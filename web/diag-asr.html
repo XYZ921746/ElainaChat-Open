@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>语音识别诊断 · ElainaChat</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 24px 16px; }
+    .wrap { max-width: 760px; margin: 0 auto; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .sub { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+    .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 16px; border: 1px solid #334155; }
+    .card h2 { font-size: 14px; color: #93c5fd; margin-bottom: 12px; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px dashed #334155; font-size: 13px; }
+    .row:last-child { border-bottom: none; }
+    .ok { color: #4ade80; font-weight: 600; }
+    .bad { color: #f87171; font-weight: 600; }
+    .warn { color: #fbbf24; font-weight: 600; }
+    .muted { color: #64748b; }
+    button { background: #3b82f6; color: #fff; border: none; border-radius: 8px; padding: 10px 22px; font-size: 14px; cursor: pointer; }
+    button:hover { background: #2563eb; }
+    button:disabled { background: #475569; cursor: not-allowed; }
+    button.stop { background: #ef4444; }
+    button.stop:hover { background: #dc2626; }
+    #status { font-size: 13px; margin: 12px 0; min-height: 20px; }
+    #transcript { background: #0b1120; border: 1px solid #334155; border-radius: 8px; padding: 12px; font-size: 15px; min-height: 60px; color: #e2e8f0; white-space: pre-wrap; }
+    #log { background: #0b1120; border: 1px solid #334155; border-radius: 8px; padding: 10px; font-size: 12px; font-family: Consolas, monospace; max-height: 220px; overflow-y: auto; line-height: 1.6; }
+    .log-line { color: #94a3b8; }
+    .log-err { color: #f87171; }
+    .log-ok { color: #4ade80; }
+    #advice { font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
+    .concl-ok { color: #4ade80; }
+    .concl-bad { color: #f87171; }
+    .concl-warn { color: #fbbf24; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; margin-left: 6px; }
+    .tag-green { background: rgba(74,222,128,.15); color: #4ade80; }
+    .tag-red { background: rgba(248,113,113,.15); color: #f87171; }
+    .tag-yellow { background: rgba(251,191,36,.15); color: #fbbf24; }
+</style>
+</head>
+<body>
+<div class="wrap">
+    <h1>🎙️ 语音识别诊断</h1>
+    <div class="sub">独立测试页：检测浏览器能否使用「语音转文字」（Web Speech API）。不依赖主应用。</div>
+
+    <div class="card">
+        <h2>① 环境检测</h2>
+        <div id="envRows"></div>
+    </div>
+
+    <div class="card">
+        <h2>② 麦克风权限测试</h2>
+        <div class="row"><span>麦克风（getUserMedia）</span><span id="micStatus">未测试</span></div>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+            <button id="btnMic">测试麦克风</button>
+            <button id="btnStart">开始语音识别测试</button>
+            <button id="btnStop" class="stop" style="display:none">停止</button>
+        </div>
+        <div id="status">点击「开始语音识别测试」，对着麦克风说一句话。</div>
+    </div>
+
+    <div class="card">
+        <h2>③ 实时转写结果</h2>
+        <div id="transcript">（尚未开始）</div>
+    </div>
+
+    <div class="card">
+        <h2>④ 事件日志</h2>
+        <div id="log"></div>
+    </div>
+
+    <div class="card">
+        <h2>⑤ 诊断结论</h2>
+        <div id="advice">等待检测…</div>
+    </div>
+
+    <div class="sub" style="margin-top:20px">测试后把「② 麦克风 / ③ 转写 / ④ 日志」的结果反馈给开发者，可以快速定位问题。</div>
+</div>
+
+<script>
+(function () {
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let rec = null;
+    let micStream = null;
+    let testRunning = false;
+
+    // ===== 日志 =====
+    function log(msg, cls) {
+        const el = document.createElement('div');
+        el.className = 'log-line' + (cls ? ' log-' + cls : '');
+        el.textContent = '[' + new Date().toTimeString().slice(0, 8) + '] ' + msg;
+        $('log').appendChild(el);
+        $('log').scrollTop = $('log').scrollHeight;
+    }
+
+    // ===== 环境检测 =====
+    function detectEnv() {
+        const rows = [];
+        const ua = String(navigator.userAgent || '');
+        const isChromium = /Chrome|Chromium|Edg|CriOS/i.test(ua) ||
+            (navigator.userAgentData && Array.isArray(navigator.userAgentData.brands) &&
+             navigator.userAgentData.brands.some(b => /Chromium/i.test(String(b.brand || ''))));
+        rows.push({ label: '浏览器', value: ua.slice(0, 90), cls: '' });
+        rows.push({ label: 'Chromium 内核（Chrome/Edge）', value: isChromium ? '✓ 是' : '✗ 否', cls: isChromium ? 'ok' : 'bad' });
+        rows.push({ label: '安全上下文（https 或 localhost）', value: window.isSecureContext ? '✓ 是' : '✗ 否', cls: window.isSecureContext ? 'ok' : 'bad' });
+        rows.push({ label: 'SpeechRecognition API', value: SR ? '✓ 支持' : '✗ 不支持', cls: SR ? 'ok' : 'bad' });
+        rows.push({ label: '麦克风（mediaDevices）', value: navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? '✓ 可用' : '✗ 不可用', cls: navigator.mediaDevices ? 'ok' : 'bad' });
+
+        $('envRows').innerHTML = rows.map(r =>
+            '<div class="row"><span>' + r.label + '</span><span class="' + (r.cls || 'muted') + '">' + r.value + '</span></div>'
+        ).join('');
+        return { isChromium, secure: window.isSecureContext, api: !!SR, media: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) };
+    }
+
+    // ===== 结论建议 =====
+    function updateAdvice() {
+        const env = detectEnv();
+        const lines = [];
+        if (!env.api) {
+            lines.push('❌ 浏览器不支持语音识别 API。\n   → 请使用 Chrome 或 Edge 访问本页重测。');
+        }
+        if (!env.secure) {
+            lines.push('❌ 当前不是安全上下文（https 或 localhost）。\n   → Chrome 会禁用语音识别与麦克风。\n   → 请用 http://localhost:4173 或 https 访问；局域网 IP / 手机直连 http 无法使用语音。');
+        }
+        if (env.media && !env.secure) {
+            lines.push('⚠️ 注意：非安全上下文下麦克风也会被禁用（上面第 ② 步会复现）。');
+        }
+        if (lines.length === 0) {
+            lines.push('✅ 环境全部就绪！点击「开始语音识别测试」实际跑一次。');
+            lines.push('   - 若出现 network 错误：Chrome 识别依赖在线服务（国内网络常见），可改用阿里云识别（主应用 设置 → 语音 → 阿里百炼）。');
+            lines.push('   - 若出现 not-allowed：浏览器弹窗里允许了麦克风吗？');
+            lines.push('   - 若识别成功：说明浏览器语音可用，主应用里应同样正常。');
+        }
+        $('advice').innerHTML = lines.join('\n');
+        $('advice').className = 'concl-' + (lines.some(l => l.startsWith('❌')) ? 'bad' : (lines.some(l => l.startsWith('⚠️')) ? 'warn' : 'ok'));
+    }
+
+    // ===== 麦克风测试 =====
+    async function testMic() {
+        log('测试麦克风权限…');
+        $('micStatus').innerHTML = '请求中…';
+        $('micStatus').className = 'muted';
+        try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                throw new Error('mediaDevices 不可用（非安全上下文或浏览器不支持）');
+            }
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            $('micStatus').innerHTML = '✓ 成功（已获得麦克风）';
+            $('micStatus').className = 'ok';
+            log('麦克风权限已授予', 'ok');
+            micStream.getTracks().forEach(t => t.stop());
+            micStream = null;
+        } catch (err) {
+            $('micStatus').innerHTML = '✗ 失败: ' + (err.message || err.name || err);
+            $('micStatus').className = 'bad';
+            log('麦克风失败: ' + (err.name || '') + ' ' + (err.message || ''), 'err');
+        }
+        updateAdvice();
+    }
+
+    // ===== 识别测试 =====
+    function startTest() {
+        if (testRunning) return;
+        if (!SR) { log('无 SpeechRecognition API', 'err'); updateAdvice(); return; }
+        try {
+            rec = new SR();
+            rec.lang = 'zh-CN';
+            rec.continuous = true;
+            rec.interimResults = true;
+            $('transcript').textContent = '（聆听中…请说话）';
+            $('btnStart').disabled = true;
+            $('btnStop').style.display = '';
+            testRunning = true;
+            log('调用 rec.start() …');
+
+            rec.onstart = () => { log('事件 onstart：识别已开始', 'ok'); $('status').textContent = '正在聆听…请说话'; };
+            rec.onresult = (event) => {
+                let finals = '', interim = '';
+                for (let i = 0; i < event.results.length; i++) {
+                    const r = event.results[i];
+                    if (r.isFinal) finals += r[0].transcript + ' ';
+                    else if (i === event.results.length - 1) interim = r[0].transcript;
+                }
+                $('transcript').textContent = (finals + interim).trim() || '（未识别到内容）';
+                log('onresult: "' + (finals + interim).trim().slice(0, 40) + '"' + (interim ? '（临时）' : '（最终）'), 'ok');
+            };
+            rec.onerror = (event) => {
+                const err = event.error || 'unknown';
+                log('事件 onerror: ' + err, 'err');
+                $('status').textContent = '错误: ' + err;
+                if (err === 'network') {
+                    $('status').textContent += ' ← Chrome 识别需要连接在线服务，国内网络常报此错';
+                } else if (err === 'not-allowed' || err === 'service-not-allowed') {
+                    $('status').textContent += ' ← 麦克风权限被拒绝或环境不允许';
+                } else if (err === 'no-speech') {
+                    $('status').textContent += ' ← 未检测到语音，请靠近麦克风';
+                } else if (err === 'audio-capture') {
+                    $('status').textContent += ' ← 麦克风被占用/禁用';
+                }
+            };
+            rec.onend = () => {
+                log('事件 onend：识别已结束', '');
+                testRunning = false;
+                $('btnStart').disabled = false;
+                $('btnStop').style.display = 'none';
+                if ($('status').textContent.startsWith('正在聆听')) $('status').textContent = '识别已结束';
+                updateAdvice();
+            };
+            rec.start();
+        } catch (err) {
+            log('rec.start() 抛错: ' + (err.message || err), 'err');
+            $('status').textContent = '启动失败: ' + (err.message || err);
+            testRunning = false;
+            $('btnStart').disabled = false;
+            $('btnStop').style.display = 'none';
+        }
+    }
+
+    function stopTest() {
+        if (rec) {
+            try { rec.stop(); } catch (e) { /* ignore */ }
+        }
+    }
+
+    $('btnMic').addEventListener('click', () => void testMic());
+    $('btnStart').addEventListener('click', startTest);
+    $('btnStop').addEventListener('click', stopTest);
+
+    // 初始化
+    const env = detectEnv();
+    log('诊断页已加载。浏览器: ' + String(navigator.userAgent).slice(0, 60));
+    log('Chromium: ' + env.isChromium + ', secure: ' + env.secure + ', API: ' + env.api);
+    if (env.api && env.secure) {
+        $('btnStart').disabled = false;
+        $('status').textContent = '环境就绪，点击「开始语音识别测试」';
+    } else {
+        $('btnStart').disabled = true;
+    }
+    updateAdvice();
+})();
+</script>
+</body>
+</html>

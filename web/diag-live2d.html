@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live2D 库诊断</title>
+<style>
+  body { font-family: monospace; background: #111; color: #eee; padding: 20px; }
+  pre { background: #000; padding: 12px; border-radius: 8px; max-height: 400px; overflow: auto; white-space: pre-wrap; }
+  .ok { color: #4ade80; } .fail { color: #f87171; }
+  button { padding: 10px 18px; margin: 8px 4px 8px 0; border-radius: 8px; border: none; cursor: pointer; background: #334155; color: #fff; }
+</style>
+</head>
+<body>
+<h3>🎥 Live2D 库加载诊断</h3>
+<div id="log"></div>
+<button onclick="window.PIXI && window.PIXI.live2d ? document.getElementById('log').textContent += '\n[手动] PIXI.live2d 存在' : document.getElementById('log').textContent += '\n[手动] PIXI.live2d 不存在'">再查一次 PIXI.live2d</button>
+
+<script src="/vendor/live2dcubismcore.min.js"></script>
+<script src="/vendor/pixi-6.min.js"></script>
+<script>
+  const log = document.getElementById('log');
+  const add = (msg, cls) => { log.innerHTML += '<div class="' + (cls || '') + '">' + msg + '</div>'; };
+  const errs = [];
+  window.addEventListener('error', e => { errs.push(e.message); add('❌ 错误: ' + e.message, 'fail'); });
+
+  add('1. Live2DCubismCore: ' + (window.Live2DCubismCore ? '✅ 存在' : '❌ 不存在'), window.Live2DCubismCore ? 'ok' : 'fail');
+  add('2. PIXI: ' + (window.PIXI ? '✅ v' + window.PIXI.VERSION : '❌ 不存在'), window.PIXI ? 'ok' : 'fail');
+</script>
+<script src="/vendor/pixi-live2d-display-cubism4.min.js"></script>
+<script>
+  setTimeout(() => {
+    const has = window.PIXI && window.PIXI.live2d && window.PIXI.live2d.Live2DModel;
+    add('3. PIXI.live2d: ' + (has ? '✅ 存在 (Live2DModel.from = ' + typeof window.PIXI.live2d.Live2DModel.from + ')' : '❌ 不存在'), has ? 'ok' : 'fail');
+    add('4. 捕获的错误数: ' + errs.length);
+    errs.forEach((e, i) => add('   错误' + (i + 1) + ': ' + e, 'fail'));
+    if (!has && !errs.length) add('⚠️ 无错误但 PIXI.live2d 不存在——库可能静默失败', 'fail');
+  }, 1500);
+</script>
+</body>
+</html>

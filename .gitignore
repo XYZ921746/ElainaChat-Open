@@ -1,0 +1,29 @@
+# 安卓工程（Capacitor + Gradle 打包工具链，本次不随仓库分发）
+android-app/
+
+dist/
+*.apk
+
+# Live2D 模型（禁止二次发布，不入库）
+web/live2d/models/
+
+# 本地打包压缩包，不入库
+*.zip
+
+# 局域网访问密码（本机凭据，禁止入库）
+web/.local-auth.json
+
+# 签名与本地环境
+*.jks
+*.keystore
+local.properties
+.env
+.env.*
+
+# 依赖、日志、系统垃圾
+node_modules/
+npm-debug.log*
+yarn-error.log*
+*.log
+.DS_Store
+Thumbs.db
