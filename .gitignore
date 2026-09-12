@@ -1,26 +1,31 @@
-# ��׿���̣�Capacitor + Gradle ��������������β���ֿ�ַ���
+# 安卓工程（Capacitor + Gradle 打包工具链，本次不随仓库分发）
 android-app/
 
 dist/
 *.apk
 
-# Live2D ģ�ͣ���ֹ���η���������⣩
-web/live2d/models/
+# Live2D 模型（默认模型随仓库分发，其余一律不入库）
+# 注意 1：必须写 models/* 而不是 models/ —— 如果整个目录被排除，git 根本不会进入它，
+#         后面针对子目录的 ! 例外就不会生效（gitignore 的已知行为）。
+# 注意 2：本文件必须保存为 UTF-8。git 是按字节比较路径的，若用 GBK 保存中文规则会静默失效。
+web/live2d/models/*
+# 随仓库分发的默认模型（其余模型仍不入库）
+!web/live2d/models/伊蕾娜·默认/
 
-# ���ش��ѹ�����������
+# 本地打包压缩包，不入库
 *.zip
 
-# �������������루����ƾ�ݣ���ֹ��⣩
+# 局域网访问密码（本机凭据，禁止入库）
 web/.local-auth.json
 
-# ǩ���뱾�ػ���
+# 签名与本地环境
 *.jks
 *.keystore
 local.properties
 .env
 .env.*
 
-# ��������־��ϵͳ����
+# 依赖、日志、系统垃圾
 node_modules/
 npm-debug.log*
 yarn-error.log*
