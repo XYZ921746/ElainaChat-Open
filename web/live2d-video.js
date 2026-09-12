@@ -20,6 +20,8 @@
   let selectedModel = '';
   let currentModelExps = [];   // 当前模型可用表情文件名（.exp3.json，供 AI 决策）
   let currentModelMotions = []; // 当前模型可用动作文件名（.motion3.json，供 AI 决策）
+  // 清单是否已从服务端拿到（区分"未知"与"确定为空"，见 resolveExpressionFile）
+  let modelAssetListKnown = false;
   // 模型尺寸/位置状态（图片网格式拖拽调整）
   //   sx/sy: 模型绝对缩放倍数（PIXI scale；模型单位高约 1~2，旧版同语义）
   //   cx/cy: 模型中心在屏幕上的位置比例（0~1）
@@ -150,6 +152,8 @@
         <div id="live2d-canvas-wrap" class="live2d-canvas-wrap">
           <canvas id="live2d-canvas"></canvas>
           <div class="live2d-name-tag" id="live2d-name-tag">视频通话中</div>
+          <div class="live2d-follow-hint" id="live2d-follow-hint" title="点击开启鼠标跟随">鼠标跟随已关闭 · 点此开启</div>
+          <div class="live2d-mute-hint" id="live2d-mute-hint" title="AI 语音已静音（可由 AI 用 [操作:取消静音] 恢复）">AI 声音已静音</div>
           <div class="live2d-speaking-indicator" id="live2d-speaking">🔊 正在说话…</div>
           <div id="live2d-resize-box" class="live2d-resize-box" title="拖动移动 · 拖手柄调整大小">
             <div class="live2d-handle" data-dir="nw"></div>
@@ -186,6 +190,12 @@
       .live2d-name-tag { position: absolute; bottom: 84px; left: 50%; transform: translateX(-50%); color: rgba(255,255,255,.85); font-size: 13px; background: rgba(0,0,0,.4); padding: 4px 14px; border-radius: 999px; white-space: nowrap; }
       .live2d-speaking-indicator { position: absolute; top: 56px; left: 50%; transform: translateX(-50%); color: #7dd3fc; font-size: 13px; display: none; background: rgba(0,0,0,.5); padding: 5px 14px; border-radius: 999px; }
       .live2d-speaking-indicator.on { display: block; }
+      /* 鼠标跟随关闭时的提示：让"模型不动"这件事自解释，而不是让人以为模型坏了 */
+      .live2d-follow-hint { position: absolute; bottom: 132px; left: 50%; transform: translateX(-50%); color: #fcd34d; font-size: 12px; display: none; background: rgba(0,0,0,.55); padding: 5px 14px; border-radius: 999px; cursor: pointer; z-index: 6; white-space: nowrap; }
+      .live2d-follow-hint.on { display: block; }
+      /* 静音提示：静音这个状态以前完全没有界面反馈（它引用的按钮早已被移除） */
+      .live2d-mute-hint { position: absolute; bottom: 170px; left: 50%; transform: translateX(-50%); color: #fca5a5; font-size: 12px; display: none; background: rgba(0,0,0,.55); padding: 5px 14px; border-radius: 999px; z-index: 6; white-space: nowrap; }
+      .live2d-mute-hint.on { display: block; }
       .live2d-bottombar { position: absolute; bottom: 0; left: 0; right: 0; padding: 16px 20px calc(20px + env(safe-area-inset-bottom)); display: flex; gap: 14px; justify-content: center; align-items: center; z-index: 5; background: linear-gradient(transparent, rgba(0,0,0,.55)); }
       .live2d-mic-btn { background: rgba(255,255,255,.14); border: none; color: #fff; width: 54px; height: 54px; border-radius: 50%; cursor: pointer; font-size: 12px; font-weight: 600; transition: all .15s; }
       .live2d-mic-btn:hover { background: rgba(255,255,255,.28); }
@@ -230,24 +240,11 @@
       if (isOpen) void loadModel();
     });
     host.querySelector('#live2d-adjust-toggle').addEventListener('click', toggleAdjustBox);
-
-    // 鼠标追踪：模型头部/眼睛跟随鼠标（UI 创建即挂载，不依赖 open 流程）
-    const wrapEl = host.querySelector('#live2d-canvas-wrap');
-    if (wrapEl && !mouseMoveHandler) {
-      mouseMoveHandler = (e) => {
-        if (!mouseFollowEnabled) return; // 设置里关掉了鼠标跟随
-        const rect = wrapEl.getBoundingClientRect();
-        const w = rect.width || window.innerWidth || 1;
-        const h = rect.height || window.innerHeight || 1;
-        if (!w || !h) return;
-        const nx = (e.clientX - rect.left) / w;
-        const ny = (e.clientY - rect.top) / h;
-        mouseTarget.x = Math.max(-1, Math.min(1, (nx - 0.5) * 2));
-        mouseTarget.y = Math.max(-1, Math.min(1, (0.5 - ny) * 2));
-        if (!mouseTrackRaf) mouseTrackRaf = setInterval(mouseTrackTick, 33);
-      };
-      wrapEl.addEventListener('pointermove', mouseMoveHandler);
-    }
+    // 「鼠标跟随已关闭」提示：点击直接开启，避免用户误以为是模型不支持
+    const followHint = host.querySelector('#live2d-follow-hint');
+    if (followHint) followHint.addEventListener('click', () => setMouseFollow(true));
+    // 注意：鼠标追踪监听器不在这里挂载（buildUI 只在首次打开时执行一次），
+    // 否则 close() 移除监听后再次打开通话将永远不会重新挂载 —— 见 ensureMouseTracking()
 
     // 调整框拖拽：手柄缩放 / 框内移动
     const box = host.querySelector('#live2d-resize-box');
@@ -546,6 +543,9 @@
     if (!container) buildUI();
     container = document.getElementById('live2d-call-host');
     container.classList.add('open');
+    ensureMouseTracking();   // 每次打开都确保监听器在位（close 会移除）
+    syncFollowHint();
+    syncMuteHint();
 
     if (!app) {
       const canvas = document.getElementById('live2d-canvas');
@@ -558,6 +558,8 @@
         antialias: true,
       });
     }
+    // 关闭通话时会停掉 PIXI 的 ticker（避免后台空转渲染），这里恢复
+    try { app?.ticker?.start?.(); } catch { /* ignore */ }
     // 必须在 app 创建之后才应用背景：否则首次打开时渲染器还是不透明底色，
     // 会把设置里保存的自定义背景/图片整个盖住（app 已存在时重复调用是幂等的）
     applyBackground();
@@ -595,6 +597,46 @@
         }
       }
     }
+    syncFollowHint();
+  }
+
+  // 通话界面上提示"鼠标跟随已关闭"（关闭时模型不动，容易被误认为模型不支持跟随）
+  function syncFollowHint() {
+    const hint = document.getElementById('live2d-follow-hint');
+    if (!hint) return;
+    hint.classList.toggle('on', isOpen && !mouseFollowEnabled);
+  }
+
+  // 静音状态提示。[操作:静音] 以前只改了一个早已从 UI 移除的按钮，
+  // 静音后通话界面毫无反馈，用户不知道 AI 为什么不说话了。
+  function syncMuteHint() {
+    const hint = document.getElementById('live2d-mute-hint');
+    if (!hint) return;
+    hint.classList.toggle('on', isOpen && aiVoiceMuted);
+  }
+
+  // 挂载/恢复鼠标追踪监听器（幂等）。
+  // 必须每次 open() 都调用一次：close() 会移除监听器并置空，而 buildUI() 只执行一次，
+  // 若只在 buildUI 里挂载，"关闭通话 → 再打开"之后鼠标跟随会永久失效。
+  function ensureMouseTracking() {
+    if (mouseMoveHandler) return;
+    const stageEl = document.getElementById('live2d-stage');
+    if (!stageEl) return;
+    mouseMoveHandler = (e) => {
+      if (!mouseFollowEnabled) return; // 设置里关掉了鼠标跟随
+      if (dragState) return;           // 正在拖拽调整框时不要跟着转头
+      const rect = stageEl.getBoundingClientRect();
+      const w = rect.width || window.innerWidth || 1;
+      const h = rect.height || window.innerHeight || 1;
+      if (!w || !h) return;
+      const nx = (e.clientX - rect.left) / w;
+      const ny = (e.clientY - rect.top) / h;
+      mouseTarget.x = Math.max(-1, Math.min(1, (nx - 0.5) * 2));
+      mouseTarget.y = Math.max(-1, Math.min(1, (0.5 - ny) * 2));
+      if (!mouseTrackRaf) mouseTrackRaf = setInterval(mouseTrackTick, 33);
+    };
+    // 监听整个通话层（不是只有画布）：鼠标移到顶栏/底栏附近时也能继续跟随
+    stageEl.addEventListener('pointermove', mouseMoveHandler);
   }
 
   // 鼠标追踪：平滑插值并驱动头部/眼球参数（setInterval 驱动，兼容各种环境）
@@ -636,11 +678,15 @@
     }
     // 移除鼠标追踪并复位参数
     if (mouseMoveHandler) {
-      const wrapEl = document.getElementById('live2d-canvas-wrap');
-      wrapEl?.removeEventListener('pointermove', mouseMoveHandler);
+      const stageEl = document.getElementById('live2d-stage');
+      stageEl?.removeEventListener('pointermove', mouseMoveHandler);
       mouseMoveHandler = null;
     }
+    syncFollowHint();
+    syncMuteHint();
     if (mouseTrackRaf) { clearInterval(mouseTrackRaf); mouseTrackRaf = null; }
+    // 停掉 PIXI 的 ticker：隐藏时没必要继续每帧渲染，open() 会重新 start
+    try { app?.ticker?.stop?.(); } catch { /* ignore */ }
     mouseTarget = { x: 0, y: 0 };
     mouseCurrent = { x: 0, y: 0 };
     if (model) {
@@ -657,28 +703,41 @@
     }
   }
 
+  // 并发保护：下拉切换、删除模型、open() 都可能同时触发加载。
+  // 旧实现没有守卫：两次加载会各自 await，后完成的那次覆盖 model，
+  // 而被覆盖的实例已经 addChild 但没人 destroy —— 双模型叠加渲染 + 显存泄漏。
+  let modelLoadSeq = 0;
+
   async function loadModel() {
     if (!app || !selectedModel) return;
+    const seq = ++modelLoadSeq;
     const tag = document.getElementById('live2d-name-tag');
     const info = getSelectedModelInfo();
+    const modelName = selectedModel;
+    const stale = () => seq !== modelLoadSeq; // 期间又来了新的加载请求
+    modelAssetListKnown = false;              // 换模型期间清单未知，先回到回退行为
     try {
       if (!info || !info.modelJson) {
         if (tag) tag.textContent = '未在模型中找到 .model3.json';
         return;
       }
-      const base = modelBaseUrl(selectedModel);
+      const base = modelBaseUrl(modelName);
       const modelJsonPath = base + encodeURIComponent(info.modelJson);
-      if (model) { app.stage.removeChild(model); model.destroy?.(); model = null; }
+      if (model) { try { app.stage.removeChild(model); model.destroy?.(); } catch { /* ignore */ } model = null; }
       // 等待 cubism4 核心就绪
       if (PIXI.live2d?.cubism4Ready) await PIXI.live2d.cubism4Ready;
-      model = await PIXI.live2d.Live2DModel.from(modelJsonPath, { autoInteract: false });
+      const created = await PIXI.live2d.Live2DModel.from(modelJsonPath, { autoInteract: false });
+      if (stale()) { try { created.destroy?.(); } catch { /* ignore */ } return; }
+      model = created;
       // 尽早记录当前模型可用表情/动作（供 AI 决策 + 语义映射兜底），避免后续步骤异常时丢失
       currentModelExps = Array.isArray(info.exps) ? info.exps.slice() : [];
       currentModelMotions = Array.isArray(info.motions) ? info.motions.slice() : [];
+      modelAssetListKnown = true; // 清单已拿到：哪怕是空的，也能确定"这个模型没有表情文件"
       // 读取该模型的真实参数表（情绪参数按语义槽解析成真实参数名，换模型必须重算）
       refreshModelParamIds();
       // 尽早探测水印开关并恢复上次状态（不依赖 addChild 等后续步骤）
       await detectWatermark(info);
+      if (stale()) return;
       // 确保 renderer 与容器尺寸一致（resizeTo 在首帧才生效）
       const wrap = document.getElementById('live2d-canvas-wrap');
       if (wrap && wrap.clientWidth > 0 && wrap.clientHeight > 0) {
@@ -702,11 +761,12 @@
       }
       applyModelSize();
       app.stage.addChild(model);
-      if (tag) tag.textContent = selectedModel;
+      if (tag) tag.textContent = modelName;
       updateResizeBox();
       startRenderLoop();
-      console.log('[Live2D] 模型加载成功:', selectedModel, modelJsonPath);
+      console.log('[Live2D] 模型加载成功:', modelName, modelJsonPath);
     } catch (err) {
+      if (stale()) return;
       console.error('[Live2D] 模型加载失败:', err);
       if (tag) tag.textContent = '模型加载失败：' + (err.message || err);
     }
@@ -722,14 +782,30 @@
   }
 
   // ===== 背景 =====
+  // 背景值最终会写进 CSS 的 background 属性，而它的来源包括 AI 的 [背景:xxx] 标签。
+  // 不校验的话 `[背景:url(https://evil/?leak)]` 就能让浏览器主动去访问外部地址
+  // （隐私泄漏 / 追踪信标）；`;` `}` 之类还能用来闭合声明注入别的样式。
+  // 只放行：data: 图片、本服务内相对路径、渐变、纯色。
+  function sanitizeBackground(v) {
+    const s = String(v == null ? '' : v).trim();
+    if (!s) return '';
+    if (/[;{}]|expression\s*\(|javascript:|@import|<\/|\\/i.test(s)) return '';
+    if (/^url\(\s*["']?data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]+["']?\s*\)$/i.test(s)) return s;
+    if (/^url\(\s*["']?\/?[\w./\-%\u4e00-\u9fa5]+["']?\s*\)$/i.test(s)) return s;
+    if (/^linear-gradient\([^();{}]*\)$/i.test(s)) return s;
+    if (/^#[0-9a-f]{3,8}$/i.test(s)) return s;
+    if (/^rgba?\([\d\s.,%]+\)$/i.test(s)) return s;
+    console.warn('[Live2D] 已忽略不受支持的背景值:', s.slice(0, 120));
+    return '';
+  }
+
   let bgStyle = (function () {
-    try { return localStorage.getItem('live2d.bg') || ''; } catch { return ''; }
+    try { return sanitizeBackground(localStorage.getItem('live2d.bg') || ''); } catch { return ''; }
   })();
 
   function applyBackground() {
     const stage = document.getElementById('live2d-stage');
     if (!stage) return;
-    const canvasWrap = document.querySelector('.live2d-canvas-wrap');
     if (bgStyle.startsWith('url(') || bgStyle.startsWith('data:') || bgStyle.startsWith('linear-gradient') || bgStyle.startsWith('#') || bgStyle.startsWith('rgb')) {
       // 图片或渐变/纯色背景：画布透明，背景由 CSS 显示
       stage.style.background = bgStyle;
@@ -755,7 +831,10 @@
         app.renderer.resize(wrap.clientWidth, wrap.clientHeight);
         applyModelSize();
       }
-      if (app) app.ticker.update();
+      // 注意：这里**不能**再调 app.ticker.update()。
+      // PIXI Application 在 autoStart 下已经把自己的 ticker 跑在 rAF 上（其中就包含 renderer.render），
+      // 这里再手动 update 一次，等于每帧把整棵场景重复渲染一遍（纯浪费）。
+      // 待机动画/物理由 PIXI 自己的 ticker 推进，本循环只负责尺寸对齐、嘴型与调整框。
       if (speaking) updateMouth();
       if (!dragState) updateResizeBox();
       requestAnimationFrame(tick);
@@ -814,31 +893,57 @@
     ['鞠躬', 'bow'],
   ];
 
+  // 表情/动作名最终会被拼进 URL 路径。encodeURIComponent 不编码字符 '.'，
+  // 所以 `[表情:../../x]` 这种输入必须在这里挡掉：Web 端还有"隐藏文件"规则兜底，
+  // 但 Android（Capacitor）走本地文件系统，没有那层保护。
+  function sanitizeAssetName(name) {
+    const s = String(name || '').trim();
+    if (!s) return '';
+    if (s.includes('/') || s.includes('\\') || s.includes('..') || s.startsWith('.')) return '';
+    return s;
+  }
+
   // 在当前模型 exps/motions 里模糊匹配目标名（子串 → 同义词组）
+  // 注意：双向 includes 在 target 只有 1 个字符时会命中任意文件名（"a" 命中 "脸a红"），
+  // 因此要求两者的有效长度都 >= 2 再参与模糊匹配。
   function fuzzyMatchFileName(target, files, ext) {
+    const t = String(target || '').trim();
+    if (t.length < 2) return null;
+    const strip = (f) => f.replace(new RegExp('\\.' + ext + '\\.json$', 'i'), '');
+    const usable = (base) => base.length >= 2;
     const hit1 = files.find(f => {
-      const base = f.replace(new RegExp('\\.' + ext + '\\.json$', 'i'), '');
-      return base.includes(target) || target.includes(base);
+      const base = strip(f);
+      return usable(base) && (base.includes(t) || t.includes(base));
     });
-    if (hit1) return hit1.replace(new RegExp('\\.' + ext + '\\.json$', 'i'), '');
-    const group = EXP_SYNONYM_GROUPS.find(g => g.some(w => target.includes(w) || w.includes(target)));
+    if (hit1) return strip(hit1);
+    const group = EXP_SYNONYM_GROUPS.find(g => g.some(w => t.includes(w) || w.includes(t)));
     if (group) {
       const hit2 = files.find(f => {
-        const base = f.replace(new RegExp('\\.' + ext + '\\.json$', 'i'), '');
-        return group.some(w => base.includes(w) || w.includes(base));
+        const base = strip(f);
+        return usable(base) && group.some(w => base.includes(w) || w.includes(base));
       });
-      if (hit2) return hit2.replace(new RegExp('\\.' + ext + '\\.json$', 'i'), '');
+      if (hit2) return strip(hit2);
     }
     return null;
   }
 
   // 把 AI 给的名称解析成当前模型实际存在的表情文件名（无扩展名）
   // 优先级：语义映射键（EXPRESSION_MAP）→ 精确文件名 → 模糊/同义词匹配 → 原样
+  // 当前模型的表情/动作清单是否已经拿到。
+  // 用于区分两种情况：①"还没加载出来/未知"（保持旧的回退行为）
+  //                 ②"已经拿到，但模型根本没有 exp 目录"（此时任何表情名都必然 404，必须直接放弃）
   function resolveExpressionFile(name) {
-    const raw = String(name || '').trim().replace(/\.(exp3|motion3)\.json$/i, '');
+    const raw = sanitizeAssetName(String(name || '').trim().replace(/\.(exp3|motion3)\.json$/i, ''));
     if (!raw) return '';
     const mapped = EXPRESSION_MAP[raw] || raw;
-    if (!currentModelExps.length) return mapped; // 表情列表未知时保持原行为
+    if (!currentModelExps.length) {
+      // 清单已知却为空 → 这个模型没有任何表情文件，别再发注定 404 的请求
+      if (modelAssetListKnown) {
+        console.warn('[Live2D] 当前模型没有 exp 目录，表情标签已忽略:', raw);
+        return '';
+      }
+      return mapped; // 清单未知时保持原行为
+    }
     if (currentModelExps.some(f => f === mapped + '.exp3.json')) return mapped;
     const fuzzy = fuzzyMatchFileName(mapped, currentModelExps, 'exp3');
     if (fuzzy) return fuzzy;
@@ -848,10 +953,16 @@
   }
 
   function resolveMotionFile(name) {
-    const raw = String(name || '').trim().replace(/\.(exp3|motion3)\.json$/i, '');
+    const raw = sanitizeAssetName(String(name || '').trim().replace(/\.(exp3|motion3)\.json$/i, ''));
     if (!raw) return '';
     const mapped = MOTION_MAP[raw] || raw;
-    if (!currentModelMotions.length) return mapped; // 动作列表未知时保持原行为
+    if (!currentModelMotions.length) {
+      if (modelAssetListKnown) {
+        console.warn('[Live2D] 当前模型没有动作文件，动作标签已忽略:', raw);
+        return '';
+      }
+      return mapped; // 动作列表未知时保持原行为
+    }
     if (currentModelMotions.some(f => f === mapped + '.motion3.json')) return mapped;
     const fuzzy = fuzzyMatchFileName(mapped, currentModelMotions, 'motion3');
     if (fuzzy) return fuzzy;
@@ -872,13 +983,21 @@
     currentExpParams = [];
   }
 
+  // 表情切换的并发保护：driveText 是"即发即忘"地调用它，而内部含 fetch/await。
+  // 连续两次回复（或流式分片）会让两次调用交错：后一次的 resetExpressionParams 会清掉
+  // 前一次刚写进去的参数，表现为"表情切了但脸还停在上一张"。用自增序号保证只有最后一次生效。
+  let expressionSeq = 0;
+
   async function setExpression(name) {
-    if (!model) return false;
+    const target = model;
+    if (!target) return false;
+    const seq = ++expressionSeq;
+    const modelName = selectedModel;
     const raw = String(name || '').trim().replace(/\.(exp3|motion3)\.json$/i, '');
     // 复位表情：[表情:default] / [表情:常规] / [表情:reset] → 恢复所有参数
     if (/^(default|none|reset|clear|常规|默认|正常)$/i.test(raw)) {
-      const coreModel = model.internalModel?.coreModel;
-      resetExpressionParams(coreModel);
+      if (seq !== expressionSeq) return false;
+      resetExpressionParams(target.internalModel?.coreModel);
       currentExpression = null;
       console.log('[Live2D] 表情已复位');
       return true;
@@ -886,18 +1005,21 @@
     const expName = resolveExpressionFile(raw);
     if (!expName) {
       // 没有匹配的表情文件：复位上一个表情的参数，避免"换了情绪但脸还停在上一张"
-      resetExpressionParams(model.internalModel?.coreModel);
+      if (seq !== expressionSeq) return false;
+      resetExpressionParams(target.internalModel?.coreModel);
       currentExpression = null;
       return false;
     }
     try {
-      const base = modelBaseUrl(selectedModel) + 'exp/';
+      const base = modelBaseUrl(modelName) + 'exp/';
       const url = base + encodeURIComponent(expName) + '.exp3.json';
       const res = await fetch(url);
+      if (seq !== expressionSeq) return false; // 已有更新的表情请求，丢弃这次结果
       if (res.ok) {
         const json = await res.json();
+        if (seq !== expressionSeq) return false;
         const params = json && Array.isArray(json.Parameters) ? json.Parameters : null;
-        const coreModel = model.internalModel?.coreModel;
+        const coreModel = target.internalModel?.coreModel;
         if (params && params.length && coreModel && typeof coreModel.setParameterValueById === 'function') {
           // 关键：先复位上一个表情的参数，再应用新表情，避免参数叠加导致"切换不成功"
           resetExpressionParams(coreModel);
@@ -922,7 +1044,8 @@
         }
       }
       // 兜底：无参数信息或 coreModel 不可用时退回库的 expression
-      await model.expression(url);
+      await target.expression(url);
+      if (seq !== expressionSeq) return false;
       currentExpression = raw;
       return true;
     } catch (err) {
@@ -932,12 +1055,15 @@
   }
 
   async function playMotion(name) {
-    if (!model) return;
+    const target = model;
+    if (!target) return;
     const motionName = resolveMotionFile(name);
     if (!motionName) return;
+    const modelName = selectedModel;
     try {
-      const base = modelBaseUrl(selectedModel) + 'exp/';
-      await model.motion(base + encodeURIComponent(motionName) + '.motion3.json');
+      const base = modelBaseUrl(modelName) + 'exp/';
+      await target.motion(base + encodeURIComponent(motionName) + '.motion3.json');
+      if (model !== target) return; // 期间换了模型，这次动作结果作废
       console.log('[Live2D] 动作:', motionName);
     } catch (err) {
       console.warn('[Live2D] 动作触发失败:', motionName, err);
@@ -1179,32 +1305,42 @@
     console.warn('[Live2D] 未知操作:', v);
   }
 
+  // 取同类标签里最后一个。
+  // 旧实现用非全局正则 match()，一条回复里出现两个同类标签时只有第一个被处理
+  // （[操作:] 在修 8.7 时已改成全局，其它标签没跟上，导致行为不一致）。
+  // 统一为"最后一个生效"：既不会漏，也避免同类标签重复触发请求造成并发竞态。
+  function lastTagValue(text, name) {
+    const re = new RegExp('\\[' + name + '[:：]\\s*([^\\]]+)\\]', 'g');
+    let v = null, m;
+    while ((m = re.exec(text)) !== null) v = m[1].trim();
+    return v;
+  }
+
   // 统一入口：解析回复中的标签并驱动模型（表情/动作/情绪/位置/大小/背景/操作）
   function driveText(text) {
     if (!text) return;
     const t = String(text);
 
-    const em = t.match(/\[表情[:：]\s*([^\]]+)\]/);
-    if (em) void setExpression(em[1].trim());
-    const mo = t.match(/\[动作[:：]\s*([^\]]+)\]/);
-    if (mo) void playMotion(mo[1].trim());
+    const expName = lastTagValue(t, '表情');
+    if (expName) void setExpression(expName);
+    const motionName = lastTagValue(t, '动作');
+    if (motionName) void playMotion(motionName);
 
     // 显式情绪优先。
     // ⚠️ 这里以前是 `driveEmotion(...); return;`，会把下面所有标签一起跳过——
     // 而系统提示词要求 AI 每条回复都带一个情绪标签，结果 [位置]/[大小]/[背景]/[操作]
     // （文件操作、打开通话、静音、隐藏水印）几乎永远不会被执行，且因为标签不显示给用户，
     // 从表面完全看不出来。现在只把「跳过自动推断」这一件事交给这个标志，不再提前返回。
-    const emo = t.match(/\[情绪[:：]\s*([^\]]+)\]/);
-    const explicitEmotion = emo ? (driveEmotion(emo[1].trim()) !== false) : false;
+    const emoName = lastTagValue(t, '情绪');
+    const explicitEmotion = emoName ? (driveEmotion(emoName) !== false) : false;
 
-    const pos = t.match(/\[位置[:：]\s*([^\]]+)\]/);
-    if (pos) setModelPositionByTag(pos[1].trim());
-    const size = t.match(/\[大小[:：]\s*([^\]]+)\]/);
-    if (size) setModelSizeByTag(size[1].trim());
-    const bg = t.match(/\[背景[:：]\s*([^\]]+)\]/);
+    const pos = lastTagValue(t, '位置');
+    if (pos) setModelPositionByTag(pos);
+    const size = lastTagValue(t, '大小');
+    if (size) setModelSizeByTag(size);
+    const bg = lastTagValue(t, '背景');
     if (bg) {
-      const key = bg[1].trim();
-      const value = BG_PRESETS[key] || key;
+      const value = BG_PRESETS[bg] || bg;
       if (window.Live2DCall?.setBackground) window.Live2DCall.setBackground(value);
     }
     // 操作标签：支持一条回复里出现多个（例如同时「打开视频通话」+「隐藏水印」）
@@ -1215,7 +1351,7 @@
     }
 
     // 没有显式表情、也没有识别成功的显式情绪时，才按触发词自动推断
-    if (!em && !explicitEmotion) {
+    if (!expName && !explicitEmotion) {
       const inferred = inferEmotionFromText(t);
       if (inferred) driveEmotion(inferred);
     }
@@ -1229,16 +1365,12 @@
 
   let aiVoiceMuted = false;
   function toggleMute() {
-    const btn = document.getElementById('live2d-mute-btn');
     aiVoiceMuted = !aiVoiceMuted;
-    if (btn) {
-      btn.textContent = aiVoiceMuted ? '🔇 AI静音' : '🔇 AI声音';
-      btn.classList.toggle('active', aiVoiceMuted);
-    }
     if (aiVoiceMuted) {
       // 静音 AI 声音：停止嘴动
       stopMouth();
     }
+    syncMuteHint();
   }
 
   // ===== 真实语音输入（复用主应用的录音 + ASR + 发送流程） =====
@@ -1274,7 +1406,12 @@
   // ===== 对外 API =====
   window.Live2DCall = {
     open, close,
-    setBackground: function (v) { bgStyle = v || ""; try { localStorage.setItem("live2d.bg", v || ""); } catch {} applyBackground(); },
+    setBackground: function (v) {
+      const safe = sanitizeBackground(v);
+      bgStyle = safe;
+      try { localStorage.setItem("live2d.bg", safe); } catch { /* ignore */ }
+      applyBackground();
+    },
     getBackground: function () { return bgStyle; },
     deleteModel,
     toggleMute,

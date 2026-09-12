@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live2D 参数绑定诊断</title>
+<style>
+  body { margin: 0; background: #14161f; color: #e5e7eb; font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { padding: 14px 18px; border-bottom: 1px solid #2a2f3d; }
+  h1 { margin: 0 0 4px; font-size: 15px; }
+  .sub { color: #9ca3af; font-size: 12px; }
+  main { display: flex; gap: 16px; padding: 16px 18px; align-items: flex-start; flex-wrap: wrap; }
+  #stage { background: #0b0e14; border-radius: 10px; border: 1px solid #2a2f3d; }
+  #panel { flex: 1; min-width: 340px; }
+  select { background: #1f2330; color: #e5e7eb; border: 1px solid #333a4d; border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+  button { background: #2f6fed; color: #fff; border: none; border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  button:disabled { background: #3a4152; cursor: default; }
+  #status { color: #9ca3af; font-size: 12px; margin: 10px 0; white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #232833; }
+  th { color: #9ca3af; font-weight: 600; position: sticky; top: 0; background: #14161f; }
+  .ok { color: #4ade80; } .bad { color: #f87171; } .warn { color: #fcd34d; }
+  .tag { display: inline-block; padding: 0 6px; border-radius: 4px; background: #232833; margin-left: 6px; font-size: 11px; color: #9ca3af; }
+  .scroll { max-height: 62vh; overflow: auto; border: 1px solid #232833; border-radius: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live2D 参数绑定诊断</h1>
+  <div class="sub">
+    逐个参数设值并对比 <b>骨骼顶点的位移</b>，判断参数是"真正绑定到绘制"还是"存在但设了没反应"。
+    Cubism 运行时对不存在的参数不报错、对未绑定的参数静默接受，所以这类问题只能实测。
+  </div>
+</header>
+<main>
+  <canvas id="stage" width="480" height="480"></canvas>
+  <div id="panel">
+    <select id="modelSelect"></select>
+    <button id="runBtn">开始扫描</button>
+    <div id="status">选择模型后点击「开始扫描」。</div>
+    <div id="result"></div>
+  </div>
+</main>
+
+<script src="/vendor/live2dcubismcore.min.js"></script>
+<script src="/vendor/pixi-6.min.js"></script>
+<script src="/vendor/pixi-live2d-display-cubism4.min.js"></script>
+<script>
+// ===== 鼠标跟随实际会用到的语义槽 → 候选参数（与 live2d-video.js 的 PARAM_CANDIDATES 保持一致）=====
+const PARAM_CANDIDATES = {
+  headX: ['ParamAngleX', 'ParamAngleX1'],
+  headY: ['ParamAngleY', 'ParamAngleY1'],
+  eyeBallX: ['ParamEyeBallX'],
+  eyeBallY: ['ParamEyeBallY'],
+};
+
+const app = new PIXI.Application({ view: document.getElementById('stage'), width: 480, height: 480, backgroundAlpha: 0 });
+let fw = null;           // 框架层 CubismModel
+let models = [];
+
+// 模型名来自服务端 readdir、参数名来自模型文件，都属外部输入 → 一律转义后再拼 HTML
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function loadModelList() {
+  const sel = document.getElementById('modelSelect');
+  try {
+    const res = await fetch('/api/live2d/models');
+    const data = await res.json();
+    models = (data.models || []).filter((m) => m.modelJson);
+    sel.textContent = '';
+    if (!models.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '（没有可用模型）';
+      sel.appendChild(o);
+      return;
+    }
+    models.forEach((m, i) => {
+      const o = document.createElement('option');
+      o.value = String(i);
+      o.textContent = m.name;
+      sel.appendChild(o);
+    });
+  } catch (e) {
+    document.getElementById('status').textContent = '读取模型列表失败：' + e.message;
+  }
+}
+
+async function loadModel(index) {
+  const m = models[index];
+  if (!m) return;
+  if (PIXI.live2d && PIXI.live2d.cubism4Ready) await PIXI.live2d.cubism4Ready;
+  if (window.__model) { try { app.stage.removeChild(window.__model); window.__model.destroy(); } catch (e) {} window.__model = null; }
+  const model = await PIXI.live2d.Live2DModel.from('/live2d/models/' + encodeURIComponent(m.name) + '/' + encodeURIComponent(m.modelJson), { autoInteract: false });
+  app.stage.addChild(model);
+  model.autoUpdate = false;   // 自己控制更新，排除待机动画干扰
+  const sc = (app.renderer.height * 0.85) / model.internalModel.originalHeight;
+  model.scale.set(sc);
+  model.x = app.renderer.width / 2 - (model.internalModel.width * sc) / 2;
+  model.y = app.renderer.height - model.internalModel.height * sc;
+  window.__model = model;
+  fw = model.internalModel.coreModel;
+}
+
+// 逐个参数：设 0 → 记录顶点 → 设值 → 记录顶点 → 取最大位移
+async function scanAll(onProgress) {
+  const ids = fw._parameterIds.slice();
+  const n = fw.getDrawableCount();
+  const snap = () => { const a = []; for (let i = 0; i < n; i++) a.push(Float32Array.from(fw.getDrawableVertexPositions(i))); return a; };
+  const rows = [];
+  for (let k = 0; k < ids.length; k++) {
+    const id = ids[k];
+    const value = /angle/i.test(id) ? 20 : 1;
+    fw.setParameterValueById(id, 0, 1); fw.update();
+    const before = snap();
+    fw.setParameterValueById(id, value, 1); fw.update();
+    const after = snap();
+    let max = 0, at = -1;
+    for (let i = 0; i < n; i++) {
+      const a = before[i], b = after[i];
+      const L = Math.min(a.length, b.length);
+      let local = 0;
+      for (let j = 0; j < L; j++) { const d = Math.abs(a[j] - b[j]); if (d > local) local = d; }
+      if (local > max) { max = local; at = i; }
+    }
+    fw.setParameterValueById(id, 0, 1); fw.update();
+    rows.push({ id, maxDelta: Math.round(max * 10000) / 10000, drawable: at, bound: max > 0.01 });
+    if (k % 10 === 0) { onProgress(k + 1, ids.length); await new Promise((r) => setTimeout(r, 0)); }
+  }
+  onProgress(ids.length, ids.length);
+  return rows;
+}
+
+function render(rows) {
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const bound = rows.filter((r) => r.bound);
+  const unbound = rows.filter((r) => !r.bound);
+
+  let html = '<h3 style="margin:14px 0 6px;font-size:13px;">鼠标跟随依赖的参数</h3><div class="scroll"><table>';
+  html += '<thead><tr><th>语义槽</th><th>候选参数</th><th>最大顶点位移</th><th>结论</th></tr></thead><tbody>';
+  for (const [slot, cands] of Object.entries(PARAM_CANDIDATES)) {
+    for (const c of cands) {
+      const r = byId.get(c);
+      if (!r) { html += `<tr><td>${slot}</td><td>${c}</td><td>-</td><td class="warn">参数表中不存在</td></tr>`; continue; }
+      html += `<tr><td>${slot}</td><td>${c}</td><td>${r.maxDelta}</td>` +
+        `<td class="${r.bound ? 'ok' : 'bad'}">${r.bound ? '已绑定，会动' : '存在但未绑定'}</td></tr>`;
+    }
+  }
+  html += '</tbody></table></div>';
+
+  html += `<h3 style="margin:16px 0 6px;font-size:13px;">全部参数：已绑定 ${bound.length} / 未绑定 ${unbound.length}（共 ${rows.length}）</h3>`;
+  html += '<div class="scroll"><table><thead><tr><th>参数</th><th>最大顶点位移</th><th>Drawable</th></tr></thead><tbody>';
+  for (const r of rows) {
+    html += `<tr><td>${esc(r.id)}</td><td class="${r.bound ? 'ok' : 'bad'}">${r.maxDelta}</td><td>${r.drawable}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+  document.getElementById('result').innerHTML = html;
+}
+
+document.getElementById('runBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runBtn');
+  const status = document.getElementById('status');
+  btn.disabled = true;
+  try {
+    const idx = Number(document.getElementById('modelSelect').value || 0);
+    status.textContent = '正在加载模型…';
+    await loadModel(idx);
+    status.textContent = '正在扫描参数绑定（每个参数都要重算一次网格，请稍候）…';
+    const rows = await scanAll((done, total) => { status.textContent = `正在扫描参数绑定… ${done}/${total}`; });
+    render(rows);
+    status.textContent = '扫描完成。判定阈值：最大顶点位移 > 0.01 视为已绑定。';
+  } catch (e) {
+    status.textContent = '出错：' + e.message;
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+loadModelList();
+</script>
+</body>
+</html>

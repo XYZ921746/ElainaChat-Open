@@ -5935,11 +5935,33 @@ ${lines.join('\n')}
             }
         };
 
+        // 「允许操作电脑」模式下写文件前必须确认一次（同一路径只问一次）。
+        // 之前 AI 可以完全无声地把任意内容写到任意路径 —— 一旦提示词被图片文字、
+        // 长期记忆或第三方模型输出污染，等于把整台机器的写权限交给了一次模型输出。
+        const agentWriteApproved = new Set();
+        function confirmAgentWrite(path, permission) {
+            if (permission !== 'computer') return true; // 限制模式只在应用文件夹内，无需打断
+            const target = String(path || '').trim();
+            if (!target) return false;
+            if (agentWriteApproved.has(target)) return true;
+            let ok = false;
+            try {
+                ok = window.confirm('AI 请求在「允许操作电脑」模式下写入文件：\n\n' + target
+                    + '\n\n允许这次写入吗？\n（同一路径只询问一次；可在「设置 → 高级」把权限改回"限制模式"彻底关闭）');
+            } catch { ok = false; }
+            if (ok) agentWriteApproved.add(target);
+            return ok;
+        }
+
         // 执行 Agent 文件操作并把结果回填对话（AI 能看到/用户能看到）
         async function doAgentFile(action, { path, content } = {}, permission) {
             try {
                 let result;
                 if (action === 'write') {
+                    if (!confirmAgentWrite(path, permission)) {
+                        insertAgentResult('已取消写入：在「允许操作电脑」模式下没有确认这次操作。\n目标：' + (path || '（未提供路径）'));
+                        return;
+                    }
                     result = await postJsonFromDevice('/api/agent/write', { permission, path, content }, {}, 30000);
                 } else {
                     const q = 'permission=' + encodeURIComponent(permission) + (path ? '&path=' + encodeURIComponent(path) : '');
@@ -6310,7 +6332,7 @@ ${lines.join('\n')}
                         <div class="text-xs text-indigo-800 truncate">${escapeHtml(t.content)}</div>
                         <div class="text-[11px] text-indigo-400">下次：${new Date(t.nextAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}${t.intervalMs > 0 ? '（周期）' : '（一次）'}</div>
                     </div>
-                    <button type="button" class="btn-secondary text-xs text-red-500" onclick="window.__cancelScheduledTask('${t.id}')">取消</button>
+                    <button type="button" class="btn-secondary text-xs text-red-500" onclick="window.__cancelScheduledTask('${safeAttrId(t.id)}')">取消</button>
                 </div>
             `).join('');
         }
@@ -7078,7 +7100,16 @@ ${lines.join('\n')}
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;')
+                .replace(/`/g, '&#96;');
+        }
+
+        // 内联 onclick 里嵌 id 用的消毒：只保留字母数字和 - _
+        // （注意：不能靠 escapeHtml 把 ' 转成 &#39; —— HTML 解析器会先把属性值里的实体解码，
+        //   再交给 JS 解析，' 依然会闭合字符串。所以这里做的是白名单剔除。）
+        function safeAttrId(id) {
+            return String(id == null ? '' : id).replace(/[^A-Za-z0-9_-]/g, '');
         }
 
         function createConversationItem(conv) {
@@ -7695,7 +7726,7 @@ ${lines.join('\n')}
                                 <div class="flex items-center gap-2 mb-2">
                                     <span class="text-xs font-medium text-indigo-500">You</span>
                                     <span class="text-xs text-indigo-300">${message.timestamp}</span>
-                                    <button onclick="event.stopPropagation(); handleMessageFavoriteClick('${message.id}')"
+                                    <button onclick="event.stopPropagation(); handleMessageFavoriteClick('${safeAttrId(message.id)}')"
                                             class="message-action-btn ml-auto p-1.5 rounded-lg hover:bg-white/60 transition-all flex items-center gap-1 ${isMessageFavorited(state.currentConversationId, message.id) ? 'text-amber-500' : 'text-indigo-300 hover:text-amber-500'}">
                                         <svg class="w-3.5 h-3.5" fill="${isMessageFavorited(state.currentConversationId, message.id) ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
                                             <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"/>
@@ -7715,7 +7746,7 @@ ${lines.join('\n')}
                 const voiceDurationSeconds = estimateVoiceDurationSeconds(message.voiceJp || message.text);
                 const voiceCard = `
                                 <div class="ai-voice-card">
-                                    <button id="voice-player-${message.id}" onclick="event.stopPropagation(); replayAIMessage('${message.id}')" class="ai-voice-player" type="button" aria-label="播放伊蕾娜的语音">
+                                    <button id="voice-player-${message.id}" onclick="event.stopPropagation(); replayAIMessage('${safeAttrId(message.id)}')" class="ai-voice-player" type="button" aria-label="播放伊蕾娜的语音">
                                         <span class="voice-play-box" aria-hidden="true">
                                             <svg class="voice-icon-play" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4L13 8 4 2.8z"/></svg>
                                             <svg class="voice-icon-pause" viewBox="0 0 16 16" fill="currentColor"><path d="M4 3h3v10H4zM9 3h3v10H9z"/></svg>
@@ -7731,7 +7762,7 @@ ${lines.join('\n')}
                                 <div class="flex items-center gap-2 mb-2">
                                     <span class="ai-speaker-name">${escapeHtml(name)}</span>
                                     <span class="text-xs text-indigo-300">${message.timestamp}</span>
-                                    <button onclick="event.stopPropagation(); handleMessageFavoriteClick('${message.id}')"
+                                    <button onclick="event.stopPropagation(); handleMessageFavoriteClick('${safeAttrId(message.id)}')"
                                             class="message-action-btn ml-auto p-1.5 rounded-lg hover:bg-white/60 transition-all flex items-center gap-1 ${faved ? 'text-amber-500' : 'text-indigo-300 hover:text-amber-500'}">
                                         <svg class="w-3.5 h-3.5" fill="${faved ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
                                             <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"/>
@@ -10757,7 +10788,15 @@ ${card.characterPrompt}
             try {
                 const res = await fetch('/api/live2d/upload', { method: 'POST', body: file });
                 const json = await res.json();
-                status.textContent = json.ok ? ('✅ 已上传: ' + json.modelName) : ('❌ ' + (json.message || '失败'));
+                if (json.ok) {
+                    // 服务端会跳过 .html/.js/.svg 等可执行类型（防止上传后被同源执行），
+                    // 这里必须告诉用户跳过了什么，否则模型"上传成功"却少了文件会很难排查
+                    const skipped = Array.isArray(json.blocked) ? json.blocked : [];
+                    status.textContent = '✅ 已上传: ' + json.modelName +
+                        (skipped.length ? `　已跳过 ${skipped.length} 个不允许的文件：${skipped.join('、')}` : '');
+                } else {
+                    status.textContent = '❌ ' + (json.message || '失败');
+                }
                 if (json.ok) await refreshLive2DSettingList();
             } catch (err) { status.textContent = '❌ ' + (err.message || err); }
             e.target.value = '';
