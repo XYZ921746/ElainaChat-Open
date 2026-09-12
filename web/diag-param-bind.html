@@ -47,11 +47,14 @@
 <script src="/vendor/pixi-live2d-display-cubism4.min.js"></script>
 <script>
 // ===== 鼠标跟随实际会用到的语义槽 → 候选参数（与 live2d-video.js 的 PARAM_CANDIDATES 保持一致）=====
+// 身体槽只在"头部已到量程上限"之后才介入（倍率 ×1.0 以上），见 live2d-video.js 的 applyFollowDrive()
 const PARAM_CANDIDATES = {
   headX: ['ParamAngleX', 'ParamAngleX1'],
   headY: ['ParamAngleY', 'ParamAngleY1'],
   eyeBallX: ['ParamEyeBallX'],
   eyeBallY: ['ParamEyeBallY'],
+  bodyX: ['ParamBodyAngleX', 'ParamBodyAngleX1'],
+  bodyY: ['ParamBodyAngleY', 'ParamBodyAngleY1'],
 };
 
 const app = new PIXI.Application({ view: document.getElementById('stage'), width: 480, height: 480, backgroundAlpha: 0 });
@@ -114,21 +117,30 @@ async function scanAll(onProgress) {
   const rows = [];
   for (let k = 0; k < ids.length; k++) {
     const id = ids[k];
+    const idx = fw.getParameterIndex(id);
+    // 量程很关键：Cubism 会按模型自身的 min/max 静默截断参数值，
+    // 所以"跟随幅度"这类增益设置超过 量程/基础值 之后就完全无效了。
+    let min = null, max = null, def = null;
+    try {
+      min = fw.getParameterMinimumValue(idx);
+      max = fw.getParameterMaximumValue(idx);
+      def = fw.getParameterDefaultValue(idx);
+    } catch (e) { /* 某些版本没有这几个方法 */ }
     const value = /angle/i.test(id) ? 20 : 1;
     fw.setParameterValueById(id, 0, 1); fw.update();
     const before = snap();
     fw.setParameterValueById(id, value, 1); fw.update();
     const after = snap();
-    let max = 0, at = -1;
+    let mx = 0, at = -1;
     for (let i = 0; i < n; i++) {
       const a = before[i], b = after[i];
       const L = Math.min(a.length, b.length);
       let local = 0;
       for (let j = 0; j < L; j++) { const d = Math.abs(a[j] - b[j]); if (d > local) local = d; }
-      if (local > max) { max = local; at = i; }
+      if (local > mx) { mx = local; at = i; }
     }
     fw.setParameterValueById(id, 0, 1); fw.update();
-    rows.push({ id, maxDelta: Math.round(max * 10000) / 10000, drawable: at, bound: max > 0.01 });
+    rows.push({ id, min, max, def, maxDelta: Math.round(mx * 10000) / 10000, drawable: at, bound: mx > 0.01 });
     if (k % 10 === 0) { onProgress(k + 1, ids.length); await new Promise((r) => setTimeout(r, 0)); }
   }
   onProgress(ids.length, ids.length);
@@ -141,21 +153,35 @@ function render(rows) {
   const unbound = rows.filter((r) => !r.bound);
 
   let html = '<h3 style="margin:14px 0 6px;font-size:13px;">鼠标跟随依赖的参数</h3><div class="scroll"><table>';
-  html += '<thead><tr><th>语义槽</th><th>候选参数</th><th>最大顶点位移</th><th>结论</th></tr></thead><tbody>';
+  html += '<thead><tr><th>语义槽</th><th>候选参数</th><th>量程</th><th>最大顶点位移</th><th>结论</th></tr></thead><tbody>';
   for (const [slot, cands] of Object.entries(PARAM_CANDIDATES)) {
     for (const c of cands) {
       const r = byId.get(c);
-      if (!r) { html += `<tr><td>${slot}</td><td>${c}</td><td>-</td><td class="warn">参数表中不存在</td></tr>`; continue; }
-      html += `<tr><td>${slot}</td><td>${c}</td><td>${r.maxDelta}</td>` +
+      if (!r) { html += `<tr><td>${esc(slot)}</td><td>${esc(c)}</td><td>-</td><td>-</td><td class="warn">参数表中不存在</td></tr>`; continue; }
+      const hasRange = r.min !== null && r.max !== null;
+      // 头部基础驱动值：headX=20、headY=16 → 量程上限 / 基础值 = "跟随幅度"还能放大的倍数上限，
+      // 超过这个倍数再调就完全没变化（Cubism 会静默截断）。
+      let ceil = '';
+      if (hasRange && (slot === 'headX' || slot === 'headY')) {
+        const m = Math.max(Math.abs(r.min), Math.abs(r.max));
+        const base = slot === 'headX' ? 20 : 16;
+        if (m > 0) ceil = ` <span class="tag">幅度 ×${(m / base).toFixed(1)} 到顶</span>`;
+      }
+      html += `<tr><td>${esc(slot)}</td><td>${esc(c)}</td><td>${hasRange ? `[${r.min}, ${r.max}]${ceil}` : '-'}</td>` +
+        `<td>${r.maxDelta}</td>` +
         `<td class="${r.bound ? 'ok' : 'bad'}">${r.bound ? '已绑定，会动' : '存在但未绑定'}</td></tr>`;
     }
   }
   html += '</tbody></table></div>';
+  html += '<p style="color:#9ca3af;font-size:12px;margin:6px 0 0">'
+    + '「量程」决定「设置 → Live2D → 跟随幅度」还能放大多少倍：参数值会被 Cubism 按模型自身的 min/max 静默截断，'
+    + '所以头部幅度超过标注的倍数之后就完全没变化了（这时更高倍率由身体跟随接续）。</p>';
 
   html += `<h3 style="margin:16px 0 6px;font-size:13px;">全部参数：已绑定 ${bound.length} / 未绑定 ${unbound.length}（共 ${rows.length}）</h3>`;
-  html += '<div class="scroll"><table><thead><tr><th>参数</th><th>最大顶点位移</th><th>Drawable</th></tr></thead><tbody>';
+  html += '<div class="scroll"><table><thead><tr><th>参数</th><th>量程</th><th>最大顶点位移</th><th>Drawable</th></tr></thead><tbody>';
   for (const r of rows) {
-    html += `<tr><td>${esc(r.id)}</td><td class="${r.bound ? 'ok' : 'bad'}">${r.maxDelta}</td><td>${r.drawable}</td></tr>`;
+    const range = (r.min === null || r.max === null) ? '-' : `[${r.min}, ${r.max}]`;
+    html += `<tr><td>${esc(r.id)}</td><td>${range}</td><td class="${r.bound ? 'ok' : 'bad'}">${r.maxDelta}</td><td>${r.drawable}</td></tr>`;
   }
   html += '</tbody></table></div>';
   document.getElementById('result').innerHTML = html;

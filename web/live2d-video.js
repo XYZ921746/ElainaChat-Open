@@ -288,7 +288,7 @@
     } else {
       for (const m of modelsList) {
         const opt = document.createElement('option');
-        opt.value = m.name;
+        opt.value = m.name;          // 目录名即显示名（设置里可重命名）
         opt.textContent = m.name;
         sel.appendChild(opt);
       }
@@ -299,6 +299,26 @@
 
   function getSelectedModelInfo() {
     return modelsList.find(m => m.name === selectedModel) || null;
+  }
+
+  /**
+   * 服务端把模型【目录】改名后，同步客户端这边所有按模型名存的东西。
+   * 目录名是"每模型设置"的 key，不迁移的话改名后模型会回到默认大小、水印开关也会丢。
+   * 顺带把 selectedModel 指到新名字，否则下拉会掉选到第一个模型。
+   */
+  function applyRenamedModel(oldName, newName) {
+    if (!oldName || !newName || oldName === newName) return Promise.resolve();
+    if (selectedModel === oldName) selectedModel = newName;
+    try {
+      for (const prefix of ['live2d.resize.', 'live2d.wm.']) {
+        const v = localStorage.getItem(prefix + oldName);
+        if (v !== null) {
+          localStorage.setItem(prefix + newName, v);
+          localStorage.removeItem(prefix + oldName);
+        }
+      }
+    } catch { /* ignore */ }
+    return refreshModelList();
   }
 
   // 模型资源基础 URL：Web 版走服务端 /live2d/models/；Capacitor（APK）走本地文件系统
@@ -315,8 +335,11 @@
       const res = await fetch('/api/live2d/models/' + encodeURIComponent(name), { method: 'DELETE' });
       const json = await res.json();
       if (json.ok) {
-        // 清理该模型保存的尺寸/位置记忆
-        try { localStorage.removeItem('live2d.resize.' + name); } catch { /* ignore */ }
+        // 清理该模型保存的尺寸/位置与水印记忆
+        try {
+          localStorage.removeItem('live2d.resize.' + name);
+          localStorage.removeItem('live2d.wm.' + name);
+        } catch { /* ignore */ }
         if (selectedModel === name) selectedModel = '';
         await refreshModelList();
         if (isOpen) {
@@ -581,6 +604,80 @@
     try { return localStorage.getItem('live2d.mouseFollow') !== '0'; } catch { return true; }
   })();
 
+  // 鼠标跟随幅度（设置 → Live2D）。
+  // 同一个"转头"参数在不同模型上的实际幅度差别很大：把 ParamAngleX 驱动到 20，
+  // 有的模型几乎不动，有的整张脸都转过去了（实测两者可见像素变化相差约 7 倍）。
+  // 所以幅度做成可调倍率：
+  //   滑块 0-10 是标准范围，10 = 原始幅度 = 1.0 倍（保持旧行为）；
+  //   输入框可以填更大的数字解锁更高倍率，上限 100 = 10 倍。
+  // ⚠️ 但头部幅度被模型自身参数量程锁死（实测两个内置模型的转头参数都是 ±30，
+  //   基础值 20 已用掉 2/3 → ×1.5 就到顶）。所以 ×1.0 以上由"身体跟随"接手补足，
+  //   否则数字框填再大也是空转。详见 mouseTrackTick 里的 bodyK。
+  const MOUSE_SCALE_MAX = 100;   // 倍率上限（=10 倍幅度）
+  const MOUSE_SCALE_BASE = 10;   // 滑块满格 = 1.0 倍
+  const BODY_GAIN_SPAN = 2;      // 倍率从 ×1.0 到 ×3.0 期间，身体跟随从 0 加到满量程
+  let mouseFollowScale = (function () {
+    try {
+      const raw = localStorage.getItem('live2d.mouseFollowScale');
+      if (raw === null) return MOUSE_SCALE_BASE; // 老用户没有这项配置，保持原来的幅度
+      const v = Number(raw);
+      return Number.isFinite(v) ? Math.max(0, Math.min(MOUSE_SCALE_MAX, Math.round(v))) : MOUSE_SCALE_BASE;
+    } catch { return MOUSE_SCALE_BASE; }
+  })();
+
+  // 把头部/眼球/身体参数复位到中位（关闭跟随、幅度归零、关闭通话三处共用）
+  function resetFollowParams() {
+    const cm = model?.internalModel?.coreModel;
+    if (!cm || typeof cm.setParameterValueById !== 'function') return;
+    for (const slot of ['headX', 'headY', 'eyeBallX', 'eyeBallY', 'bodyX', 'bodyY']) {
+      for (const pid of resolveParamIds(slot)) {
+        try { cm.setParameterValueById(pid, 0); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // 读某个参数的量程上限（绝对值）。驱动幅度不能超过它，否则 Cubism 会静默截断，
+  // 用户会以为"倍率调高了却没反应"。
+  // 带缓存：mouseTrackTick 每 33ms 调一次，而 Cubism 的 getParameterIndex 是线性查找。
+  function paramAbsMax(cm, pid) {
+    if (paramAbsMaxCache.has(pid)) return paramAbsMaxCache.get(pid);
+    let v = 0;
+    try {
+      const idx = cm.getParameterIndex(pid);
+      if (idx >= 0) v = Math.max(Math.abs(cm.getParameterMinimumValue(idx)), Math.abs(cm.getParameterMaximumValue(idx)));
+    } catch { /* ignore */ }
+    paramAbsMaxCache.set(pid, v);
+    return v;
+  }
+
+  // 该模型上"头部还能不能再放大"：基础值 20 相对量程上限还剩多少余量。
+  // 两个内置模型的转头参数都是 ±30 → ×1.0 就用掉 2/3，×1.5 之后到顶。
+  function headSaturateK(cm) {
+    let maxAbs = 0;
+    for (const pid of resolveParamIds('headX')) maxAbs = Math.max(maxAbs, paramAbsMax(cm, pid));
+    if (!maxAbs) return Infinity;      // 读不到量程就不限制（Cubism 自己会截断）
+    return maxAbs / 20;                // ×N 的 N
+  }
+
+  function setMouseFollowScale(level) {
+    const n = Number(level);
+    mouseFollowScale = Number.isFinite(n)
+      ? Math.max(0, Math.min(MOUSE_SCALE_MAX, Math.round(n)))
+      : MOUSE_SCALE_BASE;
+    try { localStorage.setItem('live2d.mouseFollowScale', String(mouseFollowScale)); } catch { /* ignore */ }
+    // 幅度调到 0 等于"不跟随"，模型应立即回正，而不是停在上一帧歪着的角度
+    if (mouseFollowScale === 0) {
+      mouseTarget = { x: 0, y: 0 };
+      mouseCurrent = { x: 0, y: 0 };
+      resetFollowParams();
+    } else {
+      // 立刻按新倍率重算一帧。否则"鼠标不动、只改倍率"时模型会一直停在旧倍率的姿态：
+      // mouseTrackTick 在插值稳定后就 clearInterval 了，没有鼠标事件不会再被触发。
+      applyFollowDrive();
+    }
+    return mouseFollowScale;
+  }
+
   function setMouseFollow(on) {
     mouseFollowEnabled = Boolean(on);
     try { localStorage.setItem('live2d.mouseFollow', mouseFollowEnabled ? '1' : '0'); } catch { /* ignore */ }
@@ -588,14 +685,7 @@
       // 关闭时把目标与当前值都归零，并把模型的角度参数复位，避免停在歪着的位置
       mouseTarget = { x: 0, y: 0 };
       mouseCurrent = { x: 0, y: 0 };
-      const cm = model?.internalModel?.coreModel;
-      if (cm && typeof cm.setParameterValueById === 'function') {
-        for (const slot of ['headX', 'headY', 'eyeBallX', 'eyeBallY']) {
-          for (const pid of resolveParamIds(slot)) {
-            try { cm.setParameterValueById(pid, 0); } catch { /* ignore */ }
-          }
-        }
-      }
+      resetFollowParams();
     }
     syncFollowHint();
   }
@@ -639,22 +729,49 @@
     stageEl.addEventListener('pointermove', mouseMoveHandler);
   }
 
-  // 鼠标追踪：平滑插值并驱动头部/眼球参数（setInterval 驱动，兼容各种环境）
+  // 把当前 mouseCurrent 按当前倍率写进模型参数。
+  // 单独抽出来是因为：mouseTrackTick 在插值稳定后会 clearInterval 停掉，
+  // 此时若用户只改倍率而鼠标不动，就再没有任何东西会去重算 —— 模型会停在旧倍率的姿态上。
+  function applyFollowDrive() {
+    const coreModel = model?.internalModel?.coreModel;
+    if (!coreModel || typeof coreModel.setParameterValueById !== 'function') return;
+    // 幅度倍率：1 = 原始幅度（×1.0）。模型对参数的敏感度天生不同，靠这个系数拉平。
+    const k = mouseFollowScale / MOUSE_SCALE_BASE;
+    const x = mouseCurrent.x * k;
+    const y = mouseCurrent.y * k;
+    // 转头：驱动该模型所有真实存在的角度参数。
+    // 不同作者会把同一个"转头"绑在 ParamAngleX 或 ParamAngleX1/Y1 上，
+    // 只写标准名的话，遇到把标准名留空的模型就完全没反应（悠小喵就是这种）。
+    //
+    // ⚠️ 这里不可能"无限放大"：参数值会被 Cubism 按模型自身量程截断。
+    // 实测 LSS 的 ParamAngleX 与悠小喵的 ParamAngleX1 量程都是 ±30，
+    // 基础值 20 已经用掉 2/3 → 倍率超过约 ×1.5 就没有任何视觉变化。
+    // 想再往上只能靠下面的"身体跟随"，这也是数字框"解锁更高"的真正作用。
+    for (const pid of resolveParamIds('headX')) coreModel.setParameterValueById(pid, x * 20);
+    for (const pid of resolveParamIds('headY')) coreModel.setParameterValueById(pid, y * 16);
+    // 眼球量程只有 ±1，所以：① 基准取 0.8（原 1.3 会让眼睛一动就顶到边界、永远贴着边）；
+    // ② 倍率按平方根缓动，低倍率同步变灵敏、高倍率不会一动手就"眼睛贴边"。
+    const eyeK = Math.sqrt(Math.max(k, 0));
+    for (const pid of resolveParamIds('eyeBallX')) coreModel.setParameterValueById(pid, x * 0.8 * eyeK);
+    for (const pid of resolveParamIds('eyeBallY')) coreModel.setParameterValueById(pid, y * 0.8 * eyeK);
+    // 身体跟随：×1.0 时为 0（完全保持原行为），×3.0 时到达该模型身体参数的量程上限。
+    // 头部到顶后由它继续把"幅度"补上去，否则"解锁更高倍率"在头部满量程后就是空转。
+    const bodyK = Math.max(0, Math.min(1, (k - 1) / BODY_GAIN_SPAN));
+    for (const pid of resolveParamIds('bodyX')) {
+      const maxAbs = paramAbsMax(coreModel, pid) || 10;
+      coreModel.setParameterValueById(pid, mouseCurrent.x * maxAbs * bodyK);
+    }
+    for (const pid of resolveParamIds('bodyY')) {
+      const maxAbs = paramAbsMax(coreModel, pid) || 10;
+      coreModel.setParameterValueById(pid, mouseCurrent.y * maxAbs * bodyK);
+    }
+  }
+
+  // 鼠标追踪：平滑插值并驱动头部/眼球/身体参数（setInterval 驱动，兼容各种环境）
   function mouseTrackTick() {
     mouseCurrent.x += (mouseTarget.x - mouseCurrent.x) * 0.14;
     mouseCurrent.y += (mouseTarget.y - mouseCurrent.y) * 0.14;
-    const coreModel = model?.internalModel?.coreModel;
-    if (coreModel && typeof coreModel.setParameterValueById === 'function') {
-      const x = mouseCurrent.x;
-      const y = mouseCurrent.y;
-      // 转头/眼球：驱动该模型所有真实存在的角度参数。
-      // 不同作者会把同一个"转头"绑在 ParamAngleX 或 ParamAngleX1/Y1/Y2 上，
-      // 只写标准名的话，遇到把标准名留空的模型就完全没反应（悠小喵就是这种）。
-      for (const pid of resolveParamIds('headX')) coreModel.setParameterValueById(pid, x * 20);
-      for (const pid of resolveParamIds('headY')) coreModel.setParameterValueById(pid, y * 16);
-      for (const pid of resolveParamIds('eyeBallX')) coreModel.setParameterValueById(pid, x * 1.3);
-      for (const pid of resolveParamIds('eyeBallY')) coreModel.setParameterValueById(pid, y * 1.3);
-    }
+    applyFollowDrive();
     const settled = Math.abs(mouseTarget.x - mouseCurrent.x) < 0.002 && Math.abs(mouseTarget.y - mouseCurrent.y) < 0.002;
     if (settled && mouseTrackRaf) { clearInterval(mouseTrackRaf); mouseTrackRaf = null; }
   }
@@ -690,15 +807,8 @@
     mouseTarget = { x: 0, y: 0 };
     mouseCurrent = { x: 0, y: 0 };
     if (model) {
-      try {
-        const cm = model.internalModel?.coreModel;
-        if (cm && typeof cm.setParameterValueById === 'function') {
-          // 复位同样按"该模型真实存在的角度参数"来，避免残留把头转着
-          for (const slot of ['headX', 'headY', 'eyeBallX', 'eyeBallY']) {
-            for (const pid of resolveParamIds(slot)) cm.setParameterValueById(pid, 0);
-          }
-        }
-      } catch { /* ignore */ }
+      // 复位同样按"该模型真实存在的角度参数"来，避免残留把头转着
+      try { resetFollowParams(); } catch { /* ignore */ }
       try { model.internalModel?.coreModel?.setParameterValueById?.('ParamMouthOpenY', 0); } catch { /* ignore */ }
     }
   }
@@ -1087,6 +1197,7 @@
   //     用的是 ParamEyeLSmile/ParamCheekPuff/ParamBrowLY/ParamEyeLOpen。
   let currentModelParamIds = new Set();
   const resolvedParamListCache = new Map();
+  const paramAbsMaxCache = new Map();   // 参数名 → 量程上限（绝对值），换模型时清空
 
   // 语义槽 → 候选参数名（按优先级，覆盖常见命名习惯）
   // smile 把 ParamMouthForm 排在眼睛笑意之前：嘴型是"笑"最直接的可见线索，
@@ -1110,6 +1221,12 @@
     headY: ['ParamAngleY', 'ParamAngleY1'],
     eyeBallX: ['ParamEyeBallX'],
     eyeBallY: ['ParamEyeBallY'],
+    // 身体角度：只在"头部已经到量程上限"之后才介入（见 mouseTrackTick）。
+    // 头部的转动幅度被模型自身的参数上限锁死（实测 LSS 与悠小喵的转头参数都是 ±30，
+    // 基础值 20 已经用掉三分之二），所以倍率超过约 ×1.5 就完全没有效果了。
+    // 想让"解锁更高倍率"真的产生变化，只能在头部满量程后带动身体一起转。
+    bodyX: ['ParamBodyAngleX', 'ParamBodyAngleX1'],
+    bodyY: ['ParamBodyAngleY', 'ParamBodyAngleY1'],
   };
   // 兜底关键字（精确候选名都没命中时，按语义在参数表里模糊找）
   const PARAM_KEYWORDS = {
@@ -1119,14 +1236,16 @@
     mouth: /^parammouth.*open/i,
     headX: /^paramanglex/i, headY: /^paramangley/i,
     eyeBallX: /^parameyeballx/i, eyeBallY: /^parameybally/i,
+    bodyX: /^parambodyanglex/i, bodyY: /^parambodyangley/i,
   };
   // 需要"驱动所有存在的候选"的槽（模型可能把同一动作拆到多个参数上）
-  const MULTI_PARAM_SLOTS = new Set(['headX', 'headY', 'eyeBallX', 'eyeBallY']);
+  const MULTI_PARAM_SLOTS = new Set(['headX', 'headY', 'eyeBallX', 'eyeBallY', 'bodyX', 'bodyY']);
 
   // 读取当前模型真实参数表（换模型后必须重算）
   function refreshModelParamIds() {
     currentModelParamIds = new Set();
     resolvedParamListCache.clear();
+    paramAbsMaxCache.clear();   // 换了模型，量程缓存必须作废
     try {
       const core = model?.internalModel?.coreModel;
       if (!core) return;
@@ -1414,6 +1533,8 @@
     },
     getBackground: function () { return bgStyle; },
     deleteModel,
+    // 供设置页在"重命名模型"之后刷新通话界面的下拉，并迁移按模型名存设置
+    applyRenamedModel,
     toggleMute,
     toggleTalk,
     setExpression,
@@ -1423,6 +1544,22 @@
     // 鼠标跟随开关（设置 → Live2D）
     setMouseFollow,
     isMouseFollow() { return mouseFollowEnabled; },
+    // 鼠标跟随幅度（0-100，10 = 原始幅度 = 1.0 倍）
+    setMouseFollowScale,
+    getMouseFollowScale() { return mouseFollowScale; },
+    getMouseFollowScaleMax() { return MOUSE_SCALE_MAX; },
+    // 幅度信息：告诉设置面板"该模型的头部在 ×N 就到量程上限了"。
+    // 头部幅度被模型自身参数范围锁死，超过这个倍率只有身体跟随还会继续变大。
+    getFollowAmpInfo() {
+      const cm = model?.internalModel?.coreModel;
+      if (!cm) return { loaded: false };
+      const sat = headSaturateK(cm);
+      return {
+        loaded: true,
+        headSaturateAt: Number.isFinite(sat) ? Math.round(sat * 10) / 10 : null,
+        bodyParamCount: resolveParamIds('bodyX').length + resolveParamIds('bodyY').length,
+      };
+    },
     // 静音时不应再动嘴（主应用也会跳过 TTS 播放，这里是双保险）
     speakStart() { if (aiVoiceMuted) return; startMouth(); },
     speakEnd() { stopMouth(); },

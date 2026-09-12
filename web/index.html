@@ -3357,11 +3357,13 @@
                         <div>
                             <label class="text-xs text-indigo-500 mb-1 block">已上传模型</label>
                             <div class="flex items-center gap-2">
-<select id="settingLive2DModel" class="modal-input text-sm">
+<select id="settingLive2DModel" class="modal-input text-sm flex-1 min-w-0">
                                 <option value="">（未上传模型）</option>
                             </select>
-<button id="settingLive2DDelete" class="btn-secondary text-xs" type="button" style="padding:8px 10px">🗑️ 删除</button>
+<button id="settingLive2DRename" class="btn-secondary text-xs shrink-0 whitespace-nowrap" type="button" style="padding:8px 10px">✏️ 重命名</button>
+<button id="settingLive2DDelete" class="btn-secondary text-xs shrink-0 whitespace-nowrap" type="button" style="padding:8px 10px">🗑️ 删除</button>
 </div>
+                            <p class="text-[11px] text-indigo-300 leading-relaxed mt-1">模型名就是它的文件夹名（上传时取 zip 里的文件夹名，拿不到才用 <code>model_xxx</code> 这类 id）。点「✏️ 重命名」可直接改，中文、空格都可以；视频通话里的下拉会跟着变，该模型的缩放/水印设置也会一起迁移。</p>
                         </div>
                         <div>
                             <label class="text-xs text-indigo-500 mb-1 block">上传新模型（.zip）</label>
@@ -3378,6 +3380,26 @@
                                 <input id="settingMouseFollow" type="checkbox" class="accent-pink-500"> 开启鼠标跟随
                             </label>
                             <p class="text-[11px] text-indigo-300 leading-relaxed mt-1">关闭后模型不会跟随鼠标（头部、眼睛都保持不动）。</p>
+
+                            <div id="settingMouseFollowScaleWrap" class="mt-3">
+                                <div class="flex items-center justify-between mb-1">
+                                    <label class="text-xs text-indigo-500">跟随幅度</label>
+                                    <span id="mouseFollowScaleLabel" class="text-xs font-medium text-pink-600">×1.0</span>
+                                </div>
+                                <input id="settingMouseFollowScale" type="range" min="0" max="10" step="1" value="10" class="custom-slider">
+                                <div class="flex items-center gap-2 mt-2">
+                                    <span class="text-[11px] text-indigo-400 whitespace-nowrap">手动输入倍率</span>
+                                    <input id="settingMouseFollowScaleNum" type="number" min="0" max="100" step="1" value="10"
+                                        class="modal-input text-sm" style="width:84px;padding:6px 8px">
+                                    <span id="mouseFollowScaleHint" class="text-[11px] text-indigo-300 flex-1 leading-snug"></span>
+                                </div>
+                                <p class="text-[11px] text-indigo-300 leading-relaxed mt-1.5">
+                                    滑块 0-10 是标准范围，10 = 原始幅度（×1.0）。不同模型的敏感度差别很大，同样的设置有的几乎不动、有的一下转到底，先在这个范围内找到合适的档位。<br>
+                                    右侧输入框可以填更大的数字（最大 100，约 10 倍）解锁更高幅度。
+                                    <b>头部转动幅度受模型自身参数上限限制</b>（多数模型是 ±30，约 ×1.5 就到顶），再往上由「身体跟随」补足：
+                                    ×1.0 时身体不动，×3.0 时身体转到该模型的上限。若模型没有绑定身体角度参数，超过上限后就不会再有变化。
+                                </p>
+                            </div>
                         </div>
 
                         <div class="mt-3 pt-3 border-t border-indigo-100">
@@ -10764,22 +10786,73 @@ ${card.characterPrompt}
         });
 
         // ===== Live2D 设置：模型列表 / 上传 / 测试 =====
+        let live2dModelList = [];   // 最近一次拉到的模型列表，重命名时要用
+        // 服务端返回的可能不是 JSON（例如服务还是旧版本时，/api/live2d/rename 落到静态处理器返回纯文本 "Not found"）。
+        // 直接 res.json() 会抛 "Unexpected token 'N'..."，用户完全看不懂，所以这里统一兜一层。
+        async function readJsonSafe(res) {
+            const text = await res.text();
+            try { return JSON.parse(text); } catch { /* 非 JSON */ }
+            return {
+                ok: false,
+                message: res.status === 404
+                    ? '服务端没有这个接口（HTTP 404）。多半是 serve.mjs 改了但服务没重启 —— 到 cmd 窗口按 Ctrl+C，再重新双击「启动.bat」。'
+                    : '服务端返回了非预期的内容（HTTP ' + res.status + '）：' + text.slice(0, 80),
+            };
+        }
         async function refreshLive2DSettingList() {
             const sel = document.getElementById('settingLive2DModel');
             if (!sel) return;
             try {
                 const res = await fetch('/api/live2d/models');
-                const json = await res.json();
-                const models = json.models || [];
+                const json = await readJsonSafe(res);
+                live2dModelList = json.models || [];
+                const prev = sel.value;
                 sel.innerHTML = '';
-                if (!models.length) sel.innerHTML = '<option value="">（未上传模型）</option>';
-                models.forEach(m => {
+                if (!live2dModelList.length) sel.innerHTML = '<option value="">（未上传模型）</option>';
+                live2dModelList.forEach(m => {
                     const opt = document.createElement('option');
-                    opt.value = m.name; opt.textContent = m.name;
+                    opt.value = m.name;       // 目录名即显示名
+                    opt.textContent = m.name;
                     sel.appendChild(opt);
                 });
+                if (prev && live2dModelList.some(m => m.name === prev)) sel.value = prev;
             } catch (e) { console.warn('[Live2D] 列表失败', e); }
         }
+
+        // 重命名模型：真改文件夹（目录名即显示名）。改完要把客户端按模型名存的东西一起迁走。
+        document.getElementById('settingLive2DRename')?.addEventListener('click', async () => {
+            const sel = document.getElementById('settingLive2DModel');
+            const oldName = sel?.value;
+            if (!oldName) { showCustomAlert('请先在上面的下拉里选一个模型。', '重命名模型'); return; }
+            const next = await showCustomModal({
+                title: '重命名模型',
+                message: '会把这个模型的文件夹一起改名。视频通话里的模型下拉、以及它的缩放/水印设置都会跟着迁移。',
+                input: true,
+                defaultValue: oldName,
+                placeholder: '例如：伊蕾娜 · 默认装',
+                confirmText: '保存',
+            });
+            if (next === null) return;   // 取消
+            const desired = String(next).trim();
+            if (!desired || desired === oldName) return;
+            try {
+                const res = await fetch('/api/live2d/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: oldName, displayName: desired }),
+                });
+                const json = await readJsonSafe(res);
+                if (!json.ok) { showCustomAlert(json.message || '重命名失败', '重命名失败'); return; }
+                const newName = json.newName || desired;
+                if (newName !== desired) showCustomAlert('「' + desired + '」已被占用，已改为「' + newName + '」。', '重命名完成');
+                // 迁移每模型设置 + 刷新通话界面下拉，并把选中项指到新名字
+                if (window.Live2DCall?.applyRenamedModel) await window.Live2DCall.applyRenamedModel(oldName, newName);
+                await refreshLive2DSettingList();
+                if (sel) sel.value = newName;
+            } catch (e) {
+                showCustomAlert('重命名失败：' + (e.message || e), '重命名失败');
+            }
+        });
         document.getElementById('settingLive2DUpload')?.addEventListener('change', async (e) => {
             const file = e.target.files?.[0];
             const status = document.getElementById('settingLive2DUploadStatus');
@@ -10787,7 +10860,7 @@ ${card.characterPrompt}
             status.textContent = '上传中…';
             try {
                 const res = await fetch('/api/live2d/upload', { method: 'POST', body: file });
-                const json = await res.json();
+                const json = await readJsonSafe(res);
                 if (json.ok) {
                     // 服务端会跳过 .html/.js/.svg 等可执行类型（防止上传后被同源执行），
                     // 这里必须告诉用户跳过了什么，否则模型"上传成功"却少了文件会很难排查
@@ -10861,7 +10934,7 @@ ${card.characterPrompt}
             if (origOpenSettingsForLive2D) origOpenSettingsForLive2D.apply(this, args);
             setTimeout(refreshLive2DSettingList, 100);
             setTimeout(syncBgSelected, 100);
-            setTimeout(syncMouseFollowBox, 100);
+            setTimeout(syncMouseFollowControls, 100);
         };
         document.getElementById('settingLive2DDelete')?.addEventListener('click', async () => {
             const sel = document.getElementById('settingLive2DModel');
@@ -10873,9 +10946,9 @@ ${card.characterPrompt}
                 if (ok) await refreshLive2DSettingList();
             } else {
                 const res = await fetch('/api/live2d/models/' + encodeURIComponent(name), { method: 'DELETE' });
-                const json = await res.json();
+                const json = await readJsonSafe(res);
                 if (json.ok) await refreshLive2DSettingList();
-                else window.alert('删除失败：' + (json.message || ''));
+                else showCustomAlert('删除失败：' + (json.message || ''), '删除失败');
             }
         });
         // 鼠标跟随开关：状态由 live2d 模块存在 localStorage，勾选即时生效
@@ -10883,10 +10956,83 @@ ${card.characterPrompt}
             const box = document.getElementById('settingMouseFollow');
             if (box) box.checked = window.Live2DCall?.isMouseFollow ? window.Live2DCall.isMouseFollow() : true;
         }
+
+        // ===== 鼠标跟随幅度 =====
+        // 滑块 0-10 是标准范围，10 = 原始幅度（×1.0）；右侧数字框可以填更大的数字解锁更高倍率。
+        // 需要它的原因：同一个 ParamAngleX=20，不同模型的实际视觉幅度能差约 7 倍，
+        // 敏感度低的模型要调高、敏感度高的要调低，否则"同样的设置"在不同模型上完全不是一个效果。
+        const MOUSE_SCALE_FALLBACK_MAX = 100;
+        const MOUSE_SCALE_BASE = 10;   // 滑块满格 / 数字框里的 10 = ×1.0
+        function mouseScaleMax() {
+            const m = Number(window.Live2DCall?.getMouseFollowScaleMax?.());
+            return Number.isFinite(m) && m > 0 ? m : MOUSE_SCALE_FALLBACK_MAX;
+        }
+        function mouseScaleCurrent() {
+            const v = Number(window.Live2DCall?.getMouseFollowScale?.());
+            return Number.isFinite(v) && v >= 0 ? v : MOUSE_SCALE_BASE;
+        }
+        // keepNumValue：用户在数字框里打字时不要把正在输入的内容覆盖掉（否则「1」还没打完就被改成别的）
+        function renderMouseFollowScale(keepNumValue) {
+            const level = mouseScaleCurrent();
+            const slider = document.getElementById('settingMouseFollowScale');
+            const num = document.getElementById('settingMouseFollowScaleNum');
+            const label = document.getElementById('mouseFollowScaleLabel');
+            const hint = document.getElementById('mouseFollowScaleHint');
+            const wrap = document.getElementById('settingMouseFollowScaleWrap');
+            const on = document.getElementById('settingMouseFollow')?.checked !== false;
+            if (slider) {
+                const max = Number(slider.max) || MOUSE_SCALE_BASE;
+                slider.value = String(Math.min(level, max));
+                updateSliderFill(slider);
+                slider.disabled = !on;
+            }
+            if (num) {
+                if (!keepNumValue) num.value = String(level);
+                num.max = String(mouseScaleMax());
+                num.disabled = !on;
+            }
+            if (label) label.textContent = '×' + (level / MOUSE_SCALE_BASE).toFixed(1);
+            if (hint) {
+                if (level === 0) hint.textContent = '已归零，模型不跟随';
+                else if (level > MOUSE_SCALE_BASE) {
+                    // 头部幅度被模型自身参数量程锁死，超过上限后只有身体跟随还会继续变大。
+                    // 这里把上限直接告诉用户，免得他以为"数字填了没用"是 bug。
+                    const info = window.Live2DCall?.getFollowAmpInfo?.();
+                    if (info && info.loaded && info.headSaturateAt) {
+                        hint.textContent = `头部上限 ×${info.headSaturateAt}，更高倍率由身体跟随补足`;
+                    } else if (info && info.loaded) {
+                        hint.textContent = '已解锁更高幅度';
+                    } else {
+                        hint.textContent = '已解锁更高幅度（开始通话后生效）';
+                    }
+                } else hint.textContent = '标准范围';
+            }
+            if (wrap) wrap.style.opacity = on ? '1' : '0.45';
+        }
+        function syncMouseFollowControls() {
+            syncMouseFollowBox();
+            renderMouseFollowScale();
+        }
         document.getElementById('settingMouseFollow')?.addEventListener('change', (e) => {
             if (window.Live2DCall?.setMouseFollow) window.Live2DCall.setMouseFollow(e.target.checked);
+            renderMouseFollowScale();
         });
-        syncMouseFollowBox();
+        // 滑块：拖完立刻生效，数字框跟着同步
+        document.getElementById('settingMouseFollowScale')?.addEventListener('input', (e) => {
+            if (window.Live2DCall?.setMouseFollowScale) window.Live2DCall.setMouseFollowScale(e.target.value);
+            renderMouseFollowScale();
+        });
+        // 数字框：可以填超出滑块范围的值（解锁更高倍率），超出上限时按上限处理
+        const mouseScaleNum = document.getElementById('settingMouseFollowScaleNum');
+        mouseScaleNum?.addEventListener('input', (e) => {
+            if (e.target.value === '') return;   // 清空时先不动，等用户输完
+            if (window.Live2DCall?.setMouseFollowScale) window.Live2DCall.setMouseFollowScale(e.target.value);
+            renderMouseFollowScale(true);
+        });
+        // 失焦 / 回车：把实际生效的值（已按上限截断）写回输入框
+        mouseScaleNum?.addEventListener('blur', () => renderMouseFollowScale());
+        mouseScaleNum?.addEventListener('keydown', (e) => { if (e.key === 'Enter') renderMouseFollowScale(); });
+        syncMouseFollowControls();
 
         refreshLive2DSettingList();
         if (document.readyState === 'loading') {

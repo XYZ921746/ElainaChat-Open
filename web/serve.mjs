@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { stat, lstat, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
+import { stat, lstat, mkdir, writeFile, readFile, readdir, rm, rename } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { randomBytes, scrypt, createHash, timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
@@ -16,6 +16,13 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const host = process.env.HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 4173);
 const MODELS_DIR = path.join(root, 'live2d', 'models');
+// 模型目录名 = 显示名（真改文件夹）。URL 与文件名都走 encodeURIComponent / decodeURIComponent，
+// 所以中文、空格、emoji 都能用；下面 sanitizeModelDirName 只挡掉文件系统层面真正不合法的字符。
+// 之所以不做"目录名保持 id + 另存显示名"的映射表：多一层状态就多一处会不同步的地方，
+// 用户看到的文件夹名和界面里的名字不一致反而更难排查。
+const MODEL_NAME_MAX = 60;
+// Windows 保留设备名，做目录名会失败
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 const MAX_UPLOAD = 200 * 1024 * 1024;      // 上传的压缩包大小上限 200MB
 const MAX_EXTRACTED = 512 * 1024 * 1024;   // 解压后总大小上限（防 zip bomb：200KB 的包可膨胀到数百 MB）
 const MAX_ENTRY_SIZE = 256 * 1024 * 1024;  // 解压后单文件上限
@@ -205,8 +212,13 @@ async function handleUpload(req, res) {
             displayName = dir === '.' ? path.posix.basename(modelFile.name, '.model3.json') : dir.split('/').pop();
         }
         if (!displayName) displayName = (files[0].name.split('/')[0] || 'model');
-        // 目录名用英文安全 id，避免中文/特殊字符路径问题
-        const modelName = 'model_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+        // 目录名直接用 zip 里的模型名 —— 用户能在文件夹里和界面里对上号，不再是一串 model_xxx。
+        // 拿不到合法名字时退回随机 id；重名自动加 " (2)"。
+        const wanted = sanitizeModelDirName(displayName);
+        const modelName = wanted
+            ? await uniqueDirName(wanted, '')
+            : 'model_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+        if (!modelName) throw new Error('无法为该模型生成合法目录名，请把 zip 里的文件夹改个名字再传');
         const targetDir = path.join(MODELS_DIR, modelName);
         await mkdir(targetDir, { recursive: true });
         // 公共顶层目录（去掉它，把文件平铺到模型目录）
@@ -228,7 +240,8 @@ async function handleUpload(req, res) {
             await rm(targetDir, { recursive: true, force: true }).catch(() => {});
             throw new Error('zip 内没有可用的模型文件（文件类型可能都被拦截了）');
         }
-        jsonResponse(res, 200, { ok: true, modelName, displayName, files: written, blocked });
+        // 目录名就是显示名，不需要额外记映射
+        jsonResponse(res, 200, { ok: true, modelName, displayName: modelName, files: written, blocked });
     } catch (err) {
         jsonResponse(res, 400, { ok: false, message: err.message || String(err) });
     }
@@ -267,6 +280,74 @@ async function listModels(res) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, message: err.message }));
     }
+}
+
+/**
+ * 把用户输入的名字洗成合法目录名。
+ * 允许中文/空格/emoji；只挡文件系统层面真正不合法的东西：
+ *   路径分隔符与 Windows 非法字符、控制字符、首尾点与空格、`.`/`..`、Windows 保留设备名、超长。
+ * 返回空串表示不可用（调用方给 400）。
+ */
+function sanitizeModelDirName(input) {
+    let s = String(input == null ? '' : input);
+    s = s.replace(/[\u0000-\u001f\u007f]/g, '');          // 控制字符
+    s = s.replace(/[\\/:*?"<>|]/g, '_');                  // Windows 非法字符 → 下划线
+    s = s.replace(/\s+/g, ' ').trim();                    // 压缩空白
+    s = s.replace(/^[.\s]+/, '').replace(/[.\s]+$/, '');  // 首尾的点/空格（Windows 不允许尾点/尾空格）
+    if (s.length > MODEL_NAME_MAX) s = s.slice(0, MODEL_NAME_MAX).trim();
+    if (!s || s === '.' || s === '..') return '';
+    if (WIN_RESERVED.test(s)) return '';                  // CON / NUL / COM1…
+    return s;
+}
+
+/** 目录名合法性（去路径分隔符 + 必须落在 MODELS_DIR 内），非法返回空串。用于已存在的目录名。 */
+function safeModelDirName(name) {
+    const safe = String(name || '').replace(/[\\/]/g, '');
+    if (!safe || safe === '.' || safe === '..') return '';
+    const target = path.join(MODELS_DIR, safe);
+    return target.startsWith(MODELS_DIR + path.sep) ? safe : '';
+}
+
+/** 目标名被占用时依次试 " (2)"、" (3)"…；exclude 是自己（原地改名不算冲突） */
+async function uniqueDirName(desired, exclude) {
+    const taken = async (n) => {
+        if (n === exclude) return false;
+        const st = await stat(path.join(MODELS_DIR, n)).catch(() => null);
+        return Boolean(st);
+    };
+    if (!(await taken(desired))) return desired;
+    for (let i = 2; i < 1000; i++) {
+        const cand = desired + ' (' + i + ')';
+        if (!(await taken(cand))) return cand;
+    }
+    return '';
+}
+
+/** 重命名模型：真改文件夹（目录名即显示名） */
+async function renameModel(body, res) {
+    const safe = safeModelDirName(body && body.name);
+    if (!safe) return jsonResponse(res, 400, { ok: false, message: '模型名无效' });
+    const oldPath = path.join(MODELS_DIR, safe);
+    const info = await stat(oldPath).catch(() => null);
+    if (!info || !info.isDirectory()) return jsonResponse(res, 404, { ok: false, message: '模型不存在' });
+
+    const desired = sanitizeModelDirName(body && body.displayName);
+    if (!desired) return jsonResponse(res, 400, { ok: false, message: '名字不能为空（也不能只含 . / \\ : * ? " < > | 这类字符）' });
+    if (desired === safe) return jsonResponse(res, 200, { ok: true, name: safe, newName: safe, unchanged: true });
+
+    const target = await uniqueDirName(desired, safe);
+    if (!target) return jsonResponse(res, 500, { ok: false, message: '重名太多，换个名字试试' });
+    const newPath = path.join(MODELS_DIR, target);
+    if (!newPath.startsWith(MODELS_DIR + path.sep)) return jsonResponse(res, 400, { ok: false, message: '名字无效' });
+
+    try {
+        await rename(oldPath, newPath);
+    } catch (err) {
+        // 目标被占用（Windows 上 rename 到已存在目录会失败）或文件被锁
+        return jsonResponse(res, 500, { ok: false, message: '重命名失败：' + (err.message || err) });
+    }
+    console.log(`[Live2D] 模型重命名: ${safe} → ${target}`);
+    return jsonResponse(res, 200, { ok: true, name: safe, newName: target, displayName: target });
 }
 
 /** 删除模型目录 */
@@ -800,6 +881,12 @@ const server = createServer(async (request, response) => {
         const delMatch = pathname.match(/^\/api\/live2d\/models\/([^/]+)$/);
         if (delMatch && request.method === 'DELETE') {
             return await deleteModel(delMatch[1], response);
+        }
+        // API：重命名模型（只改显示名，不动目录）
+        if (pathname === '/api/live2d/rename' && request.method === 'POST') {
+            let body;
+            try { body = await readJsonBody(request); } catch { return jsonResponse(response, 400, { ok: false, message: '请求无效' }); }
+            return await renameModel(body, response);
         }
         // API：AI Agent 文件操作（权限模式：app=仅应用文件夹；computer=允许操作电脑）
         const isLocal = isLocalRequest(request);

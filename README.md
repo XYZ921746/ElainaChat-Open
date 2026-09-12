@@ -36,8 +36,8 @@
 
 ### 模型管理
 - **应用内上传 zip**：在「设置 → Live2D」上传 Cubism 3 模型压缩包（含 `.model3.json` + `.moc3` + 纹理），服务端解压到 `web/live2d/models/`（该目录 `.gitignore` 不入库）。
-- **模型切换与删除**：下拉切换已上传模型，可单独删除。
-- **zip 解压健壮性**：支持 UTF-8 标志位 + **GBK 兜底解码**（Windows `Compress-Archive` 生成的中文名 zip 常见）、支持 **data descriptor**；目录名使用英文安全 id（`model_xxx`）而展示名保留中文；带路径白名单防目录穿越。
+- **模型切换、重命名与删除**：下拉切换已上传模型，可单独删除；「✏️ 重命名」直接改模型文件夹名（中文、空格都可以，重名自动加序号），每模型的缩放/水印设置会一起迁移。
+- **zip 解压健壮性**：支持 UTF-8 标志位 + **GBK 兜底解码**（Windows `Compress-Archive` 生成的中文名 zip 常见）、支持 **data descriptor**；**目录名直接取 zip 里的文件夹名**（拿不到才退回 `model_<ts>_<rand>`）；带路径白名单防目录穿越。
 
 ### 画面表现
 - **AI 说话嘴部同步（LipSync）**：用 Web Audio `AnalyserNode` 读取**真实 TTS 音量**驱动 `ParamMouthOpenY`，无音量时回落到正弦波；嘴型幅度随情绪变化（激动张嘴大、平静/伤心小）。

@@ -9,6 +9,8 @@ const androidWebRoot = path.join(projectRoot, 'android-app', 'www');
 
 // 同步到安卓 www 的文件（覆盖整个定制版 Web 前端）
 // 注意：live2d/models/ 不随 APK 分发（用户模型本地，运行时上传）
+// 注意：diag-param-bind.html 不在列表里 —— 它依赖服务端的 /api/live2d/models 列模型，
+//       而 APK（Capacitor）没有这个服务端，同步过去也只会报"读取模型列表失败"。
 const filesToCopy = [
     ['index.html', 'index.html'],
     ['diag-live2d.html', 'diag-live2d.html'],
