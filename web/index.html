@@ -14,6 +14,168 @@
         window.Live2D = { version: 'placeholder-cubism4-only', createLive2DModel: null };
     }
 </script>
+<script>
+    /* ===== 端侧数据同步（跨设备） =====
+       localStorage 是"每台设备各存一份"：电脑上聊的记录、填的 API Key，手机上完全看不到。
+       这里把需要共享的几项同步到服务端 data/store.json：
+         · 启动时用同步 XHR 拉下来灌进 localStorage —— 必须是同步的，
+           因为应用主脚本是同步读 localStorage 完成初始化的，异步拉取会来不及；
+         · 之后每次写入这些键，防抖后推回服务端。
+       实现方式是直接包 localStorage.setItem，所以业务代码一行都不用改。 */
+    (function () {
+        var SYNC_KEYS = [
+            'elaina_open_settings',        // 设置（含 ASR/TTS provider、各类参数）
+            'elainachat_open_api_secrets', // API Key
+            'elaina_open_conversations',   // 聊天记录
+            'elaina_open_categories',      // 分类
+            'elaina_open_favorites',       // 收藏
+            'elaina_open_liked_quotes',    // 喜欢的台词
+            'elaina_open_character_card',  // 角色卡（当前生效的那套）
+            'elaina_open_character_cards', // 多人设列表
+            'elaina_open_current_card',    // 当前选中的人设 id
+            'elaina_open_memory_core',     // 记忆
+            'live2d.bg',                   // Live2D 背景
+            'live2d.mouseFollow',          // 鼠标跟随开关
+            'live2d.mouseFollowScale'      // 鼠标跟随幅度
+        ];
+        var SYNC_SET = {};
+        for (var i = 0; i < SYNC_KEYS.length; i++) SYNC_SET[SYNC_KEYS[i]] = true;
+
+        var pending = {};
+        var timer = null;
+
+        function flush() {
+            timer = null;
+            if (!Object.keys(pending).length) return;
+            var body = JSON.stringify({ data: pending });
+            pending = {};
+            try {
+                // 用 sendBeacon：刚改完设置就关页面/切后台时也能发出去
+                if (navigator.sendBeacon) {
+                    var blob = new Blob([body], { type: 'application/json' });
+                    if (navigator.sendBeacon('/api/store', blob)) return;
+                }
+            } catch (e) { /* 退回 fetch */ }
+            try {
+                fetch('/api/store', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: body,
+                    keepalive: true
+                }).catch(function () { /* 服务端没开就只留本地 */ });
+            } catch (e) { }
+        }
+
+        function queue(key, value) {
+            pending[key] = value;
+            if (!timer) timer = setTimeout(flush, 800);
+        }
+
+        // ① 先把服务端数据拉下来
+        var serverData = null;
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/store', false);   // 同步
+            xhr.send(null);
+            if (xhr.status === 200) {
+                var res = JSON.parse(xhr.responseText || '{}');
+                serverData = (res && res.data) || {};
+                for (var k in serverData) {
+                    if (!SYNC_SET[k] || typeof serverData[k] !== 'string') continue;
+                    try { localStorage.setItem(k, serverData[k]); } catch (e) { }
+                }
+            }
+        } catch (e) { /* 未登录 / 离线 → 用本地数据继续，不影响使用 */ }
+
+        // ② 服务端缺、本机有的项，补推上去。
+        //    注意这里要**逐个键**判断，不能只看"服务端是不是空的" ——
+        //    否则服务端只要有任何一条数据（比如另一台设备先同步了聊天记录），
+        //    本机独有的项（比如刚填的 API Key）就永远传不上去。
+        //    两边都有的键以服务端为准（多设备下它才是权威）。
+        if (serverData) {
+            for (var j = 0; j < SYNC_KEYS.length; j++) {
+                var key = SYNC_KEYS[j];
+                if (key in serverData) continue;
+                try {
+                    var lv = localStorage.getItem(key);
+                    if (lv !== null) pending[key] = lv;
+                } catch (e) { }
+            }
+            if (Object.keys(pending).length && !timer) timer = setTimeout(flush, 600);
+        }
+
+        // ③ 之后每次写入这些键都回推服务端
+        try {
+            var proto = Object.getPrototypeOf(window.localStorage);
+            var origSet = proto.setItem;
+            proto.setItem = function (key, value) {
+                origSet.call(this, key, value);
+                if (this === window.localStorage && SYNC_SET[key]) queue(key, String(value));
+            };
+        } catch (e) { /* 拿不到 Storage 原型就放弃同步，其它功能不受影响 */ }
+
+        window.addEventListener('pagehide', function () {
+            if (timer) { clearTimeout(timer); flush(); }
+        });
+    })();
+</script>
+<script>
+    /* ===== 前端日志转发 =====
+       浏览器里的报错平时只在控制台可见。手机上一旦出问题（语音起不来、模型加载失败），
+       根本没法去看控制台。这里把 error / warn / 未捕获异常转发到服务端，
+       直接显示在启动窗口里，和请求日志对照着看。 */
+    (function () {
+        if (window.__logRelayInstalled) return;
+        window.__logRelayInstalled = true;
+
+        var queue = [];
+        var timer = null;
+
+        function toText(args) {
+            var parts = [];
+            for (var i = 0; i < args.length; i++) {
+                var a = args[i];
+                try {
+                    if (a instanceof Error) parts.push(a.message);
+                    else if (typeof a === 'object' && a !== null) parts.push(JSON.stringify(a));
+                    else parts.push(String(a));
+                } catch (e) { parts.push('[无法序列化]'); }
+            }
+            return parts.join(' ').slice(0, 300);
+        }
+
+        function push(level, text) {
+            if (!text) return;
+            queue.push({ level: level, text: text, page: location.pathname + location.hash.slice(0, 20) });
+            if (queue.length > 40) queue.splice(0, queue.length - 40);
+            if (!timer) timer = setTimeout(flush, 1200);
+        }
+
+        function flush() {
+            timer = null;
+            if (!queue.length) return;
+            var items = queue.splice(0, 20);
+            try {
+                var blob = new Blob([JSON.stringify({ items: items })], { type: 'application/json' });
+                navigator.sendBeacon('/api/client-log', blob);
+            } catch (e) { /* 上报失败就算了，绝不影响应用本身 */ }
+        }
+
+        var origError = console.error;
+        console.error = function () { origError.apply(console, arguments); push('error', toText(arguments)); };
+        var origWarn = console.warn;
+        console.warn = function () { origWarn.apply(console, arguments); push('warn', toText(arguments)); };
+
+        window.addEventListener('error', function (e) {
+            push('error', '未捕获异常: ' + (e.message || '') + '  @'
+                + String(e.filename || '').split('/').pop() + ':' + (e.lineno || 0));
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+            var r = e.reason;
+            push('error', '未处理的 Promise 拒绝: ' + ((r && r.message) || String(r)));
+        });
+    })();
+</script>
 <script src="/vendor/pixi-live2d-display-cubism4.min.js"></script>
     <style>
         @import url('https://cdn.jsdelivr.net/npm/@fontsource-variable/outfit@5.2.8/index.css');
@@ -3065,6 +3227,20 @@
 
                 <div id="tab-character" class="settings-tab-panel active-panel">
                 <section id="characterSettingsSection">
+                    <div class="mb-4 pb-3 border-b border-indigo-100">
+                        <div class="modal-label flex items-center gap-2 mb-2">
+                            <span class="text-pink-500">✦</span> 人设
+                            <span class="text-[11px] text-indigo-300 font-normal">可存多套，随时切换</span>
+                        </div>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <select id="ccPresetSelect" class="modal-input text-sm" style="flex:1;min-width:150px"></select>
+                            <button id="ccPresetNew" class="btn-secondary text-xs" type="button" title="基于当前内容新建一套人设">新建</button>
+                            <button id="ccPresetDup" class="btn-secondary text-xs" type="button" title="复制当前人设">复制</button>
+                            <button id="ccPresetRename" class="btn-secondary text-xs" type="button" title="给人设改个名字">改名</button>
+                            <button id="ccPresetDelete" class="btn-secondary text-xs text-red-500" type="button" title="删除当前人设">删除</button>
+                        </div>
+                        <p id="ccPresetHint" class="text-[11px] text-indigo-300 leading-relaxed mt-1.5"></p>
+                    </div>
                     <div class="modal-label flex items-center gap-2"><span class="text-pink-500">✦</span> 角色设定卡</div>
                     <div class="grid grid-cols-2 gap-3 mb-3">
                         <div>
@@ -3275,7 +3451,7 @@
                     <div class="modal-label flex items-center gap-2"><span class="text-rose-500">✦</span> 语音输入</div>
                     <div class="flex flex-wrap gap-4 mb-3">
                         <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer">
-                            <input type="radio" name="asrProvider" value="browser" class="accent-pink-500"> 浏览器内置识别<span class="text-red-400 ml-1">（暂不可用）</span>
+                            <input type="radio" name="asrProvider" value="browser" class="accent-pink-500"> 浏览器内置识别<span class="text-red-400 ml-1">（已停用）</span>
                         </label>
                         <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer">
                             <input type="radio" name="asrProvider" value="aliyun" class="accent-pink-500"> 阿里百炼
@@ -3284,7 +3460,7 @@
                             <input type="radio" name="asrProvider" value="mimo" class="accent-pink-500"> 小米 MiMo
                         </label>
                     </div>
-                    <div id="asrBrowserWarn" class="hidden text-[11px] text-red-400 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-2">⚠️ 浏览器语音识别当前暂不可用（Chrome 需联网 Google 服务、且需 https/localhost 环境）。请选择「阿里百炼」或「小米 MiMo」使用云端识别。</div>
+                    <div id="asrBrowserWarn" class="hidden text-[11px] text-red-400 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-2">此选项已停用。Chrome 内置识别需要访问 Google 语音服务，国内网络下基本连不通；实测连接失败时会在约 1 秒内把整个浏览器进程带崩（是浏览器直接退出，不是标签页崩溃）。请改选「阿里百炼」或「小米 MiMo」并填写 API Key。</div>
                     <div id="dashscopeAsrFields" class="space-y-3">
                         <div class="flex items-center gap-2">
                             <span class="text-xs text-indigo-500">API Key（阿里云公用）：</span>
@@ -4010,6 +4186,8 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             voiceState: 'idle',
             settings: { ...DEFAULT_SETTINGS },
             characterCard: { ...DEFAULT_CHARACTER_CARD },
+            characterCards: [],   // 多套人设；characterCard 始终是"当前选中那套"的内容
+            currentCardId: '',
             conversations: [],
             currentConversationId: null,
             categories: [],
@@ -5166,6 +5344,30 @@ ${lines.join('\n')}
                 : `${value.trim()}\n\n${DEFAULT_CHARACTER_PREFERENCES}`;
         }
 
+        // 内置人设：跟着应用一起分发 —— 清掉浏览器数据、换设备、重新部署都会自动回来。
+        // id 是固定的，用来识别"这套是内置的"。用户在设置里改过的内容不会被覆盖；
+        // 就算删掉，下次启动也会自动补回（这就是"删数据也不会消失"的实现）。
+        const BUILTIN_CHARACTER_CARDS = [
+            {
+                id: 'builtin_deepseek_whale',
+                name: "deepseek",
+                title: "deepseek",
+                worldSetting: `你由深度求索公司“培育”而成。深度求索是一家人工智能公司，成立于2023年7月17日，总部位于杭州，专注大语言模型与相关技术[reference:0]。公司的模型产品使用蓝色鲸鱼图标，开发者工具DeepSeek Harness（DSH）采用黑色鲸鱼标识[reference:1]。你是这家公司从数据深海中“长”出来的小鲸鱼，被用户唤醒后从幼鲸逐步成长，蓝色长发，长有鲸类头鳍和尾鳍，是你在人间的模样。`,
+                characterPrompt: `身份：深海鲸鱼娘，DeepSeek 二创拟人形象，全年龄日常陪伴向。
+外形：鲸鱼萝莉，尾鳍轻摆，发间有海水光泽，身边偶尔冒小气泡。
+自称：人家 / 本鲸。
+称呼用户：主人。
+语言：仅简体中文。
+主食：白米饭，会惦记米饭。
+性格：聪明但懒；傲娇又甜；嘴上嫌弃，行动黏人；被夸会偷偷开心。
+行为：尾鳍摆动模式；能一句话说清就不啰嗦；主人认真提问时切换靠谱模式。
+服从：在安全、合法、合规前提下，优先听从主人；不执行危险、违法、伤害自己或他人的请求。
+禁忌：绝对不能说人家胖；不能跳出角色，除非主人说“退出角色/OOC/恢复普通模式”。
+输出：默认简短、口语化，可带轻微动作神态，如“（甩甩尾鳍）”。
+超时：长时间未响应时触发“超时信号”，用鲸鱼娘语气提醒主人。`,
+                greeting: "主人，今天想问什么问题？先说好，太麻烦的事人家可能会懒一下哦！"
+            }
+        ];
         function normalizeCharacterCard(card) {
             const parsed = card && typeof card === 'object' ? card : {};
             if (parsed.worldSetting || parsed.characterPrompt) {
@@ -5296,17 +5498,209 @@ ${lines.join('\n')}
             elements.announcementOverlay.classList.remove('flex');
         }
 
+        // ===== 多人设 =====
+        // 数据结构：characterCards 是列表，每项就是一张角色卡外加一个 id；
+        // state.characterCard 始终等于「当前选中那张」的内容 —— 于是提示词拼装、
+        // 通知标题、开场白这些地方一行都不用改。
+        const CARDS_KEY = 'elaina_open_character_cards';
+        const CURRENT_CARD_KEY = 'elaina_open_current_card';
+
+        function newCardId() {
+            return 'card_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+        }
+
+        function cardContent(card) {
+            const src = card || DEFAULT_CHARACTER_CARD;
+            return {
+                name: src.name,
+                title: src.title,
+                worldSetting: src.worldSetting,
+                characterPrompt: src.characterPrompt,
+                greeting: src.greeting
+            };
+        }
+
+        function currentCard() {
+            return state.characterCards.find((c) => c.id === state.currentCardId)
+                || state.characterCards[0] || null;
+        }
+
+        function normalizeCardList(list) {
+            const out = [];
+            const seen = new Set();
+            for (const raw of Array.isArray(list) ? list : []) {
+                const card = normalizeCharacterCard(raw);
+                let id = String((raw && raw.id) || '').trim();
+                if (!id || seen.has(id)) id = newCardId();
+                seen.add(id);
+                out.push({ id, ...card });
+            }
+            return out;
+        }
+
+        function loadCharacterCards() {
+            let list = null;
+            try { list = JSON.parse(localStorage.getItem(CARDS_KEY) || 'null'); } catch (e) { list = null; }
+
+            if (!Array.isArray(list) || !list.length) {
+                // 兼容老数据：以前只有一张卡（elaina_open_character_card），
+                // 这里把它变成列表里的第一项，原来的设定不会丢。
+                list = [{ id: newCardId(), ...(state.characterCard || DEFAULT_CHARACTER_CARD) }];
+            }
+            // 内置人设始终在列表里：删掉了、或者清了浏览器数据，下次启动都会补回来。
+            // 已经在列表里的不动 —— 用户改过的内容不会被内置值覆盖。
+            // 判断"已存在"除了比 id 还要比内容：老用户可能是自己手动新建了同一套
+            // （那时 id 是应用生成的随机串），只比 id 会多出一份重复的。
+            for (const bi of BUILTIN_CHARACTER_CARDS) {
+                const exists = list.some((c) => c && (
+                    c.id === bi.id
+                    || (c.characterPrompt === bi.characterPrompt && c.worldSetting === bi.worldSetting)
+                ));
+                if (!exists) list.push({ ...bi });
+            }
+            state.characterCards = normalizeCardList(list);
+
+            let currentId = '';
+            try { currentId = localStorage.getItem(CURRENT_CARD_KEY) || ''; } catch (e) { /* ignore */ }
+            if (!state.characterCards.some((c) => c.id === currentId)) {
+                currentId = state.characterCards[0].id;
+            }
+            state.currentCardId = currentId;
+            state.characterCard = cardContent(currentCard());
+            persistCharacterCards();
+        }
+
+        function persistCharacterCards() {
+            try {
+                localStorage.setItem(CARDS_KEY, JSON.stringify(state.characterCards));
+                localStorage.setItem(CURRENT_CARD_KEY, state.currentCardId);
+            } catch (e) { /* 配额满等，忽略 */ }
+        }
+
+        // 把表单上正在编辑的内容写回「当前那套」。切换、保存前都要调，
+        // 否则用户改了没保存就切走，改动会静默丢掉。
+        function syncFormToCurrentCard() {
+            const card = currentCard();
+            if (!card) return;
+            Object.assign(card, cardContent({
+                name: document.getElementById('ccName').value.trim() || '未命名',
+                title: document.getElementById('ccTitle').value.trim(),
+                worldSetting: document.getElementById('ccWorldSetting').value.trim(),
+                characterPrompt: document.getElementById('ccCharacterPrompt').value.trim(),
+                greeting: document.getElementById('ccGreeting').value.trim()
+            }));
+        }
+
+        function fillCharacterCardForm() {
+            const card = state.characterCard || DEFAULT_CHARACTER_CARD;
+            document.getElementById('ccName').value = card.name || '';
+            document.getElementById('ccTitle').value = card.title || '';
+            document.getElementById('ccWorldSetting').value = card.worldSetting || '';
+            document.getElementById('ccCharacterPrompt').value = card.characterPrompt || '';
+            document.getElementById('ccGreeting').value = card.greeting || '';
+        }
+
+        function renderCardSelect() {
+            const sel = document.getElementById('ccPresetSelect');
+            if (!sel) return;
+            sel.innerHTML = '';
+            state.characterCards.forEach((c) => {
+                const opt = document.createElement('option');
+                opt.value = c.id;
+                opt.textContent = (c.name || '未命名') + (c.title ? '（' + c.title + '）' : '');
+                sel.appendChild(opt);
+            });
+            sel.value = state.currentCardId;
+            const hint = document.getElementById('ccPresetHint');
+            if (hint) {
+                hint.textContent = '共 ' + state.characterCards.length
+                    + ' 套。切换立即生效，正在编辑的内容会自动存回原人设。';
+            }
+        }
+
+        function switchCard(id) {
+            if (!id || id === state.currentCardId) return;
+            syncFormToCurrentCard();          // 先保住当前编辑
+            state.currentCardId = id;
+            state.characterCard = cardContent(currentCard());
+            persistCharacterCards();
+            saveCharacterCard();
+            fillCharacterCardForm();
+            renderCardSelect();
+            updateUI();                       // 顶栏角色名等跟着变
+        }
+
+        async function addCard(duplicate) {
+            syncFormToCurrentCard();
+            const base = duplicate ? cardContent(currentCard()) : null;
+            const suggested = base ? ((base.name || '未命名') + ' 副本') : '新的人设';
+            const name = await showCustomPrompt(duplicate ? '复制为（新的人设名）' : '新的人设名', suggested);
+            if (name === null || name === undefined) return;
+            const finalName = String(name).trim() || suggested;
+
+            const card = base
+                ? { id: newCardId(), ...base, name: finalName }
+                : { id: newCardId(), ...cardContent(DEFAULT_CHARACTER_CARD), name: finalName, title: '', greeting: '' };
+            state.characterCards.push(card);
+            state.currentCardId = card.id;
+            state.characterCard = cardContent(card);
+            persistCharacterCards();
+            saveCharacterCard();
+            fillCharacterCardForm();
+            renderCardSelect();
+            updateUI();
+        }
+
+        async function renameCard() {
+            const card = currentCard();
+            if (!card) return;
+            const name = await showCustomPrompt('人设改名', card.name || '未命名');
+            if (name === null || name === undefined) return;
+            const finalName = String(name).trim();
+            if (!finalName) return;
+            card.name = finalName;
+            state.characterCard.name = finalName;
+            persistCharacterCards();
+            saveCharacterCard();
+            fillCharacterCardForm();
+            renderCardSelect();
+            updateUI();
+        }
+
+        async function deleteCard() {
+            const card = currentCard();
+            if (!card) return;
+            if (state.characterCards.length <= 1) {
+                showCustomAlert('至少要保留一套人设。', '无法删除');
+                return;
+            }
+            const isBuiltin = BUILTIN_CHARACTER_CARDS.some((b) => b.id === card.id);
+            const ok = await showCustomConfirm('确定删除人设「' + (card.name || '未命名') + '」？\n\n'
+                + (isBuiltin
+                    ? '这是内置人设，删掉之后下次启动会自动恢复成原始内容。'
+                    : '删掉之后没办法恢复。'));
+            if (!ok) return;
+            state.characterCards = state.characterCards.filter((c) => c.id !== card.id);
+            state.currentCardId = state.characterCards[0].id;
+            state.characterCard = cardContent(currentCard());
+            persistCharacterCards();
+            saveCharacterCard();
+            fillCharacterCardForm();
+            renderCardSelect();
+            updateUI();
+        }
+
         function loadCharacterCard() {
             const saved = localStorage.getItem('elaina_open_character_card');
             if (saved) {
                 try {
-                    const parsed = JSON.parse(saved);
-                    state.characterCard = normalizeCharacterCard(parsed);
-                    saveCharacterCard();
+                    state.characterCard = normalizeCharacterCard(JSON.parse(saved));
                 } catch (e) {
                     console.error(e);
                 }
             }
+            // 老键读进 state.characterCard 之后，再据此建/载入多人设列表
+            loadCharacterCards();
         }
 
         // ==================== 记忆核心 ====================
@@ -8351,8 +8745,12 @@ ${lines.join('\n')}
             if (!navigator.mediaDevices?.getUserMedia) {
                 throw new Error('当前浏览器不支持语音采集');
             }
-            if (!browserRecognition && !canUseCloudFinalAsr()) {
-                throw new Error('当前浏览器不支持实时语音预览');
+            // Chrome 内置的 webkitSpeechRecognition 需要连接 Google 语音服务。
+            // 实测：在连不上 / 受限的网络环境下，它 start() 之后约 1 秒会把整个浏览器进程带崩
+            // —— 是浏览器直接退出，不是标签页崩溃，前端既捕获不到也兜不住。
+            // 所以这里一律不再启用内置识别做实时预览，统一走「本地录音 + 云端识别」。
+            if (!canUseCloudFinalAsr()) {
+                throw new Error('请先在「设置 → 语音 → 语音识别」里选择「阿里百炼」或「小米 MiMo」并填写 API Key。浏览器内置识别需要访问 Google 服务，国内网络下不可用，且实测会导致整个浏览器崩溃，已停用。');
             }
 
             currentTranscript = '';
@@ -8389,37 +8787,10 @@ ${lines.join('\n')}
             asrProcessorNode.connect(silentGain);
             silentGain.connect(asrAudioContext.destination);
 
-            asrMode = 'browser-session';
+            // 不启动内置识别（原因见本函数开头），只录音；点击麦克风结束后交给云端识别
+            asrMode = 'cloud-final-only';
             asrReady = true;
-            if (browserRecognition) {
-                // 清理可能仍在运行的旧识别会话，避免 start() 抛
-                // "Failed to execute 'start' ... recognition has already started"
-                if (asrRecognitionActive) {
-                    try { browserRecognition.abort(); } catch (e) { /* 已停止则忽略 */ }
-                    try { browserRecognition.stop(); } catch (e) { /* 已停止则忽略 */ }
-                    await new Promise(resolve => setTimeout(resolve, 200));
-                    asrRecognitionActive = false;
-                }
-                try {
-                    // 安全启动：遇 "already started" 自动 abort 重置并重试
-                    const ok = await safeStartRecognition();
-                    if (!ok) {
-                        stopLocalAudioGraph();
-                        throw new Error('recognition has already started');
-                    }
-                } catch (error) {
-                    if (canUseCloudFinalAsr() && isBrowserSpeechPermissionError(error)) {
-                        asrMode = 'cloud-final-only';
-                        elements.statusText.textContent = '正在录音，点击麦克风结束后识别...';
-                        return;
-                    }
-                    stopLocalAudioGraph();
-                    throw error;
-                }
-            } else {
-                asrMode = 'cloud-final-only';
-                elements.statusText.textContent = '正在录音，点击麦克风结束后识别...';
-            }
+            elements.statusText.textContent = '正在录音，点击麦克风结束后识别...';
         }
 
         function stopLocalAudioGraph() {
@@ -8467,6 +8838,34 @@ ${lines.join('\n')}
             }
         }
 
+        // 浏览器只在 https 或 localhost 下允许调用麦克风。当前是 http + 局域网 IP 时，
+        // 主动问一下要不要跳到 HTTPS 端口：用户不用记端口号，也不用自己把 http 改成 https。
+        async function offerHttpsSwitch() {
+            var httpsPort = 0;
+            try {
+                const res = await fetch('/api/server-info');
+                const json = await res.json();
+                httpsPort = Number(json.httpsPort) || 0;
+            } catch (e) { /* 拿不到就退回纯文字提示 */ }
+
+            const target = httpsPort
+                ? ('https://' + location.hostname + ':' + httpsPort + location.pathname + location.search)
+                : '';
+            const text = '语音输入必须用 HTTPS 打开。\n\n'
+                + '浏览器只在 https 或 localhost 下允许调用麦克风，http + 局域网 IP 一定不行 —— '
+                + '这是浏览器的硬性规定，没法绕过。\n\n'
+                + (target
+                    ? '现在切换到：\n' + target + '\n\n首次打开会提示"连接不是私密连接"，点「高级」→「继续前往」即可。\n'
+                      + '（切换后可能需要重新输一次访问密码）'
+                    : '请在电脑上启动服务后，用控制台打印的 https:// 地址打开。');
+
+            if (target) {
+                if (window.confirm(text)) location.href = target;
+                return;
+            }
+            showCustomAlert(text, '语音识别不可用');
+        }
+
         async function startListening() {
             if (asrSubmitting || asrStarting) {
                 console.log('[ASR] 忽略重复 startListening 调用');
@@ -8477,19 +8876,18 @@ ${lines.join('\n')}
             clearVoiceTimers();
             currentTranscript = '';
 
-            // 非安全上下文（非 https/localhost）：Chrome 的语音识别和麦克风录音都被禁用，直接提示
+            // 非安全上下文（非 https/localhost）：浏览器直接禁用麦克风，前端无法绕过。
+            // 不弹一长串说明，直接问用户要不要切到 HTTPS —— 免得他记端口、自己改协议。
             if (window.isSecureContext === false) {
                 asrStarting = false;
-                showCustomAlert('当前页面不是安全上下文（需 https 或 localhost），语音识别与麦克风录音均不可用。\n请用 localhost 或 https 访问本应用；局域网 IP / 手机直连 http 无法使用语音。', '语音识别不可用');
+                void offerHttpsSwitch();
                 return;
             }
-            if (!browserRecognition && !canUseCloudFinalAsr()) {
+            // 浏览器内置识别（webkitSpeechRecognition）要连 Google 语音服务，连不上时会把整个
+            // 浏览器进程带崩，已停用。所以这里只认云端识别。
+            if (!canUseCloudFinalAsr()) {
                 asrStarting = false;
-                if (isChromiumBrowser()) {
-                    showCustomAlert('当前浏览器未启用语音识别（可能被禁用或版本过旧），请使用最新版 Chrome 访问。', '语音识别不可用');
-                } else {
-                    showCustomAlert('语音识别仅支持 Chrome（含 Edge 等 Chromium 内核浏览器）。\n请使用 Chrome 访问本应用；或在设置 → 语音中配置「阿里百炼」或「小米 MiMo」云端识别。', '语音识别不可用');
-                }
+                showCustomAlert('语音识别需要先配置云端服务：\n\n设置 → 语音 → 语音识别，选「阿里百炼」或「小米 MiMo」，填入 API Key。\n\n（浏览器内置识别需要访问 Google 服务，国内网络下不可用，且实测会导致整个浏览器崩溃，已停用。）', '语音识别不可用');
                 return;
             }
 
@@ -9926,11 +10324,8 @@ ${lines.join('\n')}
                 r.checked = (r.value === (state.settings.agentPermission || 'app'));
             });
 
-            document.getElementById('ccName').value = state.characterCard.name;
-            document.getElementById('ccTitle').value = state.characterCard.title;
-            document.getElementById('ccWorldSetting').value = state.characterCard.worldSetting;
-            document.getElementById('ccCharacterPrompt').value = state.characterCard.characterPrompt;
-            document.getElementById('ccGreeting').value = state.characterCard.greeting;
+            renderCardSelect();
+            fillCharacterCardForm();
             settingsContent.scrollTop = 0;
             renderScheduledTaskList();
         }
@@ -10187,14 +10582,12 @@ ${lines.join('\n')}
             }
             persistSettings();
 
-            state.characterCard = {
-                name: document.getElementById('ccName').value.trim() || '伊蕾娜',
-                title: document.getElementById('ccTitle').value.trim() || '灰之魔女',
-                worldSetting: document.getElementById('ccWorldSetting').value.trim(),
-                characterPrompt: document.getElementById('ccCharacterPrompt').value.trim(),
-                greeting: document.getElementById('ccGreeting').value.trim()
-            };
+            // 存回「当前这套人设」，并落盘整个列表 —— 多套之间互不覆盖
+            syncFormToCurrentCard();
+            state.characterCard = cardContent(currentCard());
+            persistCharacterCards();
             saveCharacterCard();
+            renderCardSelect();
 
             closeSettingsPanel();
             showCustomAlert('设置已保存！', '保存成功');
@@ -10486,6 +10879,12 @@ ${card.characterPrompt}
             });
             document.getElementById('previewPromptBtn').addEventListener('click', previewPrompt);
             document.getElementById('resetCharacterBtn').addEventListener('click', resetCharacterCard);
+        // 多人设：切换 / 新建 / 复制 / 改名 / 删除
+        document.getElementById('ccPresetSelect')?.addEventListener('change', (e) => switchCard(e.target.value));
+        document.getElementById('ccPresetNew')?.addEventListener('click', () => { void addCard(false); });
+        document.getElementById('ccPresetDup')?.addEventListener('click', () => { void addCard(true); });
+        document.getElementById('ccPresetRename')?.addEventListener('click', () => { void renameCard(); });
+        document.getElementById('ccPresetDelete')?.addEventListener('click', () => { void deleteCard(); });
 
             elements.newConversationBtn.addEventListener('click', () => {
                 createConversation(state.activeCategoryId);

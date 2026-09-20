@@ -9,8 +9,9 @@ dist/
 #         后面针对子目录的 ! 例外就不会生效（gitignore 的已知行为）。
 # 注意 2：本文件必须保存为 UTF-8。git 是按字节比较路径的，若用 GBK 保存中文规则会静默失效。
 web/live2d/models/*
-# 随仓库分发的默认模型（其余模型仍不入库）
+# 随仓库分发的模型（其余模型仍不入库）
 !web/live2d/models/伊蕾娜·默认/
+!web/live2d/models/deepseek/
 
 # 本地打包压缩包，不入库
 *.zip
@@ -18,12 +19,19 @@ web/live2d/models/*
 # 局域网访问密码（本机凭据，禁止入库）
 web/.local-auth.json
 
+# 应用数据目录：跨设备同步的聊天记录 / 设置 / API Key，以及自签 HTTPS 证书。
+# 里面全是本机私密数据，绝对不能入库。
+data/
+
 # 签名与本地环境
 *.jks
 *.keystore
 local.properties
 .env
 .env.*
+
+# AI 工作记录（不属于项目内容，只是本机的辅助笔记）
+.workbuddy-ai/
 
 # 依赖、日志、系统垃圾
 node_modules/

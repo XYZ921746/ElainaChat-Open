@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title ElainaChat Open Server
 cd /d "%~dp0"
 where node >nul 2>nul

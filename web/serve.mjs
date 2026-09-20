@@ -1,7 +1,10 @@
 import { createReadStream } from 'node:fs';
 import { stat, lstat, mkdir, writeFile, readFile, readdir, rm, rename } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { randomBytes, scrypt, createHash, timingSafeEqual } from 'node:crypto';
+import { createServer as createSecureServer } from 'node:https';
+import { createServer as createNetServer } from 'node:net';
+import { execFileSync } from 'node:child_process';
+import { randomBytes, scrypt, createHash, timingSafeEqual, X509Certificate } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -11,6 +14,15 @@ import { inflateRawSync } from 'node:zlib';
 const scryptAsync = promisify(scrypt);
 
 const root = path.dirname(fileURLToPath(import.meta.url));
+// 应用根目录（web 的上一级）与其下的 data/：
+//   证书 + 端侧数据存储都放这里。因为它在 web/ 之外，静态文件服务够不到，
+//   不会像放在 web/ 里那样被直接下载走。
+const APP_ROOT = path.resolve(root, '..');
+const DATA_DIR = path.join(APP_ROOT, 'data');
+const STORE_FILE = path.join(DATA_DIR, 'store.json');
+const CERT_FILE = path.join(DATA_DIR, 'cert.pem');
+const KEY_FILE = path.join(DATA_DIR, 'key.pem');
+const STORE_MAX_BYTES = 32 * 1024 * 1024; // 端侧数据（聊天记录等）单次提交上限
 // 默认监听 0.0.0.0：局域网内其他设备（手机/平板）可通过 http://<本机IP>:4173 访问。
 // 可用 HOST 环境变量覆盖（如 HOST=127.0.0.1 仅本机）。
 const host = process.env.HOST || '0.0.0.0';
@@ -505,6 +517,12 @@ function isAllowedHost(request) {
     return allowedHostNames.has(hostname);
 }
 
+// 本机回环地址：它们本身就是浏览器的安全上下文（localhost 豁免），
+// 为了麦克风跳到 https 没有意义，只会白多一次证书警告。
+function isLoopbackHostname(h) {
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
 // 同站校验：第三方页面用 <img> / <script> / <a> 发起的 GET 不会带 Origin，
 // 但一定会带 Sec-Fetch-Site: cross-site —— 这正是"任意网页都能读本机文件"的口子。
 // 少数浏览器 / 旧版本不带 Sec-Fetch-*，所以再补一条：只要带了 Origin 且与 Host 不同源，
@@ -516,6 +534,144 @@ function isCrossSiteRequest(request) {
     const origin = request.headers.origin;
     if (!origin) return false;
     try { return new URL(origin).host !== (request.headers.host || ''); } catch { return true; }
+}
+
+// ===== HTTPS（手机端麦克风需要 secure context） =====
+// 浏览器只允许在 https:// 或 localhost 下调 getUserMedia。手机通过 http://<局域网IP>:4173
+// 访问时 navigator.mediaDevices 直接就是 undefined，所以语音输入在手机上必然不可用 ——
+// 这是浏览器的硬性规定，前端没有任何绕过办法，只能补一个 HTTPS 端口。
+// 证书自签，首次启动时生成到 data/ 下；手机上会提示"证书不受信任"，点继续即可。
+const HTTPS_PORT = Number(process.env.HTTPS_PORT || 4174);
+
+function isPrivateIPv4(ip) {
+    const p = String(ip).split('.').map(Number);
+    if (p.length !== 4 || p.some((n) => !Number.isInteger(n))) return false;
+    return p[0] === 10
+        || (p[0] === 172 && p[1] >= 16 && p[1] <= 31)
+        || (p[0] === 192 && p[1] === 168);
+}
+
+function localIPv4List() {
+    const out = [];
+    for (const list of Object.values(os.networkInterfaces())) {
+        for (const ni of list || []) {
+            if (ni.family === 'IPv4' && !ni.internal) out.push(ni.address);
+        }
+    }
+    // 私有网段排前面：手机/平板能连上的通常是 192.168.x.x / 10.x / 172.16-31.x，
+    // 而 VPN、虚拟网卡（常常是公网段，比如 26.x）手机根本连不到，
+    // 日志里把它排前面会把人带偏。
+    return out.sort((a, b) => (isPrivateIPv4(b) ? 1 : 0) - (isPrivateIPv4(a) ? 1 : 0));
+}
+
+function findOpenssl() {
+    const candidates = [
+        process.env.OPENSSL_PATH,
+        'C:\\Program Files\\Git\\usr\\bin\\openssl.exe',
+        'C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe',
+        'C:\\Program Files (x86)\\Git\\usr\\bin\\openssl.exe',
+        '/usr/bin/openssl',
+        '/usr/local/bin/openssl',
+    ].filter(Boolean);
+    for (const c of candidates) {
+        try { execFileSync(c, ['version'], { stdio: 'ignore' }); return c; } catch { /* 换下一个 */ }
+    }
+    try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); return 'openssl'; } catch { /* 没有 */ }
+    return null;
+}
+
+// 读出证书还剩多少天、以及它是不是我们自己生成的。
+// 自签证书默认 825 天（这是 Chrome / Safari 接受的上限），到期后浏览器会报
+// ERR_CERT_DATE_INVALID —— 所以剩余不足 30 天时自动换新，不用等它坏了再来查。
+function describeCert(certBuf) {
+    try {
+        const x = new X509Certificate(certBuf);
+        return {
+            daysLeft: (new Date(x.validTo).getTime() - Date.now()) / 86400000,
+            selfMade: String(x.subject || '').includes('ElainaChat'),
+        };
+    } catch {
+        return { daysLeft: Infinity, selfMade: false };
+    }
+}
+
+async function ensureCertificate(force = false) {
+    if (!force) {
+        try {
+            const [cert, key] = await Promise.all([readFile(CERT_FILE), readFile(KEY_FILE)]);
+            if (cert.length && key.length) {
+                const info = describeCert(cert);
+                // 用户自己换的证书一律不动；只有我们自己签的才做自动续期
+                if (!info.selfMade || info.daysLeft >= 30) {
+                    return { cert, key, generated: false, daysLeft: info.daysLeft };
+                }
+                console.log('[HTTPS] 自签证书还有 ' + Math.max(0, Math.floor(info.daysLeft)) + ' 天到期，自动换新');
+            }
+        } catch { /* 还没有证书，往下生成 */ }
+    }
+
+    const openssl = findOpenssl();
+    if (!openssl) return null;
+
+    try {
+        await mkdir(DATA_DIR, { recursive: true });
+        // SAN 必须带上局域网 IP，否则手机访问时证书主体对不上，浏览器连"继续访问"都不给
+        const sans = ['DNS:localhost', 'IP:127.0.0.1'];
+        for (const ip of localIPv4List()) sans.push('IP:' + ip);
+        execFileSync(openssl, [
+            'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+            '-keyout', KEY_FILE, '-out', CERT_FILE,
+            '-days', '825',
+            '-subj', '/CN=ElainaChat',
+            '-addext', 'subjectAltName=' + sans.join(','),
+        ], { stdio: 'ignore', timeout: 60000 });
+        const [cert, key] = await Promise.all([readFile(CERT_FILE), readFile(KEY_FILE)]);
+        return { cert, key, generated: true, daysLeft: describeCert(cert).daysLeft };
+    } catch (err) {
+        console.warn('  ! HTTPS 自签证书生成失败：' + (err && err.message ? err.message : err));
+        return null;
+    }
+}
+
+// ===== 端侧数据存储（data/store.json） =====
+// localStorage 是"每台设备各存一份"：电脑上聊的记录、填的 API Key，手机上完全看不到。
+// 这里把需要跨设备共享的那几项落到服务端 data/ 目录，前端启动时拉取、写入时回推。
+function normalizeStore(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const out = {};
+    for (const [k, v] of Object.entries(raw)) {
+        if (typeof k !== 'string' || !k || k.length > 120) continue;
+        if (typeof v !== 'string') continue;              // 只收字符串，与 localStorage 语义一致
+        if (v.length > 8 * 1024 * 1024) continue;         // 单键 8MB 上限
+        out[k] = v;
+    }
+    return out;
+}
+
+let storeCache = null;
+let storeWriteQueue = Promise.resolve();
+
+async function loadStore() {
+    if (storeCache) return storeCache;
+    try {
+        storeCache = normalizeStore(JSON.parse(await readFile(STORE_FILE, 'utf8')));
+    } catch {
+        storeCache = {};   // 文件不存在 / 内容损坏 → 从空开始，不阻塞启动
+    }
+    return storeCache;
+}
+
+// 串行写入 + 先写临时文件再 rename：并发提交不会把文件写成半截
+function saveStore() {
+    storeWriteQueue = storeWriteQueue.then(async () => {
+        await mkdir(DATA_DIR, { recursive: true });
+        const tmp = STORE_FILE + '.tmp';
+        await writeFile(tmp, JSON.stringify(storeCache), 'utf8');
+        await rename(tmp, STORE_FILE);
+    }).catch((err) => {
+        console.error('[store] 写入失败:', err && err.message ? err.message : err);
+    });
+    return storeWriteQueue;
 }
 
 // ===== 访问鉴权（局域网访问控制） =====
@@ -646,6 +802,57 @@ function isSameOrigin(request) {
     try { return new URL(origin).host === (request.headers.host || ''); } catch { return false; }
 }
 
+// ===== 请求日志 =====
+// 目的：启动窗口里直接能看到「谁、什么时候、访问了什么、结果如何」，
+// 排查手机连不上 / 接口报错时不用再去开浏览器控制台。
+const QUIET_FILE_RE = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|map)$/i;
+
+function ipOf(request) {
+    const raw = (request && request.socket && request.socket.remoteAddress) || '';
+    if (raw === '::1') return '127.0.0.1';
+    if (raw.startsWith('::ffff:')) return raw.slice(7);
+    return raw || '?';
+}
+
+function timeStamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+// 把 response 包一层，结束时打一行。
+// 静态资源且成功的不打 —— 否则窗口会被 js / css / 图片刷满，真正的信息反而被埋掉。
+function attachRequestLog(request, response) {
+    const started = Date.now();
+    const origWriteHead = response.writeHead;
+    response.writeHead = function (code, ...rest) {
+        if (!response.__logStatus) response.__logStatus = code;
+        return origWriteHead.call(this, code, ...rest);
+    };
+    response.on('finish', () => {
+        const code = response.__logStatus || response.statusCode || 0;
+        const rawPath = String(request.url || '/');
+        if (code < 400 && QUIET_FILE_RE.test(rawPath.split('?')[0])) return;
+        const ms = Date.now() - started;
+        console.log('[' + timeStamp() + '] '
+            + ipOf(request).padEnd(15) + ' '
+            + String(request.method || '?').padEnd(5) + ' '
+            + (rawPath.length > 52 ? rawPath.slice(0, 49) + '...' : rawPath).padEnd(52) + ' '
+            + String(code).padEnd(4) + String(ms).padStart(5) + 'ms'
+            + (response.__logNote ? '   ' + response.__logNote : '')
+            + (code >= 500 ? '   << 服务端错误' : code >= 400 ? '   << 请求失败' : ''));
+    });
+}
+
+// 302 跳转（可选带一条 Set-Cookie），用于 http → https 升级
+function redirect(res, location, setCookie) {
+    res.__logNote = '=> ' + location;
+    const headers = { Location: location, 'Cache-Control': 'no-store' };
+    if (setCookie) headers['Set-Cookie'] = setCookie;
+    res.writeHead(302, headers);
+    res.end();
+}
+
 function jsonResponse(res, code, obj, extraHeaders = {}) {
     res.writeHead(code, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -747,6 +954,7 @@ function loginPageHtml() {
   .divider { height:1px; background:#e9ddda; margin:18px 0 14px; }
   .hint { margin:0; font-size:11.5px; line-height:1.75; color:#765e52; }
   code { background:#f8f5f2; border:1px solid #e9ddda; color:#738746; padding:1px 6px; border-radius:6px; font-size:11px; }
+  a { color:#738746; font-weight:600; text-decoration:underline; }
 </style>
 </head>
 <body>
@@ -764,8 +972,37 @@ function loginPageHtml() {
       密码显示在服务端启动的 cmd 窗口里（形如 <code>访问密码: xxxxxxxx</code>）。<br>
       如果你已经改过密码，请用改后的那个。
     </p>
+    <div class="divider" id="httpsDivider" style="display:none"></div>
+    <p class="hint" id="httpsHint" style="display:none">
+      要用语音输入？浏览器规定麦克风只能在 HTTPS 下调用，http 打开的页面一定用不了。<br>
+      换成 <a id="httpsLink" href="#">这个 HTTPS 地址</a> 打开即可（首次会提示证书不受信任，
+      点「高级」→「继续前往」）。只是聊天的话，现在这个地址就够了。
+    </p>
   </div>
 <script>
+  // 手机通过「http + 局域网 IP」打开时，语音输入会被浏览器禁用（麦克风只在 https/localhost 下可用）。
+  // 直接把可点的 HTTPS 地址摆出来，用户不用记端口号，也不用自己改协议。
+  (function () {
+    var isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    if (location.protocol !== 'http:' || isLocal) return;
+    fetch('/api/server-info')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        var p = j && j.httpsPort;
+        if (!p) return;
+        // 登录页本身不该被带过去，指向根路径更合适（打开后没登录会自己跳回来）
+        var path = location.pathname === '/login' ? '/' : location.pathname;
+        var url = 'https://' + location.hostname + ':' + p + path + location.search;
+        var a = document.getElementById('httpsLink');
+        if (a) a.href = url;
+        var d = document.getElementById('httpsDivider');
+        var h = document.getElementById('httpsHint');
+        if (d) d.style.display = 'block';
+        if (h) h.style.display = 'block';
+      })
+      .catch(function () { /* 拿不到就不显示，不影响登录 */ });
+  })();
+
   document.getElementById('loginForm').addEventListener('submit', async function (e) {
     e.preventDefault();
     var err = document.getElementById('err');
@@ -788,7 +1025,9 @@ function loginPageHtml() {
 </html>`;
 }
 
-const server = createServer(async (request, response) => {
+// HTTP 与 HTTPS 共用的请求处理器（HTTPS 只是为了手机端能用麦克风，路由逻辑完全一致）
+const requestHandler = async (request, response) => {
+    attachRequestLog(request, response);
     try {
         const url = new URL(request.url || '/', `http://${host}`);
         const pathname = decodeURIComponent(url.pathname);
@@ -805,6 +1044,44 @@ const server = createServer(async (request, response) => {
             return response.end(msg);
         }
 
+        // ①.5 HTTP → HTTPS 自动跳转
+        // 手机用 http + 局域网 IP 打开时，浏览器一定不给麦克风（非安全上下文），
+        // 与其让用户自己把地址改成 https，不如直接跳过去。四条边界：
+        //   1. 只有 HTTPS 真的可用（证书就绪）时才跳，否则跳过去是打不开的
+        //   2. 本机（localhost / 127.0.0.1）不跳 —— 它本来就是安全上下文
+        //   3. /api/ 不跳 —— 前端 fetch 跟着跳转会因跨域失败
+        //   4. 带 ?stay=http 可以留在 http（写 cookie 记住），给"只想聊天、不想点证书警告"的人一条退路；
+        //      ?stay=https 恢复自动跳转
+        if (!request.socket.encrypted) {
+            let urlObj = null;
+            try { urlObj = new URL(request.url || '/', 'http://' + (request.headers.host || 'localhost')); } catch { /* 忽略怪 URL */ }
+            const stay = urlObj ? urlObj.searchParams.get('stay') : null;
+
+            if (stay === 'http') {
+                urlObj.searchParams.delete('stay');
+                return redirect(response, urlObj.pathname + (urlObj.search || ''),
+                    'elaina_stay_http=1; Path=/; Max-Age=31536000; SameSite=Lax');
+            }
+            if (stay === 'https') {
+                return redirect(response, urlObj.pathname, 'elaina_stay_http=; Path=/; Max-Age=0; SameSite=Lax');
+            }
+
+            const reqHostname = hostnameOfHostHeader(request.headers.host);
+            const canUpgrade = Boolean(certInfo)
+                && !pathname.startsWith('/api/')                  // 接口不跳，否则前端 fetch 会炸
+                && !isLoopbackHostname(reqHostname)               // 本机不跳
+                && parseCookies(request)['elaina_stay_http'] !== '1'
+                && /text\/html/i.test(String(request.headers.accept || '')); // 只跳页面导航，不跳静态资源
+            if (canUpgrade) {
+                // 跳到**同一个端口**的 https：每个端口都同时认两种协议，
+                // 所以地址里只有协议变了，用户不用换端口号
+                const hostHeader = String(request.headers.host || '');
+                const colon = hostHeader.lastIndexOf(':');
+                const reqPort = colon > 0 ? hostHeader.slice(colon + 1) : '443';
+                return redirect(response, 'https://' + reqHostname + ':' + reqPort + (request.url || '/'));
+            }
+        }
+
         // ② CSRF：非 GET 的跨站请求一律拒绝（详见 isSameOrigin 说明）
         if (request.method !== 'GET' && request.method !== 'HEAD' && !isSameOrigin(request)) {
             return jsonResponse(response, 403, { ok: false, message: '跨站请求被拒绝' });
@@ -814,6 +1091,17 @@ const server = createServer(async (request, response) => {
         //    /api/agent/read 这类 GET 接口可以被任意网页借本机浏览器读取本地文件。
         if (pathname.startsWith('/api/') && isCrossSiteRequest(request)) {
             return jsonResponse(response, 403, { ok: false, message: '跨站请求被拒绝' });
+        }
+
+        // 服务端信息（无需鉴权，只暴露端口号）：登录页也要用它 —— 手机用 http 打开时
+        // 语音输入会被浏览器禁用，登录页得能给出可点的 HTTPS 地址。
+        if (pathname === '/api/server-info' && request.method === 'GET') {
+            return jsonResponse(response, 200, {
+                ok: true,
+                // 现在**同一个端口**就支持 https，所以返回主端口本身
+                httpsPort: certInfo ? port : 0,
+                httpPort: port,
+            });
         }
 
         // 登录页（无需鉴权）
@@ -841,6 +1129,43 @@ const server = createServer(async (request, response) => {
             }
             response.writeHead(302, { Location: '/login', 'Cache-Control': 'no-store' });
             return response.end();
+        }
+
+        // 前端日志上报：把浏览器控制台里的错误转到启动窗口。
+        // 前端的问题（ASR 起不来、模型加载失败）平时只出现在浏览器控制台里，
+        // 拿手机排查时根本看不到；转过来就能和请求日志对照着看。
+        if (pathname === '/api/client-log' && request.method === 'POST') {
+            let body;
+            try { body = await readJsonBody(request, 64 * 1024); } catch { return jsonResponse(response, 400, { ok: false }); }
+            const items = Array.isArray(body && body.items) ? body.items.slice(0, 20) : [];
+            for (const it of items) {
+                const level = String((it && it.level) || 'log').toUpperCase().slice(0, 5);
+                const page = String((it && it.page) || '').slice(0, 36);
+                const text = String((it && it.text) || '').replace(/\s+/g, ' ').slice(0, 300);
+                if (!text) continue;
+                console.log('[' + timeStamp() + '] ' + ipOf(request).padEnd(15) + ' 页面 '
+                    + level.padEnd(5) + ' ' + (page ? page + '  ' : '') + text);
+            }
+            return jsonResponse(response, 200, { ok: true });
+        }
+
+        // 端侧数据存储：需要跨设备共享的那几项（设置 / 聊天记录 / API Key 等）走这里读写
+        // data/store.json。已过上面的鉴权 —— 本机免密，手机端需要先登录。
+        if (pathname === '/api/store' && request.method === 'GET') {
+            return jsonResponse(response, 200, { ok: true, data: await loadStore() });
+        }
+        if (pathname === '/api/store' && request.method === 'POST') {
+            let body;
+            try {
+                body = await readJsonBody(request, STORE_MAX_BYTES);
+            } catch {
+                return jsonResponse(response, 400, { ok: false, message: '提交内容过大或格式无效' });
+            }
+            const patch = normalizeStore(body && body.data);
+            const store = await loadStore();
+            Object.assign(store, patch);   // 按键合并：只覆盖本次提交的键，不动其它设备的其它键
+            await saveStore();
+            return jsonResponse(response, 200, { ok: true, keys: Object.keys(patch).length });
         }
 
         // 鉴权状态（供设置页展示：是否本机管理员、是否仍是初始随机密码）
@@ -900,6 +1225,13 @@ const server = createServer(async (request, response) => {
             return await agentWrite(request, response, isLocal);
         }
 
+        // 浏览器会自己请求 /favicon.ico，没这个文件就每开一次页面刷一条 404，淹没真正的日志。
+        // 回 204（表示"没有图标"）即可，安静且语义正确。
+        if (pathname === '/favicon.ico') {
+            response.writeHead(204, { 'Cache-Control': 'public, max-age=86400' });
+            return response.end();
+        }
+
         const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
         // 禁止访问隐藏文件：否则 .local-auth.json（访问密码）会被直接下载走
         if (relative.split('/').some(seg => seg.startsWith('.'))) {
@@ -942,22 +1274,22 @@ const server = createServer(async (request, response) => {
             try { response.destroy(); } catch { /* ignore */ }
         }
     }
-});
+};
 
 // 端口被占用等启动错误：给出可读提示，而不是抛一串裸栈
-server.on('error', (err) => {
+function printListenError(err, which, usedPort) {
     if (err && err.code === 'EADDRINUSE') {
         console.error('');
-        console.error('  ✗ 端口 ' + port + ' 已被占用，服务没能启动。');
+        console.error('  ✗ ' + which + ' 端口 ' + usedPort + ' 已被占用，服务没能启动。');
         console.error('    可能是之前已经开着一个 ElainaChat 服务（或其它程序占用了这个端口）。');
         console.error('    解决办法：关掉那个进程，或换个端口启动，例如：');
-        console.error('      set PORT=4174 && node web/serve.mjs');
+        console.error('      set PORT=4175 && set HTTPS_PORT=4176 && node web/serve.mjs');
         console.error('');
     } else {
-        console.error('  ✗ 服务启动失败：', err && err.message ? err.message : err);
+        console.error('  ✗ ' + which + ' 服务启动失败：', err && err.message ? err.message : err);
     }
     process.exitCode = 1;
-});
+}
 
 // 启动前准备访问密码（node web/serve.mjs --reset-password 可强制重新生成）
 if (process.argv.includes('--reset-password')) {
@@ -966,30 +1298,102 @@ if (process.argv.includes('--reset-password')) {
 }
 const authInfo = await ensureAuth();
 
-server.listen(port, host, () => {
+// --reset-cert：强制换一张新的自签证书（比如 SAN 里的局域网 IP 变了、或者怀疑证书坏了）
+const forceNewCert = process.argv.includes('--reset-cert');
+if (forceNewCert) {
+    await rm(CERT_FILE, { force: true });
+    await rm(KEY_FILE, { force: true });
+    console.log('[HTTPS] 已按 --reset-cert 清除旧证书，将重新生成');
+}
+const certInfo = await ensureCertificate(forceNewCert);
+
+// ===== 监听入口：协议分路器 =====
+// 为什么不各自 listen 一个端口：浏览器地址栏只输「192.168.0.200:4173」时，会自动补成 http://，
+// 而麦克风只在 https / localhost 下可用。如果 https 必须走另一个端口，用户就得记住端口号、
+// 还得手动敲 https:// 那 7 个字符 —— 这正是之前踩的坑。
+// 所以让**同一个端口同时认两种协议**：首字节 0x16 是 TLS 握手（交给 https server），
+// 其余（G/P/H 这些请求方法首字母）按明文 HTTP 处理。明文那一路由 requestHandler 里的
+// 「HTTP → HTTPS 自动跳转」接走（本机地址除外）。
+const httpServer = createServer(requestHandler);
+const httpsServer = certInfo
+    ? createSecureServer({ key: certInfo.key, cert: certInfo.cert }, requestHandler)
+    : null;
+
+if (httpsServer) {
+    // TLS 握手失败：排查"手机连不上"时，有这一行就知道对方到底有没有连上来
+    httpsServer.on('tlsClientError', (err, socket) => {
+        const addr = (socket && socket.remoteAddress) ? socket.remoteAddress.replace('::ffff:', '') : '?';
+        console.log('[' + timeStamp() + '] ' + addr.padEnd(15) + ' TLS 握手失败   '
+            + String((err && err.message) || err).slice(0, 100));
+    });
+}
+
+const muxSocket = (socket) => {
+    socket.once('data', (buf) => {
+        if (!buf || !buf.length) { socket.destroy(); return; }
+        socket.pause();
+        socket.unshift(buf);
+        if (buf[0] === 0x16 && httpsServer) httpsServer.emit('connection', socket);
+        else httpServer.emit('connection', socket);
+        process.nextTick(() => socket.resume());
+    });
+};
+
+const mainServer = createNetServer(muxSocket);
+mainServer.on('error', (err) => printListenError(err, 'HTTP/HTTPS', port));
+
+mainServer.listen(port, host, () => {
+    // 只打地址。语音需要 https、证书警告、安全策略这些说明都放在应用里提示，
+    // 启动窗口保持干净 —— 出问题时这一屏全是日志才看得清。
     console.log('');
-    console.log('  本机访问:   http://127.0.0.1:' + port + '   （免密码）');
-    // 监听 0.0.0.0 时额外打印局域网地址，方便手机/平板访问
+    console.log('  本机:     http://127.0.0.1:' + port);
     if (host === '0.0.0.0' || host === '::') {
-        const nets = os.networkInterfaces();
-        for (const name of Object.keys(nets)) {
-            for (const net of nets[name] || []) {
-                if (net.family === 'IPv4' && !net.internal) {
-                    console.log('  局域网访问: http://' + net.address + ':' + port + '   （需要访问密码）');
-                }
-            }
+        for (const ip of localIPv4List()) {
+            console.log('  局域网:   http://' + ip + ':' + port);
         }
     }
-    console.log('');
+    // 只有还是初始随机密码时才打出来（否则用户没地方看密码）。
+    // 自己改过之后不再显示 —— 改密码的入口在应用内的设置里。
     if (authInfo.isDefault) {
-        console.log('  访问密码: ' + authInfo.password + (authInfo.generated ? '   （本次新生成）' : ''));
-        console.log('  可在「设置 → 高级 → 访问密码」改成自己的，改完这里就不再显示。');
-    } else {
-        console.log('  访问密码: 已由你自行设置（不再显示）');
-        console.log('  忘记密码：在本机打开上面的地址重设，或加 --reset-password 重启。');
+        console.log('');
+        console.log('  访问密码: ' + authInfo.password);
     }
     console.log('');
-    console.log('  安全提示：仅允许通过本机/局域网地址访问（防 DNS rebinding）。');
-    console.log('  如果你要用主机名或域名访问，请设置 ALLOWED_HOSTS=你的域名 后重启。');
-    console.log('');
 });
+
+// 兼容入口：老的 https://IP:4174 链接继续可用（两个端口都支持双协议）。
+// 在这个端口上用明文 http 访问时，自动跳到同端口的 https。
+if (httpsServer && HTTPS_PORT !== port) {
+    const legacyServer = createNetServer((socket) => {
+        socket.once('data', (buf) => {
+            if (!buf || !buf.length) { socket.destroy(); return; }
+            socket.pause();
+            if (buf[0] === 0x16) {
+                socket.unshift(buf);
+                httpsServer.emit('connection', socket);
+                process.nextTick(() => socket.resume());
+                return;
+            }
+            // 明文：从请求头解析 Host 和目标路径，回 302 跳到同端口的 https
+            const text = buf.toString('latin1');
+            const hostMatch = /^host:\s*([^\r\n]+)/im.exec(text);
+            const lineMatch = /^[A-Z]+\s+(\S+)/.exec(text);
+            const hostHeader = (hostMatch ? hostMatch[1].trim() : '')
+                || (String(socket.localAddress || '127.0.0.1') + ':' + HTTPS_PORT);
+            let target = lineMatch ? lineMatch[1] : '/';
+            if (!target.startsWith('/')) target = '/' + target;
+            const to = 'https://' + hostHeader + target;
+            const body = '<!doctype html><meta charset="utf-8"><title>跳转到 HTTPS</title>'
+                + '<p style="font:15px/1.7 system-ui,sans-serif;padding:40px">'
+                + '正在跳转到 <a href="' + to + '">' + to + '</a></p>';
+            socket.end('HTTP/1.1 302 Found\r\n'
+                + 'Location: ' + to + '\r\n'
+                + 'Content-Type: text/html; charset=utf-8\r\n'
+                + 'Content-Length: ' + Buffer.byteLength(body) + '\r\n'
+                + 'Cache-Control: no-store\r\n'
+                + 'Connection: close\r\n\r\n' + body);
+        });
+    });
+    legacyServer.on('error', (err) => printListenError(err, 'HTTPS(兼容入口)', HTTPS_PORT));
+    legacyServer.listen(HTTPS_PORT, host);
+}
