@@ -2866,6 +2866,9 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M6 4.5h9.5L18 7v12.5H6z"/><path stroke-linecap="round" stroke-linejoin="round" d="M15.5 4.5V7H18M9 11h6M9 14.5h4"/></svg>
                 </button>
                 <div class="sidebar-rail-spacer" aria-hidden="true"></div>
+                <button id="railBackendBtn" class="sidebar-rail-btn" type="button" title="实现方式" aria-label="实现方式">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4.5" y="4.5" width="15" height="15" rx="3"/><rect x="9.6" y="9.6" width="4.8" height="4.8" rx="1.2"/><path stroke-linecap="round" d="M9 2.5v2M15 2.5v2M9 19.5v2M15 19.5v2M2.5 9h2M2.5 15h2M19.5 9h2M19.5 15h2"/></svg>
+                </button>
                 <button id="railSettingsBtn" class="sidebar-rail-btn" type="button" title="设置" aria-label="设置" data-rail-action="settings">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.73v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.73l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
                 </button>
@@ -3629,8 +3632,8 @@
                         </div>
                     </div>
 
-                    <div class="mt-4 pt-3 border-t border-indigo-100">
-                        <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> AI Agent 权限</div>
+                    <div id="agentPermissionSection" class="mt-4 pt-3 border-t border-indigo-100">
+                        <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> 电脑操作权限</div>
                         <div class="text-[11px] text-indigo-400 mb-2">控制 AI 通过 <code class="text-indigo-500">[操作:…]</code> 标签能执行到哪一层。应用内操作（视频通话/整理记忆/水印/背景等）两种模式都可用。</div>
                         <div class="flex flex-wrap gap-4 mb-2">
                             <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer">
@@ -3641,6 +3644,27 @@
                             </label>
                         </div>
                         <p class="text-[11px] text-indigo-300 leading-relaxed">限制模式：AI 只能读取/写入本应用文件夹（web/）内的文件。允许模式：AI 可读写电脑上的任意路径（通过本地服务执行），请仅在可信环境开启。</p>
+                    </div>
+
+                    <div id="agentPhoneSection" class="mt-4 pt-3 border-t border-indigo-100">
+                        <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> 手机操作</div>
+                        <div class="text-[11px] text-indigo-400 mb-2">允许 AI 操作这台手机：点击、滑动、输入文字、读取界面与截图。需要在安卓版 App 里使用（浏览器没有这个能力）。</div>
+                        <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer mb-3">
+                            <input id="settingAgentPhoneEnabled" type="checkbox" class="accent-pink-500"> 允许 AI 操作手机
+                        </label>
+                        <div class="text-[11px] text-indigo-500 font-semibold mb-1">敏感操作确认</div>
+                        <div class="flex flex-wrap gap-4 mb-2">
+                            <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer">
+                                <input type="radio" name="agentApproval" value="always" class="accent-pink-500"> 每次都询问（推荐）
+                            </label>
+                            <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer">
+                                <input type="radio" name="agentApproval" value="run" class="accent-pink-500"> 同一次运行内允许过就不再问
+                            </label>
+                            <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer">
+                                <input type="radio" name="agentApproval" value="off" class="accent-pink-500"> 不询问
+                            </label>
+                        </div>
+                        <p class="text-[11px] text-indigo-300 leading-relaxed">读取状态、查看界面、截图不需要确认；点击 / 滑动 / 输入 / 打开应用按上面的策略询问；「执行任意系统命令」无论选哪一项都会单独询问。AI 运行期间屏幕上方会显示状态条，随时可以点「停止」。</p>
                     </div>
 
                     <div class="mt-4 pt-3 border-t border-indigo-100">
@@ -3754,6 +3778,56 @@
         </div>
     </div>
 
+    <style>
+        /* AI Agent 运行状态条：运行期间常驻，随时可停止 */
+        .agent-run-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #34d399; flex: none;
+            animation: agentRunPulse 1.4s ease-in-out infinite;
+        }
+        #agentRunBar.is-stopping .agent-run-dot { background: #fbbf24; animation: none; }
+        @keyframes agentRunPulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52, 211, 153, .55); }
+            50% { opacity: .5; box-shadow: 0 0 0 6px rgba(52, 211, 153, 0); }
+        }
+        #agentStopBtn:active { transform: scale(.96); }
+        #agentStopBtn:disabled { opacity: .5; cursor: default; }
+        /* 侧边栏「实现方式」按钮：还没选过实现方式时压暗，提示功能尚未启用 */
+        .sidebar-rail-btn.is-unset { opacity: .42; }
+        .sidebar-rail-btn.is-unset:hover { opacity: .72; }
+    </style>
+
+    <div id="agentRunBar" class="agent-run-bar hidden fixed items-center gap-2" role="status" aria-live="polite"
+         style="left:50%;transform:translateX(-50%);top:88px;z-index:100000;max-width:min(92vw,430px);
+                padding:7px 9px 7px 12px;border-radius:16px;background:rgba(28,25,42,.94);
+                backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+                border:1px solid rgba(255,255,255,.16);box-shadow:0 8px 24px rgba(0,0,0,.3)">
+        <span class="agent-run-dot"></span>
+        <span id="agentRunText" style="flex:none;font-size:12px;color:rgba(255,255,255,.93);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">AI 正在操作</span>
+        <span id="agentRunStep" style="flex:none;font-size:11px;color:rgba(255,255,255,.5);white-space:nowrap"></span>
+        <button id="agentStopBtn" type="button"
+                style="margin-left:2px;flex:none;font-size:12px;font-weight:600;padding:5px 12px;border-radius:10px;
+                       background:rgba(244,63,94,.94);color:#fff;border:0;cursor:pointer">停止</button>
+    </div>
+
+    <!-- 实现方式（后端选择）：由侧边栏的「实现方式」按钮打开 -->
+    <div id="backendPanel" class="fixed inset-0 z-[62] hidden items-center justify-center p-4 modal-overlay">
+        <div class="modal-panel w-full max-w-md max-h-[86vh] flex flex-col overflow-hidden animate-modal-pop">
+            <div class="px-5 py-4 border-b border-white/60 flex items-start gap-3">
+                <div class="flex-1 min-w-0">
+                    <h3 class="text-base font-bold text-indigo-950">实现方式</h3>
+                    <p class="text-[11px] text-indigo-400 mt-0.5 leading-relaxed">AI 用哪种方式操作手机。能力与门槛各不相同，选一个。</p>
+                </div>
+                <button id="backendPanelClose" type="button" class="btn-secondary text-xs flex-shrink-0">关闭</button>
+            </div>
+            <div id="backendList" class="flex-1 overflow-y-auto scroll-soft px-5 py-4 space-y-2"></div>
+            <div class="px-5 py-3 border-t border-white/60 flex items-center gap-3">
+                <p class="text-[11px] text-indigo-300 leading-relaxed flex-1">当前生效：<span id="backendCurrent" class="text-indigo-500 font-semibold">尚未选择</span></p>
+                <button id="backendRefresh" type="button" class="btn-secondary text-xs flex-shrink-0">重新检测</button>
+            </div>
+        </div>
+    </div>
+
     <div id="customModal" class="fixed inset-0 z-[60] hidden items-center justify-center p-4 modal-overlay">
         <div class="modal-panel w-full max-w-sm overflow-hidden animate-modal-pop">
             <div class="px-6 py-5">
@@ -3788,6 +3862,21 @@
         // ==================== 原生（Capacitor APK）Live2D 模型存储适配 ====================
         // APK 没有 Node 后端：/api/live2d/* 接口在本机用 Capacitor Filesystem 实现
         const IS_NATIVE_APP = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+        // 设备形态：决定「设置 → 高级」里显示电脑侧还是手机侧的 Agent 权限。
+        // 注意与 isMobileConversationLayout() 的区别：那个看的是窗口宽度（决定排版），
+        // 这个看的是设备本身（决定给用户看哪组设置）—— 电脑上把窗口拖窄不该变成"手机"。
+        const IS_MOBILE_DEVICE = (function () {
+            try {
+                if (IS_NATIVE_APP) return true;   // 安卓版 App 一律按手机处理
+                const ua = String(navigator.userAgent || '');
+                if (/Android|iPhone|iPad|iPod|Windows Phone|HarmonyOS|Mobile/i.test(ua)) return true;
+                // iPadOS 13+ 的 UA 伪装成 Macintosh，只能靠触摸点数区分：
+                // iPad 是 5 点，真 Mac 桌面是 0。阈值取 1 以上是为了避开
+                // "Mac + 单点触摸" 这类奇异环境。
+                if (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) return true;
+            } catch (e) { /* 判断失败按电脑处理 */ }
+            return false;
+        })();
         let nativeModelRootReady = false;
 
         function nativeFs() {
@@ -3813,6 +3902,53 @@
                 console.log('[Native] Live2D 模型目录:', window.__nativeModelBase);
             } catch (e) {
                 console.warn('[Native] 初始化模型存储失败', e);
+            }
+        }
+
+        // 内置模型：随 APK 一起打包的只读副本（www/live2d/models/）。
+        // APK 里没有服务端，模型只能从本地取；这里在启动时按 manifest.json 把内置模型
+        // 复制进应用数据目录，之后列表扫描与资源寻址跟用户上传的模型完全同路，无需另做适配。
+        // 数据目录里已有同名模型（用户传过、或上次已种过）就不动它，不覆盖用户的东西。
+        async function seedBundledLive2dModels() {
+            if (!IS_NATIVE_APP || !nativeModelRootReady) return;
+            const fs = nativeFs();
+            if (!fs) return;
+            const dir = (fs.Directory && fs.Directory.Data) ? fs.Directory.Data : 'DATA';
+            let manifest;
+            try {
+                const res = await fetch('/live2d/models/manifest.json', { cache: 'no-store' });
+                if (!res.ok) return; // 没有打包模型是正常情况，不是错误
+                manifest = await res.json();
+            } catch (e) {
+                console.warn('[Native] 读取内置模型清单失败', e);
+                return;
+            }
+            const models = Array.isArray(manifest && manifest.models) ? manifest.models : [];
+            if (!models.length) return;
+            for (const entry of models) {
+                const name = String((entry && entry.name) || '');
+                const files = Array.isArray(entry && entry.files) ? entry.files : [];
+                if (!name || !files.length) continue;
+                try {
+                    const existing = await fs.readdir({ path: 'live2d/models/' + name, directory: dir });
+                    if ((existing.files || []).length) continue; // 已存在，跳过
+                } catch (e) { /* 目录不存在 → 继续种 */ }
+                let written = 0;
+                for (const rawRel of files) {
+                    const rel = String(rawRel).replace(/\\/g, '/').replace(/^\.?\//, '');
+                    if (!rel || rel.split('/').includes('..')) continue; // 防目录穿越
+                    const encoded = rel.split('/').map(encodeURIComponent).join('/');
+                    try {
+                        const res = await fetch('/live2d/models/' + encodeURIComponent(name) + '/' + encoded);
+                        if (!res.ok) continue;
+                        const bytes = new Uint8Array(await res.arrayBuffer());
+                        await nativeWriteFile('live2d/models/' + name + '/' + rel, dir, bytes);
+                        written++;
+                    } catch (e) {
+                        console.warn('[Native] 内置模型文件写入失败:', rel, e);
+                    }
+                }
+                console.log('[Native] 内置模型「' + name + '」已就绪:', written + '/' + files.length, '个文件');
             }
         }
 
@@ -3970,7 +4106,11 @@
             };
         }
         if (IS_NATIVE_APP) {
-            initNativeLive2dStorage();
+            // 顺序不能反：先建目录并拿到 base URL（nativeModelRootReady），再种内置模型。
+            // 暴露成 Promise，好让模型列表在种完之前等一下（见 live2d-video.js 的 refreshModelList）。
+            window.__nativeSeedPromise = initNativeLive2dStorage()
+                .then(seedBundledLive2dModels)
+                .catch((e) => { console.warn('[Native] 内置模型初始化失败', e); });
         }
         const CHAT_API_FORMATS = Object.freeze({
             openai: {
@@ -4153,6 +4293,9 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             autoMemory: false,
             memoryEvery: 6,
             agentPermission: 'app',
+            agentApproval: 'always',
+            agentPhoneEnabled: true,
+            agentBackend: '',   // 空 = 还没选过实现方式（此时不启用手机操作，入口按钮灰显）
             visionBaseUrl: '',
             visionApiKey: '',
             visionModel: ''
@@ -5463,11 +5606,19 @@ ${lines.join('\n')}
             if (!String(state.settings.baseUrl || '').trim()) state.settings.baseUrl = preset.defaultBaseUrl;
             if (!String(state.settings.model || '').trim()) state.settings.model = preset.defaultModel;
             if (!['browser', 'aliyun', 'mimo'].includes(state.settings.asrProvider)) state.settings.asrProvider = 'browser';
+            // 手机操作授权策略：非法值一律回落到「每次都询问」（安全默认）
+            if (!['always', 'run', 'off'].includes(state.settings.agentApproval)) state.settings.agentApproval = 'always';
+            if (typeof state.settings.agentPhoneEnabled !== 'boolean') state.settings.agentPhoneEnabled = true;
+            // 实现方式：空表示「还没选过」；非法值一律回落到空（要求用户明确选择，不替他决定）
+            if (!['', 'accessibility', 'adb', 'root', 'module'].includes(state.settings.agentBackend)) state.settings.agentBackend = '';
             // 旧版迁移：ASR Key 以前复用 TTS 的 dashscopeApiKey，现迁移到独立 asrApiKey
             if (!String(state.settings.asrApiKey || '').trim() && String(state.settings.dashscopeApiKey || '').trim()) {
                 state.settings.asrApiKey = state.settings.dashscopeApiKey;
             }
             if (!['minimax', 'doubao', 'dashscope'].includes(state.settings.ttsProvider)) state.settings.ttsProvider = 'minimax';
+            // 设置加载完再同步一次入口按钮的灰显状态：
+            // 脚本顶层那次调用可能早于 loadSettings()，会误把已选的实现方式显示成未选。
+            syncBackendEntryButton();
         }
 
         function isFirstInstall() {
@@ -6348,8 +6499,521 @@ ${lines.join('\n')}
                     rest = rest.replace(/^["']|["']$/g, '').trim();
                     void doAgentFile(action, { path: rest || undefined }, permission);
                 }
+            },
+            // 手机操作：[操作:手机点击 500 800] 等。
+            // 「停止检查 + 敏感操作授权」由 agentRuntime 统一处理（见 runAgentPhoneOperation）。
+            agentPhoneOperation(raw) {
+                void runAgentPhoneOperation(raw);
             }
         };
+
+        // ===== AI Agent 运行时：可随时停止 + 敏感操作需用户授权 =====
+        // 设计：
+        //  1. 停止是「请求式」——设置标志、中断在途请求、关掉等待中的确认弹窗，
+        //     再由各执行点调用 assertNotStopped() 主动退出。不强杀，避免留下半完成状态。
+        //  2. 授权按风险分级：safe 不问 / sensitive 可配置 / dangerous 必问。
+        //     被拒绝不静默失败，回灌给模型让它换方式。
+        const AGENT_RISK = {
+            '手机状态': 'safe',
+            '手机查看界面': 'safe',
+            '手机截图': 'safe',
+            '手机等待': 'safe',
+            '手机点击': 'sensitive',
+            '手机滑动': 'sensitive',
+            '手机输入': 'sensitive',
+            '手机按键': 'sensitive',
+            '手机打开': 'sensitive',
+            '手机命令': 'dangerous'
+        };
+
+        const agentRuntime = (function () {
+            let running = false;
+            let stopRequested = false;
+            let halted = false;          // 本批次已被用户停止：拒绝后续动作，直到下一批开始
+            let stopReason = '';
+            let step = 0;
+            let currentAction = '';
+            const approvedThisRun = new Set();   // 策略为 run 时，本次运行内已授权的动作
+            const aborters = new Set();          // 在途请求的 AbortController
+            let approvalOpen = false;
+
+            const barEl = () => document.getElementById('agentRunBar');
+            const textEl = () => document.getElementById('agentRunText');
+            const stepEl = () => document.getElementById('agentRunStep');
+            const stopBtnEl = () => document.getElementById('agentStopBtn');
+
+            function render() {
+                const b = barEl();
+                if (!b) return;
+                b.classList.toggle('hidden', !running);
+                b.classList.toggle('flex', running);
+                b.classList.toggle('is-stopping', stopRequested);
+                const t = textEl();
+                if (t) t.textContent = stopRequested ? '正在停止' : (currentAction ? 'AI 正在操作' : 'AI 正在思考');
+                const s = stepEl();
+                if (s) s.textContent = running ? ('第 ' + step + ' 步' + (currentAction ? ' · ' + currentAction : '')) : '';
+                const btn = stopBtnEl();
+                if (btn) { btn.disabled = stopRequested; btn.textContent = stopRequested ? '停止中' : '停止'; }
+            }
+
+            /** 每条 AI 回复的处理入口调用一次：开启新批次，解除上一批留下的停止状态 */
+            function beginBatch() {
+                halted = false;
+            }
+
+            function beginRun() {
+                running = true;
+                stopRequested = false;
+                stopReason = '';
+                step = 0;
+                currentAction = '';
+                approvedThisRun.clear();
+                render();
+            }
+
+            function endRun() {
+                running = false;
+                stopRequested = false;
+                aborters.clear();
+                currentAction = '';
+                render();
+            }
+
+            function requestStop(reason) {
+                if (!running || stopRequested) return false;
+                stopRequested = true;
+                halted = true;              // 粘性：本批次后续动作一律拒绝，避免停止后又自己重启
+                stopReason = String(reason || '用户停止');
+                for (const c of aborters) { try { c.abort(); } catch (e) { /* 忽略 */ } }
+                aborters.clear();
+                // 关掉正在等待的确认弹窗（按「拒绝」处理）
+                if (approvalOpen) { try { elements.customModalCancelBtn?.click(); } catch (e) { /* 忽略 */ } }
+                render();
+                return true;
+            }
+
+            function assertNotStopped() {
+                if (!stopRequested) return;
+                const err = new Error(stopReason || '已停止');
+                err.agentAborted = true;
+                throw err;
+            }
+
+            /** 把在途请求的 controller 交给运行时，停止时统一中断 */
+            function track(controller) {
+                if (controller && typeof controller.abort === 'function') aborters.add(controller);
+                return controller;
+            }
+
+            function riskOf(action) { return AGENT_RISK[action] || 'sensitive'; }
+
+            /** 敏感操作授权。返回 true 表示可以执行。 */
+            async function requestApproval(action, detail) {
+                const risk = riskOf(action);
+                if (risk === 'safe') return true;
+                if (stopRequested) return false;
+                const policy = state.settings.agentApproval || 'always';
+                if (risk !== 'dangerous') {
+                    if (policy === 'off') return true;
+                    if (policy === 'run' && approvedThisRun.has(action)) return true;
+                }
+                const lines = ['AI 想执行：' + action];
+                if (detail) lines.push('', detail);
+                lines.push('', risk === 'dangerous'
+                    ? '这是可以执行任意系统命令的操作，风险很高，请确认你信任当前对话里出现的内容。'
+                    : '该操作会改变手机状态。拒绝后 AI 会收到通知并尝试别的方式，不会卡住。');
+                if (risk !== 'dangerous' && policy === 'always') {
+                    lines.push('', '（想减少打扰：设置 → 高级 → 手机操作授权，可改为「同一次运行内允许过就不再问」）');
+                }
+                approvalOpen = true;
+                let ok = false;
+                try {
+                    ok = await showCustomModal({
+                        title: risk === 'dangerous' ? '危险操作确认' : '敏感操作确认',
+                        message: lines.join('\n'),
+                        confirmText: '允许这次',
+                        cancelText: '拒绝'
+                    });
+                } catch (e) { ok = false; }
+                approvalOpen = false;
+                if (!ok) return false;
+                if (policy === 'run') approvedThisRun.add(action);
+                return !stopRequested;   // 用户可能在弹窗期间点了停止
+            }
+
+            function setStep(n, action) {
+                step = Number(n) || 0;
+                currentAction = String(action || '');
+                render();
+            }
+
+            return {
+                beginBatch, beginRun, endRun, requestStop, assertNotStopped, track, requestApproval, setStep, render,
+                isRunning: () => running,
+                isStopRequested: () => stopRequested,
+                isHalted: () => halted,
+                getStep: () => step,
+                riskOf
+            };
+        })();
+
+        window.agentRuntime = agentRuntime;
+
+        document.getElementById('agentStopBtn')?.addEventListener('click', () => {
+            if (agentRuntime.requestStop('用户点了停止')) {
+                insertAgentResult('已停止：用户手动中止了 AI 的手机操作，后续动作没有执行。如需继续，请重新告诉 AI 要做什么，或让它先说明刚才做到哪一步。');
+            }
+        });
+
+        // ===== 手机操作：解析 [操作:手机xxx …] → 停止检查 → 授权 → 执行 → 回灌 =====
+        // 说明：原生设备能力（无障碍 / Shizuku / 模块 / ADB）尚未接入，这一层先把
+        // 「解析 / 停止 / 授权 / 结果回灌」打通；原生就位后只需实现 window.ElainaDevice.exec()，
+        // 上层逻辑不用改。设计详见 docs/mobile-agent.md。
+        const AGENT_PHONE_OPS = [
+            '手机查看界面', '手机状态', '手机截图', '手机等待',
+            '手机点击', '手机滑动', '手机输入', '手机按键', '手机打开', '手机命令'
+        ];
+
+        let phoneOpsInFlight = 0;
+        let phoneRunEndTimer = null;
+
+        function parsePhoneOperation(text) {
+            const s = String(text || '').trim();
+            for (const action of AGENT_PHONE_OPS) {
+                if (s.startsWith(action)) return { action, args: s.slice(action.length).trim() };
+            }
+            return null;
+        }
+
+        function describePhoneOperation(parsed) {
+            const a = parsed.args;
+            switch (parsed.action) {
+                case '手机点击': return a ? '点击坐标：' + a : '点击（没有给出坐标）';
+                case '手机滑动': return a ? '滑动：' + a : '滑动（没有给出坐标）';
+                case '手机输入': return a ? '要输入的文字：' + a : '输入（没有给出文字）';
+                case '手机按键': return a ? '按键：' + a : '按键（没有给出键名）';
+                case '手机打开': return a ? '要打开的应用：' + a : '打开应用（没有给出包名）';
+                case '手机等待': return a ? '等待 ' + a + ' 毫秒' : '等待';
+                case '手机命令': return '要执行的命令：' + a;
+                case '手机截图': return '截取当前屏幕画面';
+                case '手机查看界面': return '读取当前界面的控件树';
+                case '手机状态': return '查询设备与后端状态';
+                default: return '';
+            }
+        }
+
+        async function execPhoneOperation(parsed) {
+            const dev = window.ElainaDevice;
+            if (!dev || typeof dev.exec !== 'function') {
+                throw new Error('设备能力还没接入：当前版本没有编写手机操作的原生插件，这一步没有真正执行。'
+                    + '（机制本身已就绪：停止与授权都已生效，接入原生能力后即可直接使用）');
+            }
+            const res = await dev.exec({ action: parsed.action, args: parsed.args });
+            const text = res && (res.text || res.message);
+            return text || (parsed.action + ' 完成');
+        }
+
+        async function runAgentPhoneOperation(raw) {
+            const rt = window.agentRuntime;
+            if (!rt) { insertAgentResult('手机操作不可用：Agent 运行时没有初始化。'); return; }
+            const parsed = parsePhoneOperation(raw);
+            if (!parsed) {
+                insertAgentResult('无法识别的手机操作：' + String(raw || '').trim()
+                    + '\n可用写法：手机状态 / 手机查看界面 / 手机截图 / 手机点击 x y / 手机滑动 x1 y1 x2 y2 [时长] / 手机输入 文字 / 手机按键 返回|主页|回车 / 手机打开 包名 / 手机等待 毫秒');
+                return;
+            }
+            // 还没选实现方式 → 手机操作不可用（与侧边栏入口按钮的灰显一致）
+            if (!currentBackendId()) {
+                insertAgentResult('已跳过：还没有选择「实现方式」，AI 现在不能操作手机。请点侧边栏的「实现方式」按钮选一种。');
+                return;
+            }
+            // 总开关关掉时直接拒绝（设置 → 高级 → 手机操作）
+            if (state.settings.agentPhoneEnabled === false) {
+                insertAgentResult('已跳过：手机操作总开关是关闭的。需要时请在 设置 → 高级 → 手机操作 里打开「允许 AI 操作手机」。');
+                return;
+            }
+            // 本批次已被用户停止：不再执行任何动作。这是「停止」能拦住后续步骤的关键——
+            // 否则每一步都会重新 beginRun 把停止标志清掉，等于没停。
+            if (rt.isHalted && rt.isHalted()) {
+                insertAgentResult('已停止：用户中止了本次操作，这一步（' + parsed.action + '）没有执行。');
+                return;
+            }
+            phoneOpsInFlight += 1;
+            clearTimeout(phoneRunEndTimer);
+            if (!rt.isRunning()) rt.beginRun();
+            try {
+                rt.assertNotStopped();
+                rt.setStep(rt.getStep() + 1, parsed.action);
+                // safe 直接放行；sensitive 按设置里的策略询问；dangerous 必问
+                const allowed = await rt.requestApproval(parsed.action, describePhoneOperation(parsed));
+                if (!allowed) {
+                    insertAgentResult('已跳过「' + parsed.action + '」：用户没有允许这一步。请换一种方式，或先向用户说明为什么要这么做。');
+                    return;
+                }
+                rt.assertNotStopped();
+                insertAgentResult(await execPhoneOperation(parsed));
+            } catch (err) {
+                if (err && err.agentAborted) {
+                    insertAgentResult('已停止：用户中止了操作，剩余步骤没有执行。');
+                } else {
+                    insertAgentResult('手机操作失败：' + ((err && err.message) || err));
+                }
+            } finally {
+                phoneOpsInFlight -= 1;
+                if (phoneOpsInFlight <= 0) {
+                    clearTimeout(phoneRunEndTimer);
+                    // 一批操作处理完再收起状态条；若紧接着又来新操作会重新计时
+                    phoneRunEndTimer = setTimeout(() => { if (phoneOpsInFlight <= 0) rt.endRun(); }, 600);
+                }
+            }
+        }
+
+        // ===== 实现方式（后端选择）=====
+        // 四种执行方式，能力与门槛不同。原生设备层尚未接入，所以除「模块」外都只能显示
+        // 「待接入」——「模块」可以真探测（它的网关在本机 3070 端口）。
+        // 设计详见 docs/mobile-agent.md 第三节。
+        const AGENT_BACKENDS = [
+            {
+                id: 'accessibility', name: '无障碍', tag: '免 root',
+                desc: '用系统自带的无障碍服务点击、输入、读取界面。不用装任何东西，门槛最低。',
+                need: '系统设置 → 无障碍里开启本应用的服务'
+            },
+            {
+                id: 'adb', name: 'ADB', tag: '需要电脑',
+                desc: '由电脑上的本地服务执行命令，手机只负责显示。能力最全，不受手机端限制。',
+                need: '手机开 USB 或无线调试，且电脑在场'
+            },
+            {
+                id: 'root', name: 'Root', tag: '需要 root',
+                desc: '应用直接以 root 身份执行命令，不依赖电脑。',
+                need: '手机已 root，并给本应用授权一次'
+            },
+            {
+                id: 'module', name: '模块', tag: '需要 KernelSU',
+                desc: '刷入系统模块，后台静默操作：不抢前台、不被后台清理打断，能力最强。',
+                need: '刷入 KernelSU 模块（本机 3070 端口有服务）'
+            }
+        ];
+
+        // 每个实现方式对应的「去设置 / 请求权限」引导。
+        // plugin/method 指向原生插件的真跳转（如上游 ElainaPetPlugin 的 openAccessibilitySettings）；
+        // 插件不在时退化成说明弹窗 —— 所以网页版现在就能用，原生接入后自动升级为真跳转。
+        const AGENT_BACKEND_SETUP = {
+            accessibility: {
+                label: '去开启无障碍',
+                plugin: 'ElainaPet', method: 'openAccessibilitySettings',
+                guide: [
+                    '1. 打开系统的「设置 → 无障碍」（部分机型叫「辅助功能」）',
+                    '2. 在已安装的服务里找到「ElainaChat Open」',
+                    '3. 打开开关并按提示确认',
+                    '',
+                    '各厂商路径：小米在「更多设置 → 无障碍」；华为 / 荣耀在「辅助功能 → 无障碍」；OPPO / 一加在「系统设置 → 无障碍」。'
+                ].join('\n')
+            },
+            adb: {
+                label: '怎么开启调试',
+                guide: [
+                    '这个方式需要电脑配合，手机只要开启调试：',
+                    '',
+                    '1. 「设置 → 关于手机」，连点「版本号」7 次，开启开发者选项',
+                    '2. 回到「设置 → 系统 → 开发者选项」，打开「USB 调试」',
+                    '3. Android 11 及以上还可以打开「无线调试」，这样就不用插数据线',
+                    '4. 把手机连到运行本应用的电脑，再回来点「重新检测」'
+                ].join('\n')
+            },
+            root: {
+                label: '请求 root 授权',
+                plugin: 'ElainaShell', method: 'requestRoot',
+                guide: [
+                    '1. 确认手机已经 root（Magisk / KernelSU / APatch 之一）',
+                    '2. 点击请求后会弹出系统授权框，选「允许」并勾选「记住选择」',
+                    '',
+                    '注意：root 授权等于把整台手机的控制权交给本应用。请确认你信任当前安装的版本，'
+                    + '并且只在自己手动触发的场景下使用。'
+                ].join('\n')
+            },
+            module: {
+                label: '怎么刷模块',
+                guide: [
+                    '模块方式需要先在手机上刷入 KernelSU 模块，它会提供一个本地服务（127.0.0.1:3070）。',
+                    '',
+                    '1. 确认手机已刷 KernelSU 并装好管理器',
+                    '2. 刷入模块后重启手机',
+                    '3. 回来点「重新检测」，状态会变成「已就绪」',
+                    '',
+                    '刷上之后 AI 可以后台静默操作手机，不抢占你正在用的界面，是四种方式里体验最好的。'
+                ].join('\n')
+            }
+        };
+
+        const backendStatus = {};   // id -> { state, text }
+
+        /** 当前选定的实现方式；空字符串表示还没选过 */
+        function currentBackendId() {
+            const id = state.settings.agentBackend || '';
+            return AGENT_BACKENDS.some((b) => b.id === id) ? id : '';
+        }
+
+        function backendNameOf(id) {
+            const found = AGENT_BACKENDS.find((b) => b.id === id);
+            return found ? found.name : '';
+        }
+
+        /** 侧边栏入口按钮的灰显状态：没选过实现方式时压暗，提示功能尚未启用 */
+        function syncBackendEntryButton() {
+            const btn = document.getElementById('railBackendBtn');
+            if (!btn) return;
+            const chosen = currentBackendId();
+            btn.classList.toggle('is-unset', !chosen);
+            btn.title = chosen ? ('实现方式：' + backendNameOf(chosen)) : '实现方式（尚未选择）';
+        }
+
+        /** 探测某个后端当前是否可用 */
+        async function detectBackend(id) {
+            // 「模块」可以直接探测（网关在本机 3070）。no-cors 读不到响应内容，
+            // 但"有没有响应"足够判断它在不在。
+            if (id === 'module') {
+                try {
+                    const ctrl = new AbortController();
+                    const timer = setTimeout(() => ctrl.abort(), 1500);
+                    await fetch('http://127.0.0.1:3070/api/status', { mode: 'no-cors', cache: 'no-store', signal: ctrl.signal });
+                    clearTimeout(timer);
+                    return { state: 'ready', text: '已就绪' };
+                } catch (e) {
+                    return { state: 'unavailable', text: '未检测到' };
+                }
+            }
+            // 其余三个依赖原生设备层（window.ElainaDevice），当前版本还没编写，
+            // 只能显示「待接入」。接入后改成读 dev.status() 的真实结果即可。
+            const dev = window.ElainaDevice;
+            if (!dev || typeof dev.status !== 'function') return { state: 'pending', text: '待接入' };
+            try {
+                const st = await dev.status();
+                const available = !!(st && st[id] && st[id].available);
+                return available ? { state: 'ready', text: '已就绪' } : { state: 'unavailable', text: '不可用' };
+            } catch (e) {
+                return { state: 'unavailable', text: '检测失败' };
+            }
+        }
+
+        function backendStatusBadge(st) {
+            const map = {
+                ready: ['已就绪', 'color:#059669;background:#ecfdf5'],
+                unavailable: ['未检测到', 'color:#b45309;background:#fffbeb'],
+                pending: ['待接入', 'color:#818cf8;background:#eef2ff'],
+                checking: ['检测中', 'color:#818cf8;background:#eef2ff']
+            };
+            const pair = map[st && st.state] || map.checking;
+            return '<span style="' + pair[1] + ';font-size:10px;padding:2px 7px;border-radius:7px;white-space:nowrap">' + pair[0] + '</span>';
+        }
+
+        function renderBackendList() {
+            const box = document.getElementById('backendList');
+            if (!box) return;
+            const cur = currentBackendId();
+            const tip = cur ? '' :
+                '<p class="text-[11px] leading-relaxed mb-2" style="color:#b45309;background:#fffbeb;border:1px solid #fef3c7;border-radius:12px;padding:8px 12px">还没有选择实现方式，AI 现在不能操作手机。选一种即可启用（需要该方式在你这台设备上可用）。</p>';
+            box.innerHTML = tip + AGENT_BACKENDS.map((b) => {
+                const active = b.id === cur;
+                const setup = AGENT_BACKEND_SETUP[b.id];
+                // 用 div 而不是 button：卡片里还要放「去设置」按钮，而 button 不能嵌套 button
+                return '<div data-backend="' + b.id + '" role="button" tabindex="0"'
+                    + ' class="w-full text-left rounded-2xl border px-4 py-3 transition cursor-pointer"'
+                    + ' style="border-color:' + (active ? '#f9a8d4' : '#e4e4f7') + ';background:' + (active ? 'rgba(253,242,248,.7)' : 'rgba(255,255,255,.7)') + '">'
+                    + '<div class="flex items-center gap-2">'
+                    + '<span class="text-sm font-semibold text-indigo-950">' + b.name + '</span>'
+                    + '<span style="font-size:10px;color:#818cf8;background:#eef2ff;padding:2px 6px;border-radius:7px;white-space:nowrap">' + b.tag + '</span>'
+                    + '<span class="ml-auto">' + backendStatusBadge(backendStatus[b.id]) + '</span>'
+                    + '</div>'
+                    + '<p class="text-[11px] text-indigo-400 mt-1 leading-relaxed">' + b.desc + '</p>'
+                    + '<div class="flex items-center gap-2 mt-1">'
+                    + '<span class="text-[11px] text-indigo-300 leading-relaxed flex-1">需要：' + b.need + '</span>'
+                    + (setup ? '<button type="button" data-backend-setup="' + b.id + '" class="btn-secondary text-[11px] flex-shrink-0" style="padding:3px 10px">' + setup.label + '</button>' : '')
+                    + '</div>'
+                    + (active ? '<p class="text-[11px] font-semibold mt-1" style="color:#db2777">当前使用</p>' : '')
+                    + '</div>';
+            }).join('');
+            box.querySelectorAll('[data-backend]').forEach((el) => {
+                const id = el.getAttribute('data-backend');
+                el.addEventListener('click', (e) => {
+                    if (e.target && e.target.closest && e.target.closest('[data-backend-setup]')) return;   // 点设置按钮不算选中
+                    selectBackend(id);
+                });
+                el.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectBackend(id); }
+                });
+            });
+            box.querySelectorAll('[data-backend-setup]').forEach((el) => {
+                el.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    void openBackendSetup(el.getAttribute('data-backend-setup'));
+                });
+            });
+            const curEl = document.getElementById('backendCurrent');
+            if (curEl) curEl.textContent = cur ? backendNameOf(cur) : '尚未选择';
+        }
+
+        function selectBackend(id) {
+            if (!AGENT_BACKENDS.some((b) => b.id === id)) return;
+            state.settings.agentBackend = id;
+            persistSettings();
+            syncBackendEntryButton();
+            renderBackendList();
+            console.log('[Agent] 实现方式已选为:', id);
+        }
+
+        /**
+         * 「去设置 / 请求权限」：原生插件在场就走真跳转（打开无障碍设置页、弹 root 授权框），
+         * 否则弹出该方式的操作说明 —— 网页版和原生未接入时都能给出可执行的下一步。
+         */
+        async function openBackendSetup(id) {
+            const cfg = AGENT_BACKEND_SETUP[id];
+            if (!cfg) return;
+            if (cfg.plugin && cfg.method) {
+                const plugin = window.Capacitor?.Plugins?.[cfg.plugin];
+                if (plugin && typeof plugin[cfg.method] === 'function') {
+                    try {
+                        await plugin[cfg.method]();
+                        return;
+                    } catch (e) {
+                        console.warn('[Agent] 原生设置跳转失败，改用说明:', e);
+                    }
+                }
+            }
+            await showCustomAlert(cfg.guide, cfg.label);
+        }
+
+        async function refreshBackendStatus() {
+            AGENT_BACKENDS.forEach((b) => { backendStatus[b.id] = { state: 'checking', text: '检测中' }; });
+            renderBackendList();
+            await Promise.all(AGENT_BACKENDS.map(async (b) => { backendStatus[b.id] = await detectBackend(b.id); }));
+            renderBackendList();
+        }
+
+        function openBackendPanel() {
+            const el = document.getElementById('backendPanel');
+            if (!el) return;
+            el.classList.remove('hidden');
+            el.classList.add('flex');
+            el.style.zIndex = '100002';   // 高于 Live2D 通话界面（99999）与运行状态条（100000）
+            renderBackendList();
+            void refreshBackendStatus();
+        }
+
+        function closeBackendPanel() {
+            const el = document.getElementById('backendPanel');
+            if (!el) return;
+            el.classList.add('hidden');
+            el.classList.remove('flex');
+        }
+
+        document.getElementById('railBackendBtn')?.addEventListener('click', openBackendPanel);
+        document.getElementById('backendRefresh')?.addEventListener('click', () => { void refreshBackendStatus(); });
+        syncBackendEntryButton();
+        document.getElementById('backendPanelClose')?.addEventListener('click', closeBackendPanel);
+        document.getElementById('backendPanel')?.addEventListener('click', (e) => {
+            if (e.target && e.target.id === 'backendPanel') closeBackendPanel();
+        });
 
         // 「允许操作电脑」模式下写文件前必须确认一次（同一路径只问一次）。
         // 之前 AI 可以完全无声地把任意内容写到任意路径 —— 一旦提示词被图片文字、
@@ -9390,6 +10054,9 @@ ${lines.join('\n')}
                 automaticVoiceMessageKey = String(aiMessage.id);
                 pendingAutomaticVoiceMessageIds.add(automaticVoiceMessageKey);
 
+                // 新一批 Agent 动作开始：解除上一批留下的「已停止」状态
+                // （用户的停止只作用于当次操作；AI 下一次回复是新批次，应重新可用）
+                if (window.agentRuntime) window.agentRuntime.beginBatch();
                 // Live2D：解析 AI 文本中的 [表情:xxx] / [动作:xxx] 标签并触发；显示/朗读用剥离后的文本
                 if (window.Live2DCall) {
                     window.Live2DCall.drive(response);
@@ -10323,6 +10990,12 @@ ${lines.join('\n')}
             document.querySelectorAll('input[name="agentPermission"]').forEach(r => {
                 r.checked = (r.value === (state.settings.agentPermission || 'app'));
             });
+            document.querySelectorAll('input[name="agentApproval"]').forEach(r => {
+                r.checked = (r.value === (state.settings.agentApproval || 'always'));
+            });
+            const phoneToggle = document.getElementById('settingAgentPhoneEnabled');
+            if (phoneToggle) phoneToggle.checked = state.settings.agentPhoneEnabled !== false;
+            syncAgentSectionsByDevice();
 
             renderCardSelect();
             fillCharacterCardForm();
@@ -10382,6 +11055,16 @@ ${lines.join('\n')}
                 await fetch('/api/auth/logout', { method: 'POST' });
             } catch (e) { /* 忽略：无论成功与否都跳登录页 */ }
             location.href = '/login';
+        }
+
+        // 「电脑操作权限」与「手机操作」两组设置按设备形态只显示一组：
+        // 电脑上给「允许操作电脑」，手机上给「手机操作」—— 混在一起用户看不懂。
+        // 用 IS_MOBILE_DEVICE（设备本身）而不是窗口宽度，电脑上把窗口拖窄不该变成"手机"。
+        function syncAgentSectionsByDevice() {
+            const pcSection = document.getElementById('agentPermissionSection');
+            const phoneSection = document.getElementById('agentPhoneSection');
+            if (pcSection) pcSection.classList.toggle('hidden', IS_MOBILE_DEVICE);
+            if (phoneSection) phoneSection.classList.toggle('hidden', !IS_MOBILE_DEVICE);
         }
 
         function openSettings() {
@@ -10572,7 +11255,9 @@ ${lines.join('\n')}
                 asrProvider,
                 autoMemory: elements.settingAutoMemory.checked,
                 memoryEvery: Math.max(3, Math.min(50, parseInt(elements.settingMemoryEvery.value, 10) || 6)),
-                agentPermission: document.querySelector('input[name="agentPermission"]:checked')?.value || 'app'
+                agentPermission: document.querySelector('input[name="agentPermission"]:checked')?.value || 'app',
+                agentApproval: document.querySelector('input[name="agentApproval"]:checked')?.value || 'always',
+                agentPhoneEnabled: document.getElementById('settingAgentPhoneEnabled')?.checked !== false
             };
             try {
                 await saveApiSecrets(state.settings);

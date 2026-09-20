@@ -272,6 +272,11 @@
 
   // ===== 模型管理 =====
   async function refreshModelList() {
+    // APK 首次启动会把打包进来的内置模型复制到应用数据目录（见 index.html）。
+    // 种的过程还没结束时先等一下，否则刚装好打开通话会看到"未上传模型"。
+    if (window.__nativeSeedPromise) {
+      try { await window.__nativeSeedPromise; } catch { /* 种失败不影响用户自己上传的模型 */ }
+    }
     try {
       const res = await fetch('/api/live2d/models');
       const json = await res.json();
@@ -1411,6 +1416,13 @@
     if (/打开|开始|进入/.test(v) && /视频通话|通话|live2d/i.test(v)) { window.agentActions?.openVideoCall(); return; }
     if (/关闭|结束|挂断/.test(v) && /视频通话|通话|live2d/i.test(v)) { window.agentActions?.closeVideoCall(); return; }
     if (/整理记忆|记忆整理/.test(v)) { window.agentActions?.organizeMemory(); return; }
+    // 手机操作（[操作:手机点击 500 800] 等）：转发主应用，由 Agent 运行时统一做
+    // 「停止检查 + 敏感操作授权」，结果回填对话。执行层是否可用由主应用判断。
+    if (/^(手机|设备)/.test(v)) {
+      if (window.agentActions?.agentPhoneOperation) window.agentActions.agentPhoneOperation(v);
+      else console.warn('[Live2D] 主应用手机操作不可用');
+      return;
+    }
     // 文件操作（权限模式由设置控制，转发主应用执行并把结果回填对话）
     if (/列出文件|列出目录|查看文件夹|查看文件|读取文件|保存文件|写入文件|创建文件|新建文件/.test(v)) {
       if (window.agentActions?.agentFileOperation) window.agentActions.agentFileOperation(v);
