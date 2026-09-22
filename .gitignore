@@ -1,4 +1,4 @@
-# 安卓工程（Capacitor + Gradle 打包工具链，本次不随仓库分发）
+﻿# 安卓工程（Capacitor + Gradle 打包工具链，本次不随仓库分发）
 android-app/
 
 dist/
@@ -16,7 +16,9 @@ web/live2d/models/*
 # 本地打包压缩包，不入库
 *.zip
 
-# 局域网访问密码（本机凭据，禁止入库）
+# 访问密码。2026-09 起已迁到 data/auth.json（data/ 整目录本就排除），
+# 这条规则保留是为了兜住升级前遗留在 web/ 里的老文件 —— 删掉它的话，
+# 没跑过新版服务的人执行 git add . 就会把访问密码提交上去。
 web/.local-auth.json
 
 # 应用数据目录：跨设备同步的聊天记录 / 设置 / API Key，以及自签 HTTPS 证书。
@@ -29,6 +31,10 @@ data/
 local.properties
 .env
 .env.*
+
+# 沙箱可行性验证（一次性 POC，不参与软件运行）
+# 想保留的话可以删掉这条把它一起提交
+poc/
 
 # AI 工作记录（不属于项目内容，只是本机的辅助笔记）
 .workbuddy-ai/

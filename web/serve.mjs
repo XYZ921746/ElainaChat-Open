@@ -1,4 +1,7 @@
-import { createReadStream } from 'node:fs';
+import {
+    createReadStream, appendFileSync, mkdirSync, renameSync, statSync,
+    readdirSync, rmSync, existsSync, readFileSync, writeFileSync,
+} from 'node:fs';
 import { stat, lstat, mkdir, writeFile, readFile, readdir, rm, rename } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createServer as createSecureServer } from 'node:https';
@@ -7,9 +10,10 @@ import { execFileSync } from 'node:child_process';
 import { randomBytes, scrypt, createHash, timingSafeEqual, X509Certificate } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
+import { promisify, inspect } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
+import { createStore } from '../server/store.mjs';
 
 const scryptAsync = promisify(scrypt);
 
@@ -18,7 +22,9 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 //   证书 + 端侧数据存储都放这里。因为它在 web/ 之外，静态文件服务够不到，
 //   不会像放在 web/ 里那样被直接下载走。
 const APP_ROOT = path.resolve(root, '..');
-const DATA_DIR = path.join(APP_ROOT, 'data');
+// DATA_DIR 可用环境变量覆盖：自动化检查要跑真实的读写与迁移，
+// 如果直接写用户的 data/，每跑一次就会动到真实数据（甚至触发迁移）。
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(APP_ROOT, 'data');
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 const CERT_FILE = path.join(DATA_DIR, 'cert.pem');
 const KEY_FILE = path.join(DATA_DIR, 'key.pem');
@@ -45,6 +51,457 @@ const BLOCKED_EXT = new Set([
     '.svg', '.xml', '.xsl',
     '.exe', '.dll', '.com', '.scr', '.msi', '.bat', '.cmd', '.ps1', '.psm1', '.vbs', '.wsf', '.jar', '.sh',
 ]);
+
+// ===== 日志系统 =====
+//
+// 格式参照 AstrBot（`astrbot/core/log.py`）：
+//
+//   控制台  [HH:mm:ss.SSS] [标签] [级别] [来源:行号]: 消息     （终端支持时带 ANSI 颜色）
+//   文件    [YYYY-MM-DD HH:mm:ss.SSS] [标签] [级别] [来源:行号]: 消息
+//
+// 级别固定四位（DBUG/INFO/WARN/ERRO/CRIT），WARN 及以上再带 ` [v版本]` —— 都照 AstrBot 抄的，
+// 等宽、能一眼扫出来、也好 grep。
+//
+// 时间用**本地时间**。旧实现用 toISOString()（UTC），于是文件名写着 20:04、行内却是 12:04，
+// 差 8 小时对不上号 —— 日志最基础的可用性就是这个。
+//
+// 两个文件，各管一件事：
+//   <启动时刻>.log         主日志：一行一条记录，方便 grep。服务、访问、中转摘要、Agent、页面报错。
+//   <启动时刻>.trace.log   追踪日志：LLM 的完整请求消息 + 完整回复 + 完整上游报错。
+//                          多行原样保留（这是给人读的），主日志里则压成一行并截断。
+//
+// 为什么分成两个：对话内容又长又私密。混在主日志里会把 grep 结果淹掉；而且排查问题时
+// 主日志常常是要直接发出去的 —— 分开之后"要不要发对话内容"就变成一个明确的动作。
+// 追踪日志默认开（`LOG_CHAT=0` 关掉），启动时会打一行提醒。
+//
+// 落盘策略：**每次启动一组文件**，文件名就是启动时刻；单个文件超过 LOG_MAX_BYTES 就拆 `_2`/`_3`；
+// 只保留最近 LOG_KEEP 次启动（同一次启动的主日志与追踪日志一起留、一起删）。
+//
+// 不记录请求头：Authorization 就在里面，落盘等于把 API Key 写到磁盘上。
+// 请求体/响应体里的凭据形态由 redactSecrets() 兜底。
+// LOG_DIR 可以覆盖：自动化检查要起真实服务、跑真实的日志写入，
+// 如果直接写用户的 data/logs，每跑一次就多一次"启动"、还会触发轮转删掉旧日志。
+const LOG_DIR = process.env.LOG_DIR ? path.resolve(process.env.LOG_DIR) : path.join(DATA_DIR, 'logs');
+const LOG_KEEP = 10;                       // 保留最近多少次启动的日志
+const LOG_MAX_BYTES = 8 * 1024 * 1024;     // 单个日志文件上限，超出拆 _2/_3
+const LOG_TO_FILE = String(process.env.LOG_TO_FILE ?? '1') !== '0';
+// 完整对话内容是否写进追踪日志。默认开 —— 排查"AI 为什么这么答"时最缺的就是这个。
+// 只作为**初始值**：运行中可在 设置 → 高级 → 日志 里切换（见 traceEnabled）。
+const LOG_CHAT = String(process.env.LOG_CHAT ?? '1') !== '0';
+const TRACE_MSG_MAX = 4000;                // 单条消息最多记多少字
+const TRACE_BODY_MAX = 64 * 1024;          // 写进追踪日志的单次响应上限
+// 内存里最多攒多少响应字节。比 TRACE_BODY_MAX 大，是因为非流式响应必须**完整**才能 JSON.parse
+// 出回复正文；只攒 64KB 的话稍长一点的回复就解析失败，只能退化成贴一段原始 JSON。
+const TRACE_ACCUM_MAX = 256 * 1024;
+
+// 文件名：<时刻>.log / <时刻>.trace.log / <时刻>_2.log / <时刻>.trace_2.log / <时刻>-2.log（同秒再起一个实例）
+const LOG_NAME_RE = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:[-._][A-Za-z0-9]+)*\.log$/;
+const LOG_STAMP_LEN = 19;                  // `YYYY-MM-DD_HH-mm-ss` 的长度，用来按"启动"分组
+
+const pad2 = (n) => String(n).padStart(2, '0');
+/** 时刻 → 文件名里的那一段（本地时间） */
+function logStampFor(date) {
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+        + `_${pad2(date.getHours())}-${pad2(date.getMinutes())}-${pad2(date.getSeconds())}`;
+}
+/** 时刻 → 日志行里的 `YYYY-MM-DD HH:mm:ss.SSS` */
+function logTimeFull(date = new Date()) {
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} `
+        + `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+        + `.${String(date.getMilliseconds()).padStart(3, '0')}`;
+}
+/** 时刻 → 控制台用的 `HH:mm:ss.SSS` */
+function logTimeShort(date = new Date()) {
+    return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+        + `.${String(date.getMilliseconds()).padStart(3, '0')}`;
+}
+
+// ---- 级别（四位，对齐 AstrBot 的 short_levelname）----
+const LEVEL_SHORT = { DEBUG: 'DBUG', INFO: 'INFO', WARN: 'WARN', ERROR: 'ERRO', CRITICAL: 'CRIT' };
+const LEVEL_NO = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40, CRITICAL: 50 };
+// 级别从低到高。对外（设置界面 / API）一律用这套全名，短名只出现在日志行里。
+const LEVEL_NAMES = ['DEBUG', 'INFO', 'WARN', 'ERROR', 'CRITICAL'];
+// 用户可能填 AstrBot 那套短名或 logging 的全名，统一收敛
+const LEVEL_INPUT_ALIASES = {
+    DBUG: 'DEBUG', DEBUG: 'DEBUG',
+    INFO: 'INFO', INFORMATION: 'INFO',
+    WARN: 'WARN', WARNING: 'WARN',
+    ERRO: 'ERROR', ERR: 'ERROR', ERROR: 'ERROR',
+    CRIT: 'CRITICAL', CRITICAL: 'CRITICAL', FATAL: 'CRITICAL',
+};
+
+// ---- 落盘级别（运行时可改，设置界面 → 高级 → 日志）----
+//
+// 与 AstrBot 的分工一致：**控制台 sink 恒为 DEBUG（终端永远看全量），文件 sink 按级别过滤**。
+// 这样"排查时终端不丢东西"和"日志文件不被 DEBUG 刷爆"可以同时成立。
+//
+// 为什么级别要可改而不是写死环境变量：这个应用是双击 `启动.bat` 跑的，用户改不了环境变量 ——
+// 环境变量只作为**首次启动的初始值**，之后由设置界面写进 data/log-settings.json。
+// 日志设置文件。跟着 LOG_DIR 走：自动化检查会用临时目录覆盖 LOG_DIR，
+// 若这里写死 DATA_DIR，跑一次检查就会把用户真实的日志级别改掉。
+const LOG_SETTINGS_FILE = path.join(LOG_DIR, 'log-settings.json');
+let fileLevel = 'INFO';        // 当前落盘级别（低于它的记录只进控制台）
+let traceEnabled = LOG_CHAT;   // 对话追踪日志开关（运行时可切）
+
+/** 把任意写法收敛成标准级别名；非法值返回 null（调用方决定回落到什么） */
+function normalizeLevelName(raw) {
+    return LEVEL_INPUT_ALIASES[String(raw || '').trim().toUpperCase()] || null;
+}
+
+/** 读持久化的日志设置（缺失/损坏都返回空对象，由调用方回落默认值） */
+function readSavedLogSettings() {
+    try {
+        const saved = JSON.parse(readFileSync(LOG_SETTINGS_FILE, 'utf8'));
+        return (saved && typeof saved === 'object') ? saved : {};
+    } catch { return {}; }
+}
+
+// 初始化：环境变量 > data/log-settings.json > 默认。
+// 环境变量优先是刻意的 —— 自动化检查要能强制指定级别，而不受本机已保存的值干扰。
+{
+    const saved = readSavedLogSettings();
+    fileLevel = normalizeLevelName(process.env.LOG_LEVEL)
+        || normalizeLevelName(saved.level)
+        || 'INFO';
+    if (process.env.LOG_CHAT === undefined && typeof saved.trace === 'boolean') {
+        traceEnabled = saved.trace;
+    }
+}
+
+/** 当前级别是否该落盘（控制台不受它约束） */
+function shouldLogToFile(level) {
+    return (LEVEL_NO[level] || 20) >= (LEVEL_NO[fileLevel] || 20);
+}
+
+/** 落盘级别的持久化。改级别是低频操作，直接同步写，省掉一套异步队列 */
+function persistLogSettings() {
+    if (!LOG_TO_FILE) return;
+    try {
+        mkdirSync(LOG_DIR, { recursive: true });
+        writeFileSync(LOG_SETTINGS_FILE, JSON.stringify({
+            level: fileLevel, trace: traceEnabled, updatedAt: new Date().toISOString(),
+        }, null, 2), 'utf8');
+    } catch { /* 写不进去不影响本次运行，只是下次启动回到旧值 */ }
+}
+
+/** 运行中改落盘级别。返回是否真的变了（没变就不用重挂 sink / 写盘） */
+function setFileLogLevel(next) {
+    const level = normalizeLevelName(next);
+    if (!level || level === fileLevel) return false;
+    fileLevel = level;
+    persistLogSettings();
+    return true;
+}
+
+/**
+ * 运行中开关对话追踪日志。
+ * 打开时若文件还没建过就补建一个 —— 否则用户打开开关、去目录里找却什么都没有，
+ * 会以为开关没生效（启动时只建过一次，那时是关的）。
+ */
+function setTraceEnabled(on) {
+    const next = Boolean(on);
+    if (next === traceEnabled) return false;
+    traceEnabled = next;
+    if (next && LOG_TO_FILE && !traceSink.file) {
+        try {
+            traceSink.file = sinkPath(traceSink);
+            appendFileSync(traceSink.file, '');
+        } catch { /* 建不出来就只影响追踪日志 */ }
+    }
+    persistLogSettings();
+    return true;
+}
+// AstrBot 的级别色：DEBUG 亮蓝 / INFO 亮青 / WARN 亮黄 / ERROR 红 / CRIT 亮红
+const LEVEL_COLOR = {
+    DEBUG: '\x1b[1;34m', INFO: '\x1b[1;36m', WARN: '\x1b[1;33m',
+    ERROR: '\x1b[31m', CRITICAL: '\x1b[1;31m',
+};
+const ANSI_RESET = '\x1b[0m';
+const ANSI_TIME = '\x1b[32m';   // 时间绿色，同 AstrBot 的 <green>{time}</green>
+
+// 版本号：WARN 及以上会附在级别后面（同 AstrBot 的 astrbot_version_tag）。
+// 这个项目频繁重打包，出问题时能一眼对上"这份日志是哪一版产生的"。
+let APP_VERSION = '0.0.0';
+try {
+    APP_VERSION = JSON.parse(readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')).version || APP_VERSION;
+} catch { /* 读不到就算了 */ }
+
+// 消息开头的 [xxx] 会被抽出来当标签，正文里不再重复 —— 所以调用点照旧写
+// `console.log('[relay] ...')` 即可。这里把历史遗留的标签收敛成一套固定词汇，
+// 免得日志里同时出现 [boot]/[log]/[HTTPS]/[鉴权] 四种风格。
+const TAG_ALIASES = {
+    boot: 'Core', log: 'Core', store: 'Store', relay: 'Relay', live2d: 'Live2D',
+    agent: 'Agent', chat: 'Chat', http: 'HTTP', page: 'Page',
+    鉴权: 'Auth', auth: 'Auth', https: 'Cert', tls: 'Cert', cert: 'Cert',
+    tts: 'TTS', asr: 'ASR', vision: 'Vision',
+};
+function normalizeTag(raw) {
+    const key = String(raw || '').trim();
+    if (!key) return 'Core';
+    const hit = TAG_ALIASES[key] || TAG_ALIASES[key.toLowerCase()];
+    if (hit) return hit;
+    // 未知标签原样保留（首字母大写），免得新写的标签被悄悄吞掉
+    return key.length <= 12 ? key[0].toUpperCase() + key.slice(1) : 'Core';
+}
+
+// 来源位置：取调用栈里第一条**不属于日志模块自己**的帧。
+// 必须跳过内部帧，否则每条日志都会指向 emitLog 自己，等于没写。
+// patchedConsoleLog 是下面那个 console 包装函数的名字 —— 得在这里就先登记上。
+const LOG_INTERNAL_FNS = new Set(['emitLog', 'appendToFile', 'captureLocation', 'patchedConsoleLog', 'traceLine', 'logCritical']);
+function captureLocation() {
+    try {
+        const lines = String(new Error().stack || '').split('\n');
+        for (let i = 1; i < lines.length; i++) {
+            const m = lines[i].match(/at\s+(?:(.*?)\s+\()?(.*?):(\d+):(\d+)\)?\s*$/);
+            if (!m) continue;
+            // 被赋成 console.log 之后，V8 把函数名渲染成 `console.patchedConsoleLog [as log]`。
+            // 不剥掉 ` [as log]` 后缀的话，名字既不等于 `patchedConsoleLog`、也过不了
+            // `^.*\.` 那一刀，于是包装层会被当成"真正的调用点" —— 结果是**每一条**日志
+            // 都指向包装函数内部那一行，来源定位完全失效。
+            const rawFn = (m[1] || '').replace(/\s*\[as\s+[^\]]*\]\s*$/, '').trim();
+            if (LOG_INTERNAL_FNS.has(rawFn) || LOG_INTERNAL_FNS.has(rawFn.replace(/^.*\./, ''))) continue;
+            const file = m[2].replace(/\\/g, '/');
+            if (!file || file.startsWith('node:')) continue;
+            const base = file.split('/').pop().replace(/\.(mjs|cjs|js)$/, '');
+            if (!base) continue;
+            return base + ':' + m[3];
+        }
+    } catch { /* 拿不到行号不影响日志本身 */ }
+    return 'serve.mjs:?';
+}
+
+// 控制台是否上色。hasColors() 自己会尊重 NO_COLOR / FORCE_COLOR；非 TTY（重定向到文件）
+// 时返回 false，所以把控制台重定向出去也不会带一堆转义码。
+const CONSOLE_COLOR = (() => {
+    try {
+        if (!process.stdout.isTTY) return false;
+        if (typeof process.stdout.hasColors === 'function') return process.stdout.hasColors();
+        return !process.env.NO_COLOR;
+    } catch { return false; }
+})();
+
+// 包装 console 之前先留一份原件：日志系统自己输出时要用它，否则会递归。
+const consoleOriginal = {
+    log: console.log.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+    info: console.info.bind(console),
+};
+
+// 老版本的日志是固定名 server.log（按 4MB 滚动成 server.log.1）。
+// 直接放着不管会永远留一个不会再更新的孤儿文件，用户分不清哪个是新的；
+// 按它的修改时间改名成新格式，让它作为一份历史日志正常参与轮转。
+function adoptLegacyLogs() {
+    for (const [legacy, tag] of [['server.log', ''], ['server.log.1', '_old']]) {
+        const full = path.join(LOG_DIR, legacy);
+        try {
+            if (!existsSync(full)) continue;
+            const stamp = logStampFor(statSync(full).mtime);
+            let target = path.join(LOG_DIR, stamp + tag + '.log');
+            for (let i = 2; existsSync(target); i++) target = path.join(LOG_DIR, `${stamp}${tag}_${i}.log`);
+            renameSync(full, target);
+            consoleOriginal.log(`[${logTimeShort()}] [Core] [INFO] [serve.mjs:?]: 旧日志 ${legacy} 已改名为 ${path.basename(target)}`);
+        } catch { /* 改不动就留着，不影响启动 */ }
+    }
+}
+
+// 只保留最近 LOG_KEEP **次启动**。
+// 按"启动"分组而不是按文件数：一次启动现在会产出两个文件（主日志 + 追踪日志），
+// 按文件数算的话"留 10 份"就只等于 5 次启动，用户设的保留量会凭空缩水一半。
+function pruneOldLogs() {
+    try {
+        const sessions = new Map();
+        for (const name of readdirSync(LOG_DIR)) {
+            if (!LOG_NAME_RE.test(name)) continue;
+            const key = name.slice(0, LOG_STAMP_LEN);   // 文件名前缀就是启动时刻
+            if (!sessions.has(key)) sessions.set(key, []);
+            sessions.get(key).push(name);
+        }
+        const stale = [...sessions.keys()].sort().slice(0, Math.max(0, sessions.size - LOG_KEEP));
+        for (const key of stale) {
+            for (const name of sessions.get(key)) {
+                rmSync(path.join(LOG_DIR, name), { force: true });
+                consoleOriginal.log(`[${logTimeShort()}] [Core] [INFO] [serve.mjs:?]: 清理旧日志 ${name}（只保留最近 ${LOG_KEEP} 次启动）`);
+            }
+        }
+    } catch { /* 清理失败不影响启动 */ }
+}
+
+/**
+ * 写进日志文件的文本要脱敏。
+ *
+ * 起因：启动横幅里有「访问密码: xxxxxxxx」，而它会被原样落盘。排查问题时这些日志
+ * 是要发出去的（贴到聊天里、发给别人看），明文密码就跟着一起漏了。
+ * 追踪日志里还有完整对话和上游请求体，更需要这一层。
+ *
+ * 只在**写文件**这一层脱敏，控制台输出保持原样 —— 用户本来就靠终端里那行密码登录，
+ * 而 `启动.bat` 并没有把控制台重定向到文件，所以不存在"换个地方又漏出去"的口子。
+ */
+const SECRET_RULES = [
+    // 启动横幅：只保留标签
+    [/访问密码[:：]\s*\S+/g, '访问密码: ******（仅打印在控制台，不写入日志）'],
+    // 兜底：万一日志里带上了 Authorization 头或 key=value 形式的凭据
+    [/(Bearer\s+)[A-Za-z0-9._\-]{8,}/gi, '$1******'],
+    [/((?:apiKey|api_key|api-key|accessKey|access_key|token|password|secret|authorization)"?\s*[:=]\s*"?)([A-Za-z0-9._\-]{12,})/gi, '$1******'],
+    // 常见厂商的裸 key 形态（sk- / rc- 等），万一出现在对话或报错里
+    [/\b(sk|rc|hk|ak)-[A-Za-z0-9._\-]{16,}/g, '$1-******'],
+];
+
+function redactSecrets(text) {
+    let out = String(text);
+    for (const [re, to] of SECRET_RULES) out = out.replace(re, to);
+    return out;
+}
+
+// ---- 两个 sink 的文件状态 ----
+// part=1 时文件名不带序号；超过 LOG_MAX_BYTES 后递增，变成 `_2`、`_3`……
+// 同一秒内起两个实例时用 `-2` 挂在 base 上（不是 `_2`），免得和大小拆分的序号撞车。
+const mainSink = { base: '', ext: '.log', part: 1, file: '', bytes: 0 };
+const traceSink = { base: '', ext: '.trace.log', part: 1, file: '', bytes: 0 };
+function sinkPath(sink) {
+    return path.join(LOG_DIR, sink.base + (sink.part > 1 ? '_' + sink.part : '') + sink.ext);
+}
+
+function initLogFiles() {
+    if (!LOG_TO_FILE) return;
+    try {
+        mkdirSync(LOG_DIR, { recursive: true });
+        adoptLegacyLogs();
+        let base = logStampFor(new Date());
+        for (let i = 2; existsSync(path.join(LOG_DIR, base + '.log')); i++) base = logStampFor(new Date()) + '-' + i;
+        mainSink.base = base;
+        traceSink.base = base;
+        mainSink.file = sinkPath(mainSink);
+        traceSink.file = sinkPath(traceSink);
+        appendFileSync(mainSink.file, '');   // 立即建出空文件：这样它也会被算进"最近 N 次启动"
+        // 追踪日志也先建出来。启动横幅里已经报了它的路径，用户照着去找却找不到会以为功能坏了；
+        // 而且这样 `tail -f` 能从服务一启动就挂上，不用等第一次对话。
+        if (traceEnabled) appendFileSync(traceSink.file, '');
+    } catch { /* 目录不可写时退化为"只打控制台" */ }
+}
+
+/** 追加一行到某个 sink，必要时按大小换下一段 */
+function appendToFile(sink, text) {
+    if (!LOG_TO_FILE || !sink.file) return;
+    try {
+        const bytes = Buffer.byteLength(text);
+        if (sink.bytes + bytes > LOG_MAX_BYTES) {
+            sink.part += 1;
+            sink.file = sinkPath(sink);
+            sink.bytes = 0;
+            consoleOriginal.log(`[${logTimeShort()}] [Core] [INFO] [serve.mjs:?]: 日志超过 `
+                + `${Math.round(LOG_MAX_BYTES / 1024 / 1024)}MB，换到 ${path.basename(sink.file)}`);
+        }
+        appendFileSync(sink.file, text);
+        sink.bytes += bytes;
+    } catch { /* 日志写不进去也绝不能影响主流程 */ }
+}
+
+/**
+ * 写一条主日志。
+ *
+ * 消息开头的 `[标签]` 会被抽出来当标签字段，正文里不再重复 —— 这样调用点还是
+ * `console.log('[relay] ...')` 这种最自然的写法，输出却是 AstrBot 那种结构化的
+ * `[时刻] [Relay] [INFO] [serve.mjs:1344]: ...`。
+ */
+function emitLog(level, args) {
+    const text = args
+        .map((a) => (typeof a === 'string' ? a : inspect(a, { depth: 4, breakLength: Infinity })))
+        .join(' ');
+    const m = text.match(/^\s*\[([^\]\n]{1,16})\]\s*([\s\S]*)$/);
+    const tag = m ? normalizeTag(m[1]) : 'Core';
+    const body = (m ? m[2] : text).replace(/\s+$/, '');
+    // 纯空白不落盘：旧实现会把 console.log('') 也写成一条空记录，翻日志时全是噪音
+    if (!body.trim()) return;
+
+    const now = new Date();
+    const short = LEVEL_SHORT[level] || 'INFO';
+    const loc = captureLocation();
+    // AstrBot 只在 WARNING 及以上附版本号 —— 正常信息里塞版本号纯属噪音
+    const verTag = (LEVEL_NO[level] || 20) >= 30 ? ` [v${APP_VERSION}]` : '';
+
+    // 文件：一条记录一行（换行压成 ⏎），保证 grep / tail 的可用性。
+    // 完整的多行内容在追踪日志里，那里不压。
+    // 低于当前落盘级别的记录只进控制台 —— 终端始终是全量，级别只用来收窄文件。
+    if (shouldLogToFile(level)) {
+        const flat = body.replace(/\s*\n\s*/g, ' ⏎ ');
+        appendToFile(mainSink, `[${logTimeFull(now)}] [${tag}] [${short}]${verTag} [${loc}]: ${redactSecrets(flat)}\n`);
+    }
+
+    // 控制台：正文保持原样（多行就多行），人看的
+    const head = CONSOLE_COLOR
+        ? `${ANSI_TIME}[${logTimeShort(now)}]${ANSI_RESET} [${tag}] ${LEVEL_COLOR[level] || ''}[${short}]${ANSI_RESET}${verTag} [${loc}]: `
+        : `[${logTimeShort(now)}] [${tag}] [${short}]${verTag} [${loc}]: `;
+    consoleOriginal.log(head + body);
+}
+
+/**
+ * 写追踪日志：LLM 的完整请求消息、完整回复、完整上游报错。
+ * 多行**原样保留**（这是给人读的）；主日志里对应的那条会压成一行并截断。
+ * 只在开头带一个时间戳，正文块不再逐行加前缀，免得把内容切碎。
+ */
+function traceLine(text) {
+    if (!traceEnabled) return;
+    const body = String(text ?? '');
+    if (!body.trim()) return;
+    appendToFile(traceSink, `[${logTimeFull()}] ${redactSecrets(body)}\n`);
+}
+
+initLogFiles();
+
+for (const [method, level] of [
+    ['log', 'INFO'], ['info', 'INFO'], ['debug', 'DEBUG'], ['warn', 'WARN'], ['error', 'ERROR'],
+]) {
+    // 具名函数：captureLocation() 靠函数名跳过包装层，匿名箭头函数拿不到稳定的名字
+    console[method] = function patchedConsoleLog(...args) {
+        try {
+            // 只走 emitLog —— 它已经负责格式化并调用 consoleOriginal 输出。
+            // 这里若再 original(...args) 打一遍，控制台上每条日志会出现两行（原文 + 格式化），
+            // 而落盘的只有格式化那行，两边对不上号。
+            emitLog(level, args);
+        } catch {
+            // 日志系统自己出问题时必须把内容原样吐出来，否则等于把整条链路静音
+            consoleOriginal[method === 'debug' ? 'log' : method](...args);
+        }
+    };
+}
+
+// CRITICAL 没有对应的 console 方法，用显式函数暴露。
+// 之前 LEVEL_SHORT / LEVEL_NO / LEVEL_COLOR 里都定义了 CRITICAL，却没有任何代码能产生它 ——
+// 是彻头彻尾的死配置。现在补上真正的产生路径，级别过滤里它才有意义。
+function logCritical(...args) {
+    try { emitLog('CRITICAL', args); } catch { consoleOriginal.error(...args); }
+}
+
+pruneOldLogs();   // 放在包装之后：清理动作本身也进日志
+
+// 记录本次启动的标识，日志文件里能看出这份日志属于哪一次、跑了多久
+const BOOT_AT = Date.now();
+console.log(`[boot] serve.mjs 启动 pid=${process.pid} node=${process.version} 版本 v${APP_VERSION}`);
+if (LOG_TO_FILE) {
+    console.log(`[boot] 主日志: ${path.relative(APP_ROOT, mainSink.file)}`);
+    // 落盘级别是运行时可改的，启动时把它说清楚 —— 否则用户会疑惑"我调成 WARN 了，怎么还有 INFO"
+    console.log(`[boot] 落盘级别: ${fileLevel}（终端始终显示全部级别；可在 设置 → 高级 → 日志 里调整）`);
+    // 追踪日志里有完整对话内容，用户排查时常常把日志直接发出去 —— 必须明确提醒一句
+    console.log(traceEnabled
+        ? `[boot] 追踪日志: ${path.relative(APP_ROOT, traceSink.file)}（含完整对话内容，对外分享前先看一眼）`
+        : '[boot] 追踪日志已关闭，只记录访问与错误摘要（设置 → 高级 → 日志 可开启）');
+    console.log(`[boot] 每次启动一组文件，只保留最近 ${LOG_KEEP} 次启动`);
+} else {
+    console.log('[boot] 本次不落盘（LOG_TO_FILE=0），日志只打在控制台');
+}
+
+// 收尾也留一行：日志文件的最后一个时间戳就是会话结束时刻，配合文件名就能知道"这次跑了多久"。
+// 排查"服务是不是半夜自己挂了"时，这一行是唯一的判据。
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+        try {
+            const sec = Math.round((Date.now() - BOOT_AT) / 1000);
+            console.log(`[boot] 收到 ${signal}，服务结束（本次运行 ${sec} 秒）`);
+        } catch { /* 收尾日志失败也要能正常退出 */ }
+        process.exit(0);
+    });
+}
 
 const contentTypes = new Map([
     ['.html', 'text/html; charset=utf-8'],
@@ -259,7 +716,33 @@ async function handleUpload(req, res) {
     }
 }
 
-/** 列出已上传模型（附 model3.json 路径、exp 表情/动作列表、vtube.json 路径，供 AI 表情决策与探测使用） */
+/**
+ * 递归收集模型目录下所有文件的相对路径（正斜杠分隔）。
+ * 表情/动作并不保证放在固定子目录里：Cubism 只规定 *.exp3.json / *.motion3.json 的文件格式，
+ * 放在哪由模型作者自己决定。仓库内置的 deepseek 就把 50 多个 *.exp3.json 直接堆在模型根目录、
+ * 动作放在 motions/ 子目录 —— 早期"只扫 exp/ 子目录"的实现因此一个都看不到，
+ * 表现为"打包进去的模型没有表情/动作"。
+ * 限制递归深度，避免病态目录树把模型列表接口拖慢。
+ */
+async function collectModelFiles(dir, prefix = '', depth = 0) {
+    if (depth > 3) return [];
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return []; }
+    const out = [];
+    for (const entry of entries) {
+        const rel = prefix ? prefix + '/' + entry.name : entry.name;
+        if (entry.isDirectory()) out.push(...await collectModelFiles(path.join(dir, entry.name), rel, depth + 1));
+        else out.push(rel);
+    }
+    return out;
+}
+
+/**
+ * 列出已上传模型（附 model3.json 路径、exps 表情/motions 动作列表、vtube.json 路径，
+ * 供 AI 表情决策与探测使用）。
+ * exps/motions 里是「相对模型根目录的路径」（如 `脸红.exp3.json`、`motions/idle.motion3.json`），
+ * 不是裸文件名 —— 客户端要按这个路径去拼资源地址。
+ */
 async function listModels(res) {
     try {
         const entries = await stat(MODELS_DIR).catch(() => null);
@@ -272,17 +755,13 @@ async function listModels(res) {
             let motions = [];
             let vtube = null;
             try {
-                const files = await readdir(path.join(MODELS_DIR, name));
-                modelJson = files.find(f => f.toLowerCase().endsWith('.model3.json')) || null;
-                vtube = files.find(f => f.toLowerCase().endsWith('.vtube.json')) || null;
-                const expDirName = files.find(f => f.toLowerCase() === 'exp');
-                if (expDirName) {
-                    try {
-                        const expFiles = (await readdir(path.join(MODELS_DIR, name, expDirName))).sort();
-                        exps = expFiles.filter(f => f.toLowerCase().endsWith('.exp3.json'));
-                        motions = expFiles.filter(f => f.toLowerCase().endsWith('.motion3.json'));
-                    } catch { /* ignore */ }
-                }
+                const files = await collectModelFiles(path.join(MODELS_DIR, name));
+                // model3.json / vtube.json 优先取根目录下的，避免纹理等子目录里的同名文件抢走
+                const pickRoot = (pred) => files.find(f => !f.includes('/') && pred(f)) || files.find(pred) || null;
+                modelJson = pickRoot(f => f.toLowerCase().endsWith('.model3.json'));
+                vtube = pickRoot(f => f.toLowerCase().endsWith('.vtube.json'));
+                exps = files.filter(f => f.toLowerCase().endsWith('.exp3.json')).sort();
+                motions = files.filter(f => f.toLowerCase().endsWith('.motion3.json')).sort();
             } catch { /* ignore */ }
             models.push({ name, modelJson, exps, motions, vtube });
         }
@@ -384,6 +863,137 @@ const AGENT_APP_ROOT = path.resolve(root);
 const AGENT_READ_LIMIT = 300 * 1024; // 读文件上限 300KB
 const AGENT_WRITE_LIMIT = 1024 * 1024; // 写请求体上限 1MB
 
+// ===== 外壳文件夹（桌面/文档/下载…）的真实位置 =====
+// 为什么非要有这块：用户可以把桌面「移动」到任意位置（资源管理器 → 桌面属性 → 位置 → 移动），
+// OneDrive 也会把桌面重定向到 OneDrive 下。此时 C:\Users\<用户名>\Desktop **根本不存在**，
+// 而 AI 只会按惯例猜这个路径 —— 猜错就是一句「目录不存在」，然后它就没招了（实测踩过：
+// 用户的桌面在 D:\桌面，AI 猜 C:\Users\Administrator\Desktop，404，操作终止）。
+// 权威答案在注册表 HKCU\...\Explorer\User Shell Folders 里，这里读出来给 AI 用。
+//
+// fallback 是「注册表读不到」时的按惯例猜测（非 Windows、或安全策略拦住 reg.exe/PowerShell）。
+const SHELL_FOLDER_SPECS = [
+    { key: 'desktop', label: '桌面', reg: ['Desktop'], fallback: ['Desktop', '桌面', 'OneDrive/Desktop', 'OneDrive/桌面'], aliases: ['desktop', '桌面'] },
+    { key: 'documents', label: '文档', reg: ['Personal'], fallback: ['Documents', '文档'], aliases: ['documents', '文档'] },
+    { key: 'downloads', label: '下载', reg: ['{374DE290-123F-4565-9164-39C4925E467B}'], fallback: ['Downloads', '下载'], aliases: ['downloads', '下载'] },
+    { key: 'pictures', label: '图片', reg: ['My Pictures'], fallback: ['Pictures', '图片'], aliases: ['pictures', '图片'] },
+    { key: 'music', label: '音乐', reg: ['My Music'], fallback: ['Music', '音乐'], aliases: ['music', '音乐'] },
+    { key: 'videos', label: '视频', reg: ['My Video'], fallback: ['Videos', '视频'], aliases: ['videos', '视频'] },
+];
+
+/** 展开 Windows 环境变量（%USERPROFILE% 之类），大小写不敏感 */
+function expandWindowsEnv(value) {
+    return String(value || '').replace(/%([^%\s]+)%/g, (whole, name) => {
+        const hit = Object.keys(process.env).find(k => k.toLowerCase() === String(name).toLowerCase());
+        return hit ? process.env[hit] : whole;
+    });
+}
+
+/**
+ * 把命令行程序的原始输出字节解成字符串。
+ *
+ * 为什么不能直接 `encoding: 'utf8'`：Windows 的控制台程序（reg.exe / powershell.exe）
+ * 默认按**系统 ANSI 代码页**写 stdout，中文系统是 GBK。按 UTF-8 解会把 `D:\桌面`
+ * 变成 `D:\����` —— 路径看起来"读到了"，实际是错的，比读不到更危险。
+ * Node 自带完整 ICU，所以这里用「先 UTF-8，出现替换字符就按 GBK 重解」的启发式。
+ */
+function decodeCliText(buf) {
+    const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf ?? ''));
+    const utf8 = new TextDecoder('utf-8').decode(bytes);
+    if (!utf8.includes('\uFFFD')) return utf8;
+    try { return new TextDecoder('gbk').decode(bytes); } catch { return utf8; }
+}
+
+/** 读注册表里的 User Shell Folders。返回 { 值名: 路径 }，读不到就是空对象 */
+function readUserShellFolders() {
+    const out = {};
+    if (process.platform !== 'win32') return out;
+    const regKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders';
+
+    // ① PowerShell：输出用 Base64 包一层（见下），这样非 ASCII 路径不会被代码页打碎。
+    //    放在前面是因为 reg.exe 没法控制输出编码，中文路径有被弄坏的风险。
+    try {
+        const script = "$p = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders'"
+            + " | Select-Object -Property * -Exclude PS* | ConvertTo-Json -Compress;"
+            + " [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($p))";
+        const raw = decodeCliText(execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { timeout: 15000, windowsHide: true }));
+        const parsed = JSON.parse(Buffer.from(raw.trim(), 'base64').toString('utf8') || '{}');
+        for (const [k, v] of Object.entries(parsed)) if (typeof v === 'string') out[k] = v;
+    } catch { /* 没装 / 被策略拦住，走兜底 */ }
+
+    // ② 兜底：reg.exe（PowerShell 被禁用时）。输出形如：    Desktop    REG_EXPAND_SZ    D:\桌面
+    if (!Object.keys(out).length) {
+        try {
+            const raw = decodeCliText(execFileSync('reg.exe', ['query', regKey], { timeout: 5000, windowsHide: true }));
+            for (const line of raw.split(/\r?\n/)) {
+                const m = line.match(/^\s*(.+?)\s{2,}REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/i);
+                if (m) out[m[1].trim()] = m[2].trim();
+            }
+        } catch { /* 被安全策略拦住 / 不存在，交给上层按惯例猜 */ }
+    }
+    return out;
+}
+
+// 只解析一次（起进程不便宜，而且这些路径在一次运行里不会变）
+const shellFolderCache = { resolved: false, roots: [], aliasMap: new Map() };
+
+function resolveShellFolders() {
+    if (shellFolderCache.resolved) return shellFolderCache;
+    shellFolderCache.resolved = true; // 先置位：即使解析抛异常也不重复起进程
+    const registry = readUserShellFolders();
+    const home = os.homedir();
+    const aliasMap = new Map();
+    const roots = [];
+    for (const spec of SHELL_FOLDER_SPECS) {
+        let found = '';
+        for (const name of spec.reg) {
+            if (registry[name]) { found = expandWindowsEnv(registry[name]); break; }
+        }
+        if (!found) {
+            for (const name of spec.fallback) {
+                const candidate = path.resolve(home, name);
+                if (existsSync(candidate)) { found = candidate; break; }
+            }
+        }
+        if (!found) continue;
+        roots.push({ key: spec.key, label: spec.label, path: found, exists: existsSync(found) });
+        for (const alias of spec.aliases) aliasMap.set(alias.toLowerCase(), found);
+    }
+    aliasMap.set('userprofile', home);
+    aliasMap.set('home', home);
+    if (process.env.TEMP) aliasMap.set('temp', process.env.TEMP);
+    if (process.env.APPDATA) aliasMap.set('appdata', process.env.APPDATA);
+    if (process.env.LOCALAPPDATA) aliasMap.set('localappdata', process.env.LOCALAPPDATA);
+    shellFolderCache.roots = roots;
+    shellFolderCache.aliasMap = aliasMap;
+    return shellFolderCache;
+}
+
+/**
+ * 把 AI 写的路径别名换成真实路径。
+ * 支持 `%DESKTOP%\a.txt`（大小写不敏感）与 `~desktop/a.txt` / `~/a.txt`。
+ * 只认这两种显式写法 —— 不去猜「桌面\a.txt」这种裸词，否则一个恰好叫「桌面」的目录会被劫持。
+ */
+function expandPathAliases(raw) {
+    const { aliasMap } = resolveShellFolders();
+    let p = String(raw || '').trim();
+    if (!p) return p;
+    p = p.replace(/%([^%\s]{1,32})%/g, (whole, name) => aliasMap.get(String(name).trim().toLowerCase()) || whole);
+    const tilde = p.match(/^~([A-Za-z_][A-Za-z0-9_]*)?(?=$|[\\/])/);
+    if (tilde) {
+        const hit = aliasMap.get(String(tilde[1] || 'home').toLowerCase());
+        if (hit) p = hit + p.slice(tilde[0].length);
+    }
+    return p;
+}
+
+/** 给 AI 看的「真实位置」提示（路径不存在时附在错误里，让它下一轮能自己纠正） */
+function shellFolderHint() {
+    const { roots } = resolveShellFolders();
+    if (!roots.length) return '';
+    return '这台电脑的真实位置：' + roots.map(r => `${r.label}=${r.path}`).join('、')
+        + '。路径不存在时请直接用上面的绝对路径，或用别名 %DESKTOP% / %DOCUMENTS% / %DOWNLOADS%。';
+}
+
 /**
  * 判断请求是否来自本机。
  * 安全前提：服务默认监听 0.0.0.0（方便手机/平板访问），而 Agent 文件操作接口没有鉴权，
@@ -399,7 +1009,7 @@ function isLocalRequest(request) {
 const PERM_DENIED_MSG = '限制模式：仅可操作应用文件夹（web/）。如需操作电脑其他路径，请在本机用 http://127.0.0.1:4173 打开（出于安全，局域网访问一律限制在应用文件夹内）。';
 
 function resolveAgentPath(rawPath, permission, isLocal) {
-    const p = String(rawPath || '').trim();
+    const p = expandPathAliases(rawPath);
     if (!p) return null;
     // 只有本机请求才允许"允许操作电脑"；其余一律按 app 模式处理
     const effective = (isLocal && permission === 'computer') ? 'computer' : 'app';
@@ -410,15 +1020,42 @@ function resolveAgentPath(rawPath, permission, isLocal) {
     return resolved;
 }
 
+/**
+ * 列目录。返回 [{ name, type, link }]。
+ *
+ * type 的判定必须走 stat 兜底：Windows 上的 junction（`C:\Users\All Users`、
+ * `C:\Users\<用户>\My Documents` 这类兼容性链接）在 readdir 的 Dirent 里
+ * **既不是目录也不是文件** —— `isDirectory()` 返回 false、`isSymbolicLink()` 返回 true。
+ * 旧实现只看 isDirectory()，于是这 12 个 junction 全被标成「文件」，
+ * 用户一看就觉得「和我电脑里的文件夹对不上」。
+ */
+async function listAgentEntries(target) {
+    const entries = await readdir(target, { withFileTypes: true });
+    const list = await Promise.all(entries.map(async (e) => {
+        if (e.isDirectory()) return { name: e.name, type: 'dir', link: false };
+        if (e.isFile()) return { name: e.name, type: 'file', link: false };
+        // 符号链接 / junction：跟随一次，按真实类型归类，并标记 link 供界面区分
+        const real = await stat(path.join(target, e.name)).catch(() => null);
+        if (real && real.isDirectory()) return { name: e.name, type: 'dir', link: true };
+        return { name: e.name, type: 'file', link: Boolean(e.isSymbolicLink()) };
+    }));
+    return list.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
+}
+
 async function agentLs(params, res, isLocal) {
     try {
         const permission = String(params.get('permission') || 'app');
         const target = resolveAgentPath(params.get('path') || AGENT_APP_ROOT, permission, isLocal);
         if (!target) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, message: (permission === 'computer' && isLocal) ? '路径无效' : PERM_DENIED_MSG })); return; }
         const info = await stat(target).catch(() => null);
-        if (!info || !info.isDirectory()) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, message: '目录不存在' })); return; }
-        const entries = await readdir(target, { withFileTypes: true });
-        const list = entries.map(e => ({ name: e.name, type: e.isDirectory() ? 'dir' : 'file' })).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
+        if (!info || !info.isDirectory()) {
+            // 带上真实位置提示：AI 猜错路径时，下一轮能自己纠正（旧实现只回「目录不存在」，它就卡死了）
+            const hint = (permission === 'computer' && isLocal) ? shellFolderHint() : '';
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, message: '目录不存在：' + target + (hint ? '。' + hint : '') }));
+            return;
+        }
+        const list = await listAgentEntries(target);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, path: target, entries: list }));
     } catch (err) {
@@ -433,7 +1070,12 @@ async function agentRead(params, res, isLocal) {
         const target = resolveAgentPath(params.get('path'), permission, isLocal);
         if (!target) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, message: (permission === 'computer' && isLocal) ? '路径无效' : PERM_DENIED_MSG })); return; }
         const info = await stat(target).catch(() => null);
-        if (!info || !info.isFile()) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, message: '文件不存在' })); return; }
+        if (!info || !info.isFile()) {
+            const hint = (permission === 'computer' && isLocal) ? shellFolderHint() : '';
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, message: '文件不存在：' + target + (hint ? '。' + hint : '') }));
+            return;
+        }
         if (info.size > AGENT_READ_LIMIT) { res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, message: '文件过大（>300KB）' })); return; }
         const buf = await (await import('node:fs/promises')).readFile(target, 'utf8');
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -633,45 +1275,35 @@ async function ensureCertificate(force = false) {
     }
 }
 
-// ===== 端侧数据存储（data/store.json） =====
+// ===== 端侧数据存储（data/ 分类落盘）=====
 // localStorage 是"每台设备各存一份"：电脑上聊的记录、填的 API Key，手机上完全看不到。
 // 这里把需要跨设备共享的那几项落到服务端 data/ 目录，前端启动时拉取、写入时回推。
-function normalizeStore(raw) {
+//
+// 存储结构见 server/store.mjs —— 那边负责把整块键值拆成分类文件（人设卡一卡一文件、
+// 聊天记录与记忆各自独立），读的时候再拼回键值。**前端仍然只看到键值**，所以
+// data-sync.js 与 APK 侧一行都不用改。
+const store = createStore({
+    dataDir: DATA_DIR,
+    log: (level, msg) => (level === 'error' ? console.error(msg) : console.log(msg)),
+});
+const loadStore = () => store.loadStore();
+const saveStore = () => store.saveStore();
+
+/**
+ * 校验并收敛 POST /api/store 提交上来的补丁。
+ * 只收字符串值（与 localStorage 语义一致）；限制键长与单键体积，
+ * 避免一个超大键把 data/ 撑爆。分类拆分由 server/store.mjs 负责，这里只管"收得干净"。
+ */
+function normalizeStorePatch(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
     const out = {};
     for (const [k, v] of Object.entries(raw)) {
         if (typeof k !== 'string' || !k || k.length > 120) continue;
-        if (typeof v !== 'string') continue;              // 只收字符串，与 localStorage 语义一致
+        if (typeof v !== 'string') continue;
         if (v.length > 8 * 1024 * 1024) continue;         // 单键 8MB 上限
         out[k] = v;
     }
     return out;
-}
-
-let storeCache = null;
-let storeWriteQueue = Promise.resolve();
-
-async function loadStore() {
-    if (storeCache) return storeCache;
-    try {
-        storeCache = normalizeStore(JSON.parse(await readFile(STORE_FILE, 'utf8')));
-    } catch {
-        storeCache = {};   // 文件不存在 / 内容损坏 → 从空开始，不阻塞启动
-    }
-    return storeCache;
-}
-
-// 串行写入 + 先写临时文件再 rename：并发提交不会把文件写成半截
-function saveStore() {
-    storeWriteQueue = storeWriteQueue.then(async () => {
-        await mkdir(DATA_DIR, { recursive: true });
-        const tmp = STORE_FILE + '.tmp';
-        await writeFile(tmp, JSON.stringify(storeCache), 'utf8');
-        await rename(tmp, STORE_FILE);
-    }).catch((err) => {
-        console.error('[store] 写入失败:', err && err.message ? err.message : err);
-    });
-    return storeWriteQueue;
 }
 
 // ===== 访问鉴权（局域网访问控制） =====
@@ -682,7 +1314,13 @@ function saveStore() {
 //   · 本机（127.0.0.1）自动视为管理员：免密进入，且可修改访问密码 —— 这也是忘记密码时的找回入口。
 //   · 局域网设备必须登录，登录后种 HttpOnly Cookie 会话（默认 7 天）。
 //   · 首次启动生成随机密码并在控制台打印；用户改过密码后只存加盐哈希，控制台不再打印。
-const AUTH_FILE = path.join(root, '.local-auth.json');
+//
+// 文件位置：data/auth.json。
+// 它原先放在 web/.local-auth.json —— 那是"运行时私密数据混在源码目录里"，
+// 只靠 .gitignore 单独排除 + 静态服务的"禁止访问隐藏文件"规则兜住，位置本身就不对。
+// 现在统一收进 data/（和 store.json、证书、日志同一处），老文件首次启动自动搬过来。
+const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
+const LEGACY_AUTH_FILE = path.join(root, '.local-auth.json');
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_COOKIE = 'elaina_session';
 const LOGIN_MAX_FAILS = 5;
@@ -733,11 +1371,29 @@ async function loadAuthFile() {
     try {
         const o = JSON.parse(await readFile(AUTH_FILE, 'utf8'));
         if (o && typeof o === 'object') return o;
-    } catch { /* 文件不存在或损坏 → 视为未初始化 */ }
+    } catch { /* 文件不存在或损坏 → 继续看老位置 */ }
+
+    // 一次性迁移：老位置有就搬到新位置。
+    // 搬不动（权限等）也不能让用户被锁在门外，退回用老内容继续跑。
+    try {
+        const legacy = JSON.parse(await readFile(LEGACY_AUTH_FILE, 'utf8'));
+        if (legacy && typeof legacy === 'object') {
+            try {
+                await mkdir(DATA_DIR, { recursive: true });
+                await rename(LEGACY_AUTH_FILE, AUTH_FILE);
+                console.log('[鉴权] 访问密码文件已迁移：web/.local-auth.json → data/auth.json');
+            } catch (err) {
+                console.error('[鉴权] 访问密码文件迁移失败，暂时沿用旧位置:', String(err?.message || err));
+            }
+            return legacy;
+        }
+    } catch { /* 老位置也没有 → 视为未初始化 */ }
+
     return null;
 }
 
 async function saveAuthFile(o) {
+    await mkdir(DATA_DIR, { recursive: true });
     await writeFile(AUTH_FILE, JSON.stringify(o, null, 2), 'utf8');
 }
 
@@ -814,14 +1470,9 @@ function ipOf(request) {
     return raw || '?';
 }
 
-function timeStamp() {
-    const d = new Date();
-    const p = (n) => String(n).padStart(2, '0');
-    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-}
-
 // 把 response 包一层，结束时打一行。
 // 静态资源且成功的不打 —— 否则窗口会被 js / css / 图片刷满，真正的信息反而被埋掉。
+// 状态码决定级别：5xx 记 ERRO、4xx 记 WARN、其余 INFO，这样在日志里能直接按级别筛出问题。
 function attachRequestLog(request, response) {
     const started = Date.now();
     const origWriteHead = response.writeHead;
@@ -834,13 +1485,14 @@ function attachRequestLog(request, response) {
         const rawPath = String(request.url || '/');
         if (code < 400 && QUIET_FILE_RE.test(rawPath.split('?')[0])) return;
         const ms = Date.now() - started;
-        console.log('[' + timeStamp() + '] '
-            + ipOf(request).padEnd(15) + ' '
+        const line = ipOf(request).padEnd(15) + ' '
             + String(request.method || '?').padEnd(5) + ' '
             + (rawPath.length > 52 ? rawPath.slice(0, 49) + '...' : rawPath).padEnd(52) + ' '
             + String(code).padEnd(4) + String(ms).padStart(5) + 'ms'
             + (response.__logNote ? '   ' + response.__logNote : '')
-            + (code >= 500 ? '   << 服务端错误' : code >= 400 ? '   << 请求失败' : ''));
+            + (code >= 500 ? '   << 服务端错误' : code >= 400 ? '   << 请求失败' : '');
+        // 时间戳由日志系统统一加，这里不再自己拼一个 —— 旧实现两份时间格式混在一行里
+        console[code >= 500 ? 'error' : code >= 400 ? 'warn' : 'log']('[http] ' + line);
     });
 }
 
@@ -874,6 +1526,391 @@ async function readJsonBody(request, limit = 64 * 1024) {
     }
     if (overflow) throw new Error('请求体过大');
     return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+}
+
+/**
+ * 读原始请求体（二进制安全）。给数据导入用 —— zip 是二进制，
+ * 走 readJsonBody 会被 JSON.parse 弄坏。
+ */
+async function readRawBody(request, limit = 64 * 1024) {
+    const chunks = [];
+    let total = 0;
+    let overflow = false;
+    for await (const chunk of request) {
+        total += chunk.length;
+        if (total > limit) { overflow = true; chunks.length = 0; continue; }
+        chunks.push(chunk);
+    }
+    if (overflow) throw new Error('请求体过大');
+    return Buffer.concat(chunks);
+}
+
+// ===== 本地中转 /api/relay =====
+//
+// 为什么需要它：BYOK 的"直连"是让浏览器自己去请求服务商，而浏览器会强制 CORS。
+// 大量中转站（自建 OneAPI、厂商内测网关、Ollama 之类）根本不发 Access-Control-Allow-Origin，
+// 预检 OPTIONS 甚至直接 405 —— 这时 fetch() 只会抛一句 "Failed to fetch"，
+// 看不出任何原因。而 ChatBox / Cherry Studio 这些原生客户端不受 CORS 约束，
+// 于是同一个 Key、同一个地址在它们那儿正常，在网页里就是连不上。
+//
+// 中转把请求搬到 Node 侧发出（Node 没有 CORS 这回事），前端只跟**同源**的 /api/relay 说话，
+// 连预检都不会触发。Key 只经过本机进程内存，不落盘、不发给任何第三方 —— 与 BYOK 一致。
+// 对话历史、语音 base64、图片 base64 都会走这条通道，给宽一点（和端侧数据同一个量级）。
+const RELAY_BODY_LIMIT = 32 * 1024 * 1024;
+const RELAY_TIMEOUT_MAX = 10 * 60 * 1000;
+// 超过这个大小的请求体不再解析内容（JSON.parse 一个 32MB 的图片请求要几百毫秒，
+// 平白给对话加延迟）。此时只记大小，不记消息。
+const RELAY_TRACE_PARSE_MAX = 16 * 1024 * 1024;
+// 这些地址是云厂商元数据服务，被中转当作跳板去读会泄露本机凭据，直接封掉。
+const RELAY_DENY_HOSTS = new Set(['169.254.169.254', 'metadata.google.internal', 'metadata.tencent.internal']);
+
+// ===== 对话追踪 =====
+//
+// 为什么埋在中转这一层：`/api/relay` 是**所有对外 AI 请求的唯一出口**（三种对话格式、
+// 获取模型、语音、视觉全走它），在这一层埋点就能覆盖全部，前端一行都不用改。
+//
+// 主日志只留一行摘要（提问 / 回复各截一段），完整内容进 `<启动时刻>.trace.log`。
+// 旧日志只有「谁在什么时候调了哪个接口」—— 出问题时根本还原不出当时问了什么、答了什么、
+// 上游到底为什么拒，这正是这次要补上的。
+
+/** 把消息内容拍平成可读文本；图片等二进制只记大小，绝不记 base64（否则日志瞬间膨胀） */
+function flattenContent(content) {
+    if (typeof content === 'string') return content;
+    if (content === null || content === undefined) return '';
+    if (Array.isArray(content)) {
+        return content.map((part) => {
+            if (typeof part === 'string') return part;
+            if (!part || typeof part !== 'object') return '';
+            const type = String(part.type || '');
+            if (/image/i.test(type)) {
+                const data = String(part.image_url?.url || part.source?.data || part.data || '');
+                return data ? `[图片 约 ${Math.round(data.length * 3 / 4)} 字节]` : '[图片]';
+            }
+            if (part.text !== undefined) return String(part.text);
+            if (part.content !== undefined) return flattenContent(part.content);
+            return `[${type || '未知片段'}]`;
+        }).filter(Boolean).join('\n');
+    }
+    if (typeof content === 'object') {
+        if (content.text !== undefined) return String(content.text);
+        return JSON.stringify(content);
+    }
+    return String(content);
+}
+
+/** 从请求体里抽「模型 + 消息列表」，兼容三种对话格式；不是对话请求就返回 null */
+function summarizeChatRequest(json) {
+    if (!json || typeof json !== 'object') return null;
+    const messages = [];
+    // Anthropic 把系统提示放在顶层的 system 字段
+    if (json.system !== undefined) messages.push({ role: 'system', text: flattenContent(json.system) });
+    const list = Array.isArray(json.messages) ? json.messages
+        : (Array.isArray(json.input) ? json.input : null);   // OpenAI Responses 用 input[]
+    if (!list) return messages.length ? { model: String(json.model || ''), messages } : null;
+    for (const m of list) {
+        if (!m || typeof m !== 'object') continue;
+        messages.push({
+            role: String(m.role || (m.type === 'message' ? 'assistant' : 'user')),
+            text: flattenContent(m.content !== undefined ? m.content : m),
+        });
+    }
+    return { model: String(json.model || ''), messages };
+}
+
+/** 从响应体里抽回复正文（三种格式，含流式分片） */
+function extractReplyText(json) {
+    if (!json || typeof json !== 'object' || json.error) return '';
+    const choice = Array.isArray(json.choices) ? json.choices[0] : null;
+    if (choice) {
+        const text = flattenContent((choice.message || choice.delta || {}).content);
+        if (text) return text;
+    }
+    // Anthropic 流式：{"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}
+    if (json.delta && typeof json.delta === 'object' && typeof json.delta.text === 'string' && json.delta.text) {
+        return json.delta.text;
+    }
+    // OpenAI Responses 流式：{"type":"response.output_text.delta","delta":"…"}
+    if (typeof json.delta === 'string' && json.delta) return json.delta;
+    if (typeof json.output_text === 'string' && json.output_text) return json.output_text;
+    if (Array.isArray(json.output)) {
+        const parts = [];
+        for (const item of json.output) {
+            for (const c of (item && Array.isArray(item.content) ? item.content : [])) {
+                if (c && typeof c.text === 'string') parts.push(c.text);
+            }
+        }
+        if (parts.length) return parts.join('\n');
+    }
+    if (Array.isArray(json.content)) {
+        const parts = json.content.filter((c) => c && typeof c.text === 'string').map((c) => c.text);
+        if (parts.length) return parts.join('\n');
+    }
+    return '';
+}
+
+/** 抽错误原因。FastAPI 系网关会把真正的文案套在 detail.error.message 里，必须挖到底 */
+function extractErrorText(json, rawText) {
+    if (json && typeof json === 'object') {
+        const candidates = [
+            json.error?.message, json.error?.error?.message,
+            json.detail?.error?.message, json.detail?.message,
+            typeof json.detail === 'string' ? json.detail : '', json.message,
+        ];
+        for (const c of candidates) if (typeof c === 'string' && c.trim()) return c.trim();
+        if (json.error && typeof json.error === 'object') return JSON.stringify(json.error);
+    }
+    return String(rawText || '').trim();
+}
+
+const clip = (text, max, label) => (text.length > max ? `${text.slice(0, max)}…（${label}，共 ${text.length} 字）` : text);
+
+/** 从 SSE 文本里把分片拼回完整回复（流式对话的响应体不是 JSON，直接读会得到一坨 data: 行） */
+function parseSseReply(rawText) {
+    const parts = [];
+    for (const line of String(rawText).split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;    // event: / id: / 心跳注释行直接跳过
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+            const piece = extractReplyText(JSON.parse(payload));
+            if (piece) parts.push(piece);
+        } catch { /* 被截断的最后一行、或非 JSON 的心跳，忽略 */ }
+    }
+    return parts.join('');
+}
+
+/**
+ * 流式响应里的报错，状态码常常是 200 —— 错在 `data:` 行里。
+ * 这类"看起来成功、其实一个字都没回"的情况不特意挖一下，用户只会看到"AI 不回话"，
+ * 而日志里一片祥和，完全无从下手。
+ */
+function parseSseError(rawText) {
+    for (const line of String(rawText).split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+            const json = JSON.parse(payload);
+            if (json && (json.error || json.type === 'error')) return extractErrorText(json, payload);
+        } catch { /* 同上 */ }
+    }
+    return '';
+}
+
+/** 「问了什么」：请求全文进追踪日志，主日志只留最后一问（一眼看出这次聊了什么） */
+function traceRelayRequest({ method, target, reqJson, reqRaw }) {
+    const where = `${target.host}${target.pathname}`;
+    const summary = summarizeChatRequest(reqJson);
+    if (!summary || !summary.messages.length) return null;
+    const lines = [`===== 请求 ${method} ${where} =====`];
+    lines.push(`模型 ${summary.model || '(未指定)'} · ${summary.messages.length} 条消息 · ${Buffer.byteLength(String(reqRaw || ''))} 字节`);
+    summary.messages.forEach((m, i) => {
+        lines.push(`[${i + 1}/${summary.messages.length}] ${m.role}（${m.text.length} 字）\n`
+            + clip(m.text, TRACE_MSG_MAX, '本条已截断'));
+    });
+    traceLine(lines.join('\n'));
+    const lastUser = [...summary.messages].reverse().find((m) => m.role === 'user');
+    if (lastUser && lastUser.text.trim()) {
+        console.log('[chat] 提问：' + clip(lastUser.text.replace(/\s+/g, ' ').trim(), 200, '已截断'));
+    }
+    return summary;
+}
+
+/**
+ * 一次中转的完整记录：请求 + 响应。
+ *
+ * 主日志留一行（谁、哪家、什么状态、多久、为什么失败），追踪日志留全文。
+ * 这是这次日志改造的核心 —— 旧日志只有「什么地址在什么时间调用了什么 API」，
+ * 出问题时还原不出当时问了什么、答了什么、上游到底为什么拒。
+ */
+function traceRelayExchange({ method, target, reqJson, reqRaw, status, ms, respJson, respRaw }) {
+    const where = `${target.host}${target.pathname}`;
+    const isChat = /\/chat\/completions|\/responses|\/messages/i.test(target.pathname);
+    const summary = traceRelayRequest({ method, target, reqJson, reqRaw });
+    const raw = String(respRaw || '');
+    const tail = `${method} ${where} -> ${status} 上游 ${ms}ms`;
+
+    // 请求体没能解析（超大 / 非 JSON）时至少留个大小，
+    // 否则追踪日志里会出现"只有响应、没有请求"，反而更难读
+    if (!summary && isChat) {
+        traceLine(`===== 请求 ${method} ${where} =====\n（请求体未解析或为空，${Buffer.byteLength(String(reqRaw || ''))} 字节）`);
+    }
+
+    // ① 上游报错：完整报错进追踪日志，主日志那一行直接带上原因，不用再翻文件
+    if (status >= 400) {
+        traceLine(`===== 响应 ${status} · ${ms}ms（上游报错）=====\n`
+            + clip(raw || '(空响应)', TRACE_BODY_MAX, '响应过大已截断'));
+        const reason = extractErrorText(respJson, raw) || '(上游没有给出原因)';
+        console.error(`[relay] ${tail} << 上游报错：` + clip(reason.replace(/\s+/g, ' '), 400, '已截断'));
+        return;
+    }
+
+    // ② 回复正文：非流式直接读 JSON，流式把 data: 分片拼回去
+    let reply = extractReplyText(respJson);
+    if (!reply && raw) reply = parseSseReply(raw);
+    if (reply) {
+        traceLine(`===== 响应 ${status} · ${ms}ms =====\n` + clip(reply, TRACE_MSG_MAX, '回复已截断'));
+        console.log(`[relay] ${tail}`);
+        console.log('[chat] 回复：' + clip(reply.replace(/\s+/g, ' ').trim(), 200, '已截断'));
+        return;
+    }
+
+    // ③ 状态码 200、却一个字都没抽出来 —— 流式接口把报错塞在 data: 行里就是这种形态
+    const sseError = raw ? parseSseError(raw) : '';
+    if (sseError) {
+        traceLine(`===== 响应 ${status} · ${ms}ms（流式响应内报错）=====\n`
+            + clip(raw, TRACE_BODY_MAX, '响应过大已截断'));
+        console.error(`[relay] ${tail} << 响应内报错：` + clip(sseError.replace(/\s+/g, ' '), 400, '已截断'));
+        return;
+    }
+
+    // ④ 非对话接口（获取模型等）成功时不再把响应体倒进追踪日志，否则模型列表会把对话内容淹掉
+    if (raw && isChat) traceLine(`===== 响应 ${status} · ${ms}ms =====\n` + clip(raw, TRACE_BODY_MAX, '响应过大已截断'));
+    console.log(`[relay] ${tail}`);
+}
+
+async function handleRelay(request, response) {
+    let payload;
+    try { payload = await readJsonBody(request, RELAY_BODY_LIMIT); }
+    catch {
+        // 这些校验失败以前是完全静默的 —— 前端只会拿到一句中文提示，
+        // 日志里连"发生过这件事"都没有，用户报"对话发不出去"时无从查起。
+        console.warn('[relay] 请求体无效或过大，已拒绝');
+        return jsonResponse(response, 400, { ok: false, relayError: true, message: '中转请求体无效或过大' });
+    }
+
+    let target;
+    try { target = new URL(String(payload?.url || '')); }
+    catch {
+        console.warn('[relay] 目标地址无效：' + String(payload?.url || '(空)').slice(0, 200));
+        return jsonResponse(response, 400, { ok: false, relayError: true, message: '中转目标地址无效' });
+    }
+
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+        console.warn(`[relay] 不支持的协议 ${target.protocol}//${target.host}，只允许 http/https`);
+        return jsonResponse(response, 400, { ok: false, relayError: true, message: '中转只支持 http/https' });
+    }
+    if (RELAY_DENY_HOSTS.has(target.hostname.toLowerCase())) {
+        console.warn(`[relay] 拒绝访问云元数据地址 ${target.host}（防本机凭据泄露）`);
+        return jsonResponse(response, 403, { ok: false, relayError: true, message: '该地址不允许通过中转访问' });
+    }
+    // 局域网设备不能把本机当中转跳板去打本机的其它服务（SSRF）。
+    // 本机自己发起的请求放行 —— Ollama 这类就住在 127.0.0.1。
+    if (!isLocalRequest(request) && isLoopbackHostname(target.hostname)) {
+        console.warn(`[relay] 拒绝非本机请求访问本机地址 ${target.host}（防 SSRF）`);
+        return jsonResponse(response, 403, { ok: false, relayError: true, message: '本机地址只能由本机发起中转' });
+    }
+
+    const method = String(payload?.method || 'GET').toUpperCase();
+    if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+        console.warn(`[relay] 不支持的请求方法 ${method}`);
+        return jsonResponse(response, 400, { ok: false, relayError: true, message: '中转不支持的请求方法' });
+    }
+
+    const headers = {};
+    const rawHeaders = payload?.headers;
+    if (rawHeaders && typeof rawHeaders === 'object') {
+        for (const [k, v] of Object.entries(rawHeaders)) {
+            const key = String(k);
+            // Host / Content-Length 交给 undici 自己算；Cookie、Origin 之类浏览器身份信息不该外发。
+            if (/^(host|content-length|cookie|origin|referer|connection|transfer-encoding)$/i.test(key)) continue;
+            if (v === null || v === undefined) continue;
+            headers[key] = String(v);
+        }
+    }
+    // 不让上游压缩：一是 SSE 要能逐块透传，二是省得再解一遍。
+    headers['accept-encoding'] = 'identity';
+
+    const timeoutMs = Math.min(Math.max(Number(payload?.timeoutMs) || 120000, 1000), RELAY_TIMEOUT_MAX);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let abortedByClient = false;
+    response.on('close', () => {
+        if (!response.writableEnded) { abortedByClient = true; controller.abort(); }
+    });
+
+    const sendBody = !(method === 'GET' || method === 'HEAD');
+    const bodyValue = typeof payload?.body === 'string'
+        ? payload.body
+        : (payload?.body === undefined || payload?.body === null ? undefined : JSON.stringify(payload.body));
+    const reqRaw = typeof bodyValue === 'string' ? bodyValue : '';
+    // 解析请求体**只为了记日志**。超大请求（图片 / 语音 base64）跳过：JSON.parse 一个几十 MB 的
+    // 对象要几百毫秒，为了日志给每次对话平白加延迟不划算 —— 那种情况只记大小。
+    let reqJson = null;
+    if (reqRaw && Buffer.byteLength(reqRaw) <= RELAY_TRACE_PARSE_MAX) {
+        try { reqJson = JSON.parse(reqRaw); } catch { reqJson = null; }
+    }
+
+    let upstream;
+    const relayStartedAt = Date.now();
+    try {
+        upstream = await fetch(target, {
+            method,
+            headers,
+            body: sendBody ? bodyValue : undefined,
+            signal: controller.signal,
+            redirect: 'follow',
+        });
+    } catch (err) {
+        clearTimeout(timer);
+        if (abortedByClient) return;                       // 客户端自己走了，不用回话
+        const cause = err?.cause;
+        // 这一句比浏览器那句 "Failed to fetch" 有用得多：能看出是 DNS、TLS 还是连接被拒。
+        // 带上 cause.code（ENOTFOUND / ECONNREFUSED / UND_ERR_CONNECT_TIMEOUT …），方便直接 grep。
+        const detail = err?.name === 'AbortError'
+            ? `超过 ${Math.round(timeoutMs / 1000)} 秒没有响应`
+            : String(cause?.message || err?.message || err) + (cause?.code ? ` [${cause.code}]` : '');
+        // 连不上时把**请求内容**也写进追踪日志：否则只看到"连接被拒"，
+        // 不知道当时问的是什么、模型名有没有写错 —— 而这恰恰是最常见的原因。
+        traceRelayRequest({ method, target, reqJson, reqRaw });
+        traceLine(`===== 请求失败 ${method} ${target.href} =====\n${detail}（${Date.now() - relayStartedAt}ms）`);
+        console.error(`[relay] 请求失败 ${method} ${target.href} -> ${detail} (${Date.now() - relayStartedAt}ms)`);
+        return jsonResponse(response, 502, { ok: false, relayError: true, message: `本地中转无法连接目标：${detail}` });
+    }
+
+    response.writeHead(upstream.status, {
+        'Content-Type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+    });
+
+    // 边透传边攒一份给日志用。攒到上限就停止记录（**继续透传**），
+    // 免得一个长回答把内存吃掉；流式的正文稍后由 parseSseReply 从 data: 行拼回来。
+    const traceChunks = [];
+    let traceBytes = 0;
+    if (upstream.body) {
+        try {
+            for await (const chunk of upstream.body) {
+                if (abortedByClient) break;
+                response.write(chunk);
+                if (traceBytes < TRACE_ACCUM_MAX) {
+                    traceChunks.push(chunk);
+                    traceBytes += chunk.length;
+                }
+            }
+        } catch (err) {
+            if (!abortedByClient) console.error('[relay] 透传响应中断:', String(err?.message || err));
+        }
+    }
+    clearTimeout(timer);
+    response.end();
+
+    if (abortedByClient) return;
+    // 每个中转请求留一条完整记录：目标是哪家、什么状态、耗时多少、问了什么、答了什么 / 为什么失败。
+    // 排查"偶发失败"时这是唯一能还原现场的东西 —— 旧日志只有一行状态码，看不出原因。
+    const respRaw = traceChunks.length ? Buffer.concat(traceChunks).toString('utf8') : '';
+    let respJson = null;
+    if (respRaw) {
+        try { respJson = JSON.parse(respRaw); } catch { respJson = null; }
+    }
+    traceRelayExchange({
+        method, target, reqJson, reqRaw,
+        status: upstream.status,
+        ms: Date.now() - relayStartedAt,
+        respJson, respRaw,
+    });
 }
 
 async function handleLogin(request, response) {
@@ -1131,6 +2168,12 @@ const requestHandler = async (request, response) => {
             return response.end();
         }
 
+        // 本地中转：把浏览器发不出去的跨域请求搬到 Node 侧（见 handleRelay 的说明）。
+        // 放在鉴权之后 —— 它会把请求原样转发到任意 http(s) 地址，不能让未登录的访客当跳板用。
+        if (pathname === '/api/relay' && request.method === 'POST') {
+            return await handleRelay(request, response);
+        }
+
         // 前端日志上报：把浏览器控制台里的错误转到启动窗口。
         // 前端的问题（ASR 起不来、模型加载失败）平时只出现在浏览器控制台里，
         // 拿手机排查时根本看不到；转过来就能和请求日志对照着看。
@@ -1139,14 +2182,64 @@ const requestHandler = async (request, response) => {
             try { body = await readJsonBody(request, 64 * 1024); } catch { return jsonResponse(response, 400, { ok: false }); }
             const items = Array.isArray(body && body.items) ? body.items.slice(0, 20) : [];
             for (const it of items) {
-                const level = String((it && it.level) || 'log').toUpperCase().slice(0, 5);
+                const rawLevel = String((it && it.level) || 'log').toLowerCase();
+                const level = ['debug', 'info', 'warn', 'error'].includes(rawLevel) ? rawLevel : 'log';
                 const page = String((it && it.page) || '').slice(0, 36);
-                const text = String((it && it.text) || '').replace(/\s+/g, ' ').slice(0, 300);
+                const text = String((it && it.text) || '').trim();
                 if (!text) continue;
-                console.log('[' + timeStamp() + '] ' + ipOf(request).padEnd(15) + ' 页面 '
-                    + level.padEnd(5) + ' ' + (page ? page + '  ' : '') + text);
+                // 主日志压成一行。旧实现截到 300 字符 —— 恰好把最关键的上游报错砍在半截
+                // （`requestedModel":"Qwen3.8-` 就断了），查问题时等于没有。放宽到 2000。
+                const oneLine = text.replace(/\s+/g, ' ');
+                const clipped = oneLine.length > 2000
+                    ? oneLine.slice(0, 2000) + ' …（已截断，完整内容见追踪日志）'
+                    : oneLine;
+                // 浏览器的 console.debug 现在真的记成 DBUG（以前被压成 INFO，
+                // 于是"把级别调到 DEBUG"也看不到前端调试信息）
+                const method = { debug: 'debug', info: 'log', warn: 'warn', error: 'error' }[level] || 'log';
+                console[method]('[page] ' + ipOf(request).padEnd(15) + ' '
+                    + (page ? page + '  ' : '') + clipped);
+                // 完整原文一行不丢地进追踪日志 —— 浏览器控制台里的报错往往带着真正的错误原因
+                traceLine(`===== 浏览器上报 · ${page || '/'} · ${level.toUpperCase()} =====\n${text}`);
             }
             return jsonResponse(response, 200, { ok: true });
+        }
+
+        // 日志设置：读取当前状态 / 运行时调整级别与对话追踪。
+        // 放在鉴权之后 —— 它会改服务端行为，不能让未登录的局域网设备操作。
+        if (pathname === '/api/logs/settings' && request.method === 'GET') {
+            return jsonResponse(response, 200, {
+                ok: true,
+                level: fileLevel,
+                levels: LEVEL_NAMES,
+                trace: traceEnabled,
+                fileEnabled: LOG_TO_FILE,
+                logDir: path.relative(APP_ROOT, LOG_DIR) || '.',
+                mainFile: mainSink.file ? path.relative(APP_ROOT, mainSink.file) : '',
+                traceFile: traceSink.file ? path.relative(APP_ROOT, traceSink.file) : '',
+                keep: LOG_KEEP,
+                maxMb: Math.round(LOG_MAX_BYTES / 1024 / 1024),
+            });
+        }
+        if (pathname === '/api/logs/settings' && request.method === 'POST') {
+            let body;
+            try { body = await readJsonBody(request, 8 * 1024); } catch { return jsonResponse(response, 400, { ok: false, message: '请求格式无效' }); }
+            const notes = [];
+            if (body && body.level !== undefined) {
+                const want = normalizeLevelName(body.level);
+                if (!want) return jsonResponse(response, 400, { ok: false, message: '级别无效，可选：' + LEVEL_NAMES.join(' / ') });
+                if (setFileLogLevel(want)) notes.push(`落盘级别已改为 ${want}`);
+            }
+            if (body && body.trace !== undefined) {
+                if (setTraceEnabled(body.trace)) notes.push(body.trace ? '对话追踪已开启' : '对话追踪已关闭');
+            }
+            // 这次调整本身也要留下痕迹：否则日志级别被改过、事后却看不出来，
+            // 排查"怎么少了那么多日志"时会先怀疑代码而不是设置。
+            if (notes.length) {
+                console.log(`[log] 日志设置已更新：${notes.join('；')}（操作者 ${ipOf(request)}）`);
+            }
+            return jsonResponse(response, 200, {
+                ok: true, level: fileLevel, trace: traceEnabled, changed: notes,
+            });
         }
 
         // 端侧数据存储：需要跨设备共享的那几项（设置 / 聊天记录 / API Key 等）走这里读写
@@ -1161,11 +2254,84 @@ const requestHandler = async (request, response) => {
             } catch {
                 return jsonResponse(response, 400, { ok: false, message: '提交内容过大或格式无效' });
             }
-            const patch = normalizeStore(body && body.data);
-            const store = await loadStore();
-            Object.assign(store, patch);   // 按键合并：只覆盖本次提交的键，不动其它设备的其它键
+            const patch = normalizeStorePatch(body && body.data);
+            const current = await loadStore();
+            Object.assign(current, patch);   // 按键合并：只覆盖本次提交的键，不动其它设备的其它键
             await saveStore();
             return jsonResponse(response, 200, { ok: true, keys: Object.keys(patch).length });
+        }
+
+        // 数据导出：把 data/ 下的全部分类数据打包成一个 JSON 文件下载。
+        // 用途：换机器、重装、版本升级前备份 —— 用户最怕的"更新一次聊天记录没了"。
+        if (pathname === '/api/data/export' && request.method === 'GET') {
+            const body = await store.exportZip();
+            const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+            const filename = `elainachat-backup-${stamp}.zip`;
+            // 刻意**不发** Content-Disposition: attachment。
+            //
+            // 原因：迅雷/FDM 这类下载器会往 Chrome 里装机器级扩展（HKLM 注册表强制安装，
+            // 任何 profile 都躲不掉），只要看到 attachment 就把这个 URL 抢走转给自己的
+            // 下载引擎 —— 结果是浏览器里拿到一个被改写的空响应（实测是 204 + 0 字节），
+            // 用户既拿不到文件、也不知道为什么，还会被弹一个下载器窗口。
+            //
+            // 改成：这里只把字节正常发出去，前端 fetch 成 blob 后用 <a download> 触发保存。
+            // blob: 是内存地址，外部下载器无从接管，也不会弹窗。
+            // 文件名通过自定义头带过去（自定义头不触发下载器识别）。
+            response.writeHead(200, {
+                'Content-Type': 'application/zip',
+                'Content-Length': body.length,
+                'X-Backup-Filename': filename,
+                'Cache-Control': 'no-store',
+                'X-Content-Type-Options': 'nosniff',
+            });
+            return response.end(body);
+        }
+        // 数据导入：接受 zip（推荐）或 v1 的单 JSON 旧备份，按 merge（默认）或 replace 合并进 data/。
+        // 这里收**原始字节**而不是 JSON —— zip 是二进制，走 readJsonBody 会被解析坏。
+        if (pathname === '/api/data/import' && request.method === 'POST') {
+            let raw;
+            try {
+                raw = await readRawBody(request, STORE_MAX_BYTES);
+            } catch {
+                return jsonResponse(response, 400, { ok: false, message: '备份文件过大' });
+            }
+            // mode 走 query（body 是二进制，塞不进 JSON 字段）
+            const mode = url.searchParams.get('mode') === 'replace' ? 'replace' : 'merge';
+            try {
+                const result = await store.importBackup(raw, mode);
+                if (!result.ok) return jsonResponse(response, 400, { ok: false, message: result.message || '备份里没有可导入的数据' });
+                return jsonResponse(response, 200, {
+                    ok: true, mode, keys: result.keys, source: result.source,
+                    message: result.message || `已导入 ${result.keys} 项数据`,
+                });
+            } catch (err) {
+                return jsonResponse(response, 400, { ok: false, message: '导入失败：' + (err && err.message ? err.message : '未知错误') });
+            }
+        }
+        // 数据位置信息：告诉用户"我的数据在哪、有哪些"，配合导入导出用
+        if (pathname === '/api/data/info' && request.method === 'GET') {
+            const storeData = await loadStore();
+            const keys = Object.keys(storeData);
+            const counts = { characters: 0, conversations: 0, memoryEntries: 0 };
+            try { counts.characters = JSON.parse(storeData['elaina_open_character_cards'] || '[]').length; } catch { /* 忽略 */ }
+            try { counts.conversations = JSON.parse(storeData['elaina_open_conversations'] || '[]').length; } catch { /* 忽略 */ }
+            try {
+                const mem = JSON.parse(storeData['elaina_open_memory_core'] || '{}');
+                counts.memoryEntries = Array.isArray(mem.diary) ? mem.diary.length : 0;
+            } catch { /* 忽略 */ }
+            return jsonResponse(response, 200, {
+                ok: true,
+                dir: path.relative(APP_ROOT, DATA_DIR) || 'data',
+                layout: {
+                    settings: 'store.json（设置 / API Key / UI 偏好）',
+                    characters: 'characters/（一卡一文件）',
+                    conversations: 'conversations/（一对话一文件）',
+                    memory: 'memory.json',
+                    logs: 'logs/',
+                },
+                counts,
+                keys: keys.length,
+            });
         }
 
         // 鉴权状态（供设置页展示：是否本机管理员、是否仍是初始随机密码）
@@ -1215,6 +2381,15 @@ const requestHandler = async (request, response) => {
         }
         // API：AI Agent 文件操作（权限模式：app=仅应用文件夹；computer=允许操作电脑）
         const isLocal = isLocalRequest(request);
+        if (pathname === '/api/agent/roots' && request.method === 'GET') {
+            // 把「桌面/文档/下载…到底在哪」告诉前端 —— 用户可以把桌面移动到任意位置，
+            // 让 AI 按惯例猜 C:\Users\<用户名>\Desktop 是会猜错的（实测踩过）。
+            const { roots } = resolveShellFolders();
+            const visible = (isLocal && url.searchParams.get('permission') === 'computer')
+                ? roots
+                : roots.map(r => ({ ...r, path: undefined })); // 非本机不泄露宿主机的真实路径
+            return jsonResponse(response, 200, { ok: true, platform: process.platform, roots: visible });
+        }
         if (pathname === '/api/agent/ls' && request.method === 'GET') {
             return await agentLs(url.searchParams, response, isLocal);
         }
@@ -1233,7 +2408,8 @@ const requestHandler = async (request, response) => {
         }
 
         const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-        // 禁止访问隐藏文件：否则 .local-auth.json（访问密码）会被直接下载走
+        // 禁止访问隐藏文件：这条规则仍然必要 —— 它挡住的是 .env / .git / 各类点文件，
+        // 以及历史上曾经放在这里的 .local-auth.json（访问密码，现已迁到 data/ 下）。
         if (relative.split('/').some(seg => seg.startsWith('.'))) {
             response.writeHead(403, { 'X-Content-Type-Options': 'nosniff' }).end('Forbidden');
             return;
@@ -1276,27 +2452,42 @@ const requestHandler = async (request, response) => {
     }
 };
 
-// 端口被占用等启动错误：给出可读提示，而不是抛一串裸栈
+// 端口被占用等启动错误：给出可读提示，而不是抛一串裸栈。
+// 用 CRITICAL —— 服务根本没起来，这是最高级别的失败，不该和普通报错混在一个档次里。
+// （不写空行分隔：日志系统会丢弃纯空白记录，写了也是白写。）
 function printListenError(err, which, usedPort) {
     if (err && err.code === 'EADDRINUSE') {
-        console.error('');
-        console.error('  ✗ ' + which + ' 端口 ' + usedPort + ' 已被占用，服务没能启动。');
-        console.error('    可能是之前已经开着一个 ElainaChat 服务（或其它程序占用了这个端口）。');
-        console.error('    解决办法：关掉那个进程，或换个端口启动，例如：');
-        console.error('      set PORT=4175 && set HTTPS_PORT=4176 && node web/serve.mjs');
-        console.error('');
+        logCritical('  ✗ ' + which + ' 端口 ' + usedPort + ' 已被占用，服务没能启动。');
+        logCritical('    可能是之前已经开着一个 ElainaChat 服务（或其它程序占用了这个端口）。');
+        logCritical('    解决办法：关掉那个进程，或换个端口启动，例如：');
+        logCritical('      set PORT=4175 && set HTTPS_PORT=4176 && node web/serve.mjs');
     } else {
-        console.error('  ✗ ' + which + ' 服务启动失败：', err && err.message ? err.message : err);
+        logCritical('  ✗ ' + which + ' 服务启动失败：' + (err && err.message ? err.message : err));
     }
     process.exitCode = 1;
 }
 
 // 启动前准备访问密码（node web/serve.mjs --reset-password 可强制重新生成）
 if (process.argv.includes('--reset-password')) {
+    // 新旧两个位置都清，否则迁移逻辑会把老文件又搬回来，"重置"等于没重置
     await rm(AUTH_FILE, { force: true });
+    await rm(LEGACY_AUTH_FILE, { force: true });
     console.log('[鉴权] 已按 --reset-password 清除旧密码，将重新生成');
 }
 const authInfo = await ensureAuth();
+
+// 数据存储迁移：旧的 data/store.json 把聊天记录/人设卡/记忆全挤在一个文件里，
+// 现在按类别拆开（见 server/store.mjs）。这一步在监听之前跑完，保证第一个请求
+// 读到的就是迁移后的数据。幂等：没有旧数据时什么都不做。
+try {
+    const moved = await store.migrateIfNeeded();
+    if (moved.length) {
+        console.log(`[store] 数据已迁移到分类存储：${moved.join('、')}（原始数据未删除，见 data/）`);
+    }
+} catch (err) {
+    // 迁移失败不能挡住启动 —— 旧数据仍在 store.json 里，服务照常可用
+    console.error('[store] 迁移失败（服务继续启动，旧数据未受影响）:', err && err.message ? err.message : err);
+}
 
 // --reset-cert：强制换一张新的自签证书（比如 SAN 里的局域网 IP 变了、或者怀疑证书坏了）
 const forceNewCert = process.argv.includes('--reset-cert');
@@ -1323,7 +2514,7 @@ if (httpsServer) {
     // TLS 握手失败：排查"手机连不上"时，有这一行就知道对方到底有没有连上来
     httpsServer.on('tlsClientError', (err, socket) => {
         const addr = (socket && socket.remoteAddress) ? socket.remoteAddress.replace('::ffff:', '') : '?';
-        console.log('[' + timeStamp() + '] ' + addr.padEnd(15) + ' TLS 握手失败   '
+        console.warn('[tls] ' + addr.padEnd(15) + ' TLS 握手失败   '
             + String((err && err.message) || err).slice(0, 100));
     });
 }

@@ -7,6 +7,16 @@
     <script src="/vendor/tailwind.js"></script>
     <script src="/vendor/live2dcubismcore.min.js"></script>
     <script src="/vendor/pixi-6.min.js"></script>
+    <!-- 对话 API 格式适配器（三种协议的实现 + 分发表）。
+         必须放在主脚本**之前**：主脚本会挂 window.ChatDeps 供它取依赖，
+         并在 callChatAPI 里调 window.ChatProviders.forFormat()。
+         注意：它只在"被调用时"才读 ChatDeps，所以真正的顺序要求是
+         「本文件先加载」——先加载只定义、不执行，最稳。 -->
+    <script src="/js/chat-providers.js"></script>
+    <!-- 数据备份（APK 侧）：安卓版没有本地服务，/api/data/* 不存在，
+         所以由这个模块直接在 localStorage 上生成/还原备份。
+         格式与 Web 版同构（同一套 zip 结构），两边可以互相导入。 -->
+    <script src="/js/chat-backup.js"></script>
     <script>
     // pixi-live2d-display 初始化时强制检查 Cubism2 (window.Live2D)；
     // 我们的模型是 Cubism3/4，用 live2dcubismcore 加载，这里给个占位避免初始化中断。
@@ -14,168 +24,8 @@
         window.Live2D = { version: 'placeholder-cubism4-only', createLive2DModel: null };
     }
 </script>
-<script>
-    /* ===== 端侧数据同步（跨设备） =====
-       localStorage 是"每台设备各存一份"：电脑上聊的记录、填的 API Key，手机上完全看不到。
-       这里把需要共享的几项同步到服务端 data/store.json：
-         · 启动时用同步 XHR 拉下来灌进 localStorage —— 必须是同步的，
-           因为应用主脚本是同步读 localStorage 完成初始化的，异步拉取会来不及；
-         · 之后每次写入这些键，防抖后推回服务端。
-       实现方式是直接包 localStorage.setItem，所以业务代码一行都不用改。 */
-    (function () {
-        var SYNC_KEYS = [
-            'elaina_open_settings',        // 设置（含 ASR/TTS provider、各类参数）
-            'elainachat_open_api_secrets', // API Key
-            'elaina_open_conversations',   // 聊天记录
-            'elaina_open_categories',      // 分类
-            'elaina_open_favorites',       // 收藏
-            'elaina_open_liked_quotes',    // 喜欢的台词
-            'elaina_open_character_card',  // 角色卡（当前生效的那套）
-            'elaina_open_character_cards', // 多人设列表
-            'elaina_open_current_card',    // 当前选中的人设 id
-            'elaina_open_memory_core',     // 记忆
-            'live2d.bg',                   // Live2D 背景
-            'live2d.mouseFollow',          // 鼠标跟随开关
-            'live2d.mouseFollowScale'      // 鼠标跟随幅度
-        ];
-        var SYNC_SET = {};
-        for (var i = 0; i < SYNC_KEYS.length; i++) SYNC_SET[SYNC_KEYS[i]] = true;
-
-        var pending = {};
-        var timer = null;
-
-        function flush() {
-            timer = null;
-            if (!Object.keys(pending).length) return;
-            var body = JSON.stringify({ data: pending });
-            pending = {};
-            try {
-                // 用 sendBeacon：刚改完设置就关页面/切后台时也能发出去
-                if (navigator.sendBeacon) {
-                    var blob = new Blob([body], { type: 'application/json' });
-                    if (navigator.sendBeacon('/api/store', blob)) return;
-                }
-            } catch (e) { /* 退回 fetch */ }
-            try {
-                fetch('/api/store', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: body,
-                    keepalive: true
-                }).catch(function () { /* 服务端没开就只留本地 */ });
-            } catch (e) { }
-        }
-
-        function queue(key, value) {
-            pending[key] = value;
-            if (!timer) timer = setTimeout(flush, 800);
-        }
-
-        // ① 先把服务端数据拉下来
-        var serverData = null;
-        try {
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', '/api/store', false);   // 同步
-            xhr.send(null);
-            if (xhr.status === 200) {
-                var res = JSON.parse(xhr.responseText || '{}');
-                serverData = (res && res.data) || {};
-                for (var k in serverData) {
-                    if (!SYNC_SET[k] || typeof serverData[k] !== 'string') continue;
-                    try { localStorage.setItem(k, serverData[k]); } catch (e) { }
-                }
-            }
-        } catch (e) { /* 未登录 / 离线 → 用本地数据继续，不影响使用 */ }
-
-        // ② 服务端缺、本机有的项，补推上去。
-        //    注意这里要**逐个键**判断，不能只看"服务端是不是空的" ——
-        //    否则服务端只要有任何一条数据（比如另一台设备先同步了聊天记录），
-        //    本机独有的项（比如刚填的 API Key）就永远传不上去。
-        //    两边都有的键以服务端为准（多设备下它才是权威）。
-        if (serverData) {
-            for (var j = 0; j < SYNC_KEYS.length; j++) {
-                var key = SYNC_KEYS[j];
-                if (key in serverData) continue;
-                try {
-                    var lv = localStorage.getItem(key);
-                    if (lv !== null) pending[key] = lv;
-                } catch (e) { }
-            }
-            if (Object.keys(pending).length && !timer) timer = setTimeout(flush, 600);
-        }
-
-        // ③ 之后每次写入这些键都回推服务端
-        try {
-            var proto = Object.getPrototypeOf(window.localStorage);
-            var origSet = proto.setItem;
-            proto.setItem = function (key, value) {
-                origSet.call(this, key, value);
-                if (this === window.localStorage && SYNC_SET[key]) queue(key, String(value));
-            };
-        } catch (e) { /* 拿不到 Storage 原型就放弃同步，其它功能不受影响 */ }
-
-        window.addEventListener('pagehide', function () {
-            if (timer) { clearTimeout(timer); flush(); }
-        });
-    })();
-</script>
-<script>
-    /* ===== 前端日志转发 =====
-       浏览器里的报错平时只在控制台可见。手机上一旦出问题（语音起不来、模型加载失败），
-       根本没法去看控制台。这里把 error / warn / 未捕获异常转发到服务端，
-       直接显示在启动窗口里，和请求日志对照着看。 */
-    (function () {
-        if (window.__logRelayInstalled) return;
-        window.__logRelayInstalled = true;
-
-        var queue = [];
-        var timer = null;
-
-        function toText(args) {
-            var parts = [];
-            for (var i = 0; i < args.length; i++) {
-                var a = args[i];
-                try {
-                    if (a instanceof Error) parts.push(a.message);
-                    else if (typeof a === 'object' && a !== null) parts.push(JSON.stringify(a));
-                    else parts.push(String(a));
-                } catch (e) { parts.push('[无法序列化]'); }
-            }
-            return parts.join(' ').slice(0, 300);
-        }
-
-        function push(level, text) {
-            if (!text) return;
-            queue.push({ level: level, text: text, page: location.pathname + location.hash.slice(0, 20) });
-            if (queue.length > 40) queue.splice(0, queue.length - 40);
-            if (!timer) timer = setTimeout(flush, 1200);
-        }
-
-        function flush() {
-            timer = null;
-            if (!queue.length) return;
-            var items = queue.splice(0, 20);
-            try {
-                var blob = new Blob([JSON.stringify({ items: items })], { type: 'application/json' });
-                navigator.sendBeacon('/api/client-log', blob);
-            } catch (e) { /* 上报失败就算了，绝不影响应用本身 */ }
-        }
-
-        var origError = console.error;
-        console.error = function () { origError.apply(console, arguments); push('error', toText(arguments)); };
-        var origWarn = console.warn;
-        console.warn = function () { origWarn.apply(console, arguments); push('warn', toText(arguments)); };
-
-        window.addEventListener('error', function (e) {
-            push('error', '未捕获异常: ' + (e.message || '') + '  @'
-                + String(e.filename || '').split('/').pop() + ':' + (e.lineno || 0));
-        });
-        window.addEventListener('unhandledrejection', function (e) {
-            var r = e.reason;
-            push('error', '未处理的 Promise 拒绝: ' + ((r && r.message) || String(r)));
-        });
-    })();
-</script>
+    <script src="/js/data-sync.js"></script>
+    <script src="/js/frontend-log.js"></script>
 <script src="/vendor/pixi-live2d-display-cubism4.min.js"></script>
     <style>
         @import url('https://cdn.jsdelivr.net/npm/@fontsource-variable/outfit@5.2.8/index.css');
@@ -634,7 +484,9 @@
            用长属性兜底所有 fixed inset-0 浮层，新 WebView 上效果与 inset: 0 相同。 */
         .fixed.inset-0 { top: 0; right: 0; bottom: 0; left: 0; }
 
-        #customModal { z-index: 100001 !important; }
+        /* #customModal 的层级不在这里 —— 见下方「弹窗之间的层叠顺序必须写死」那段。
+           同一个属性上留两条互相打架的 !important 规则，靠源码顺序决定谁赢，
+           下次有人挪动其中一条就会静默改变层级，所以只保留一处。 */
         #customModal:not(.hidden),
         #conversationMoveOverlay:not(.hidden) { display: flex !important; }
         #conversationMoveOverlay {
@@ -1681,6 +1533,15 @@
         #sidebar > div:last-child > div:last-child { color: var(--pixso-brown-soft) !important; }
 
         /* Pixso dialog system: opaque, warm and typography-led instead of grey glass. */
+        /* 弹窗之间的层叠顺序必须写死。
+           .modal-overlay 上是 z-index: 100001 !important，会把所有弹窗压成同一层，
+           于是"谁在上面"变成由 DOM 顺序决定 —— 改一下 HTML 里元素的位置就可能把对话框
+           埋到别的弹窗后面。这里用 ID 选择器（优先级高于类选择器）+ !important 显式分层：
+             100001 普通弹窗（设置、分类管理、移动会话…）
+             100002 实现方式面板（从设置里打开，必须盖住设置）
+             100003 提示 / 确认对话框（要用户立刻做决定，永远在最上面） */
+        #backendPanel { z-index: 100002 !important; }
+        #customModal { z-index: 100003 !important; }
         .modal-overlay {
             background: rgba(50, 34, 26, 0.38);
             backdrop-filter: blur(4px);
@@ -2866,9 +2727,6 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M6 4.5h9.5L18 7v12.5H6z"/><path stroke-linecap="round" stroke-linejoin="round" d="M15.5 4.5V7H18M9 11h6M9 14.5h4"/></svg>
                 </button>
                 <div class="sidebar-rail-spacer" aria-hidden="true"></div>
-                <button id="railBackendBtn" class="sidebar-rail-btn" type="button" title="实现方式" aria-label="实现方式">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4.5" y="4.5" width="15" height="15" rx="3"/><rect x="9.6" y="9.6" width="4.8" height="4.8" rx="1.2"/><path stroke-linecap="round" d="M9 2.5v2M15 2.5v2M9 19.5v2M15 19.5v2M2.5 9h2M2.5 15h2M19.5 9h2M19.5 15h2"/></svg>
-                </button>
                 <button id="railSettingsBtn" class="sidebar-rail-btn" type="button" title="设置" aria-label="设置" data-rail-action="settings">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.73v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.73l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
                 </button>
@@ -3223,6 +3081,7 @@
                 <button type="button" class="settings-tab-btn" data-settings-tab="tab-voice">语音</button>
                 <button type="button" class="settings-tab-btn" data-settings-tab="tab-vision">视觉</button>
                 <button type="button" class="settings-tab-btn" data-settings-tab="tab-live2d">Live2D</button>
+                <button type="button" class="settings-tab-btn" data-settings-tab="tab-capability">能力</button>
                 <button type="button" class="settings-tab-btn" data-settings-tab="tab-advanced">高级</button>
             </div>
 
@@ -3281,23 +3140,16 @@
                         <div>
                             <label class="text-xs text-indigo-500 mb-1 block">API 格式</label>
                             <select id="settingApiFormat" class="modal-input text-sm">
-                                <option value="openai">OpenAI 兼容（DeepSeek / 硅基流动 / OneAPI 等）</option>
-                                <option value="dashscope">阿里云千问 Qwen</option>
+                                <option value="openai-compatible">OpenAI 兼容（DeepSeek / 硅基流动 / OneAPI / Ollama…）</option>
+                                <option value="openai-responses">OpenAI 官方（Responses 接口）</option>
                                 <option value="anthropic">Anthropic Claude</option>
-                                <option value="gemini">Google Gemini</option>
-                                <option value="ollama">Ollama 本地</option>
                             </select>
-                        </div>
-                        <div>
-                            <label class="text-xs text-indigo-500 mb-1 block">请求模式</label>
-                            <select id="settingProviderMode" class="modal-input text-sm">
-                                <option value="direct">使用官方默认地址</option>
-                                <option value="custom-proxy">自定义 Base URL</option>
-                            </select>
+                            <p id="apiFormatHint" class="text-[11px] text-indigo-300 leading-relaxed mt-1"></p>
                         </div>
                         <div>
                             <label class="text-xs text-indigo-500 mb-1 block">API Base URL</label>
                             <input id="settingBaseUrl" autocomplete="off" type="url" inputmode="url" class="modal-input text-sm" placeholder="https://api.deepseek.com/v1">
+                            <p class="text-[11px] text-indigo-300 leading-relaxed mt-1">切换上面的「API 格式」会自动填好对应的默认地址；用自建中转或别的服务商时，直接改这里就行。</p>
                         </div>
                         <div>
                             <label class="text-xs text-indigo-500 mb-1 block">模型名</label>
@@ -3316,7 +3168,7 @@
                         <button id="testChatConnectionBtn" type="button" class="btn-secondary text-xs">测试对话连接</button>
                         <button id="clearApiKeysBtn" type="button" class="btn-secondary text-xs">清除全部 API Key</button>
                     </div>
-                    <p id="providerModeHint" class="text-[11px] text-indigo-300 leading-relaxed mt-2">请求从当前设备直接发给所选服务商，不经过作者服务器。Android Key 使用系统 Keystore 加密；Web Key 仅保存在当前标签页会话。</p>
+                    <p id="chatFormatHint" class="text-[11px] text-indigo-300 leading-relaxed mt-2">请求从当前设备直接发给所选服务商，不经过作者服务器。Android Key 使用系统 Keystore 加密；Web Key 仅保存在当前标签页会话。</p>
                 </section>
                 </div><!-- /tab-chat -->
 
@@ -3609,7 +3461,12 @@
                 </section>
                 </div><!-- /tab-live2d -->
 
-                <div id="tab-advanced" class="settings-tab-panel">
+                <!-- ============ 能力：AI 能做什么 ============
+                     这三组都是"给 AI 开多大权限"，放在一起比散在「高级」里好找。
+                     从「高级」移过来时**保持原有 id 与结构不变**，所以所有 JS 引用
+                     （elements.settingAutoMemory、#scheduledTaskList、#agentPermissionSection、
+                      radio[name=agentPermission]）都不用改。 -->
+                <div id="tab-capability" class="settings-tab-panel">
                 <section>
                     <div class="modal-label flex items-center gap-2"><span class="text-fuchsia-500">✦</span> 记忆</div>
                     <div class="flex items-center justify-between mb-3">
@@ -3646,9 +3503,30 @@
                         <p class="text-[11px] text-indigo-300 leading-relaxed">限制模式：AI 只能读取/写入本应用文件夹（web/）内的文件。允许模式：AI 可读写电脑上的任意路径（通过本地服务执行），请仅在可信环境开启。</p>
                     </div>
 
+                    <!-- 手机操作也从「高级」移到这里 —— 它同样属于"给 AI 开权限"，
+                         而且原本就排在电脑操作权限后面。id 保持不变。 -->
                     <div id="agentPhoneSection" class="mt-4 pt-3 border-t border-indigo-100">
                         <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> 手机操作</div>
                         <div class="text-[11px] text-indigo-400 mb-2">允许 AI 操作这台手机：点击、滑动、输入文字、读取界面与截图。需要在安卓版 App 里使用（浏览器没有这个能力）。</div>
+
+                        <!-- 实现方式：原本挂在侧边栏，但手机上侧边栏收起后就进不去了，
+                             所以放进「手机操作」里 —— 它本来就是这组设置的前提。 -->
+                        <div class="rounded-2xl border px-3 py-3 mb-3" style="border-color:#e4e4f7;background:rgba(249,249,255,.8)">
+                            <div class="flex items-center gap-2">
+                                <span class="text-[11px] text-indigo-600 font-semibold">实现方式</span>
+                                <span id="settingBackendBadge" class="ml-auto"></span>
+                            </div>
+                            <p id="settingBackendSummary" class="text-[11px] mt-1 leading-relaxed" style="color:#b45309">还没有选择实现方式，AI 现在不能操作手机。</p>
+                            <!-- 诊断用：一眼看出「检测不到」是"原生层没接上"还是"还没授权"，
+                                 免得用户以为功能坏了 -->
+                            <p id="settingBackendBridge" class="text-[11px] mt-1 leading-relaxed text-indigo-300">原生设备层：检测中…</p>
+                            <div class="flex items-center gap-2 mt-2">
+                                <button id="settingBackendChooseBtn" type="button" class="btn-secondary text-[11px]" style="padding:3px 10px">选择实现方式</button>
+                                <button id="settingBackendRefreshBtn" type="button" class="btn-secondary text-[11px]" style="padding:3px 10px">重新检测</button>
+                            </div>
+                            <p class="text-[11px] text-indigo-300 leading-relaxed mt-2">实现方式决定 AI 用哪条路操作手机（无障碍 / Shizuku / Root / 模块 / ADB），能力与门槛各不相同。下面几项设置与它无关，随时可以改；但没选实现方式时 AI 不会真的动手。</p>
+                        </div>
+
                         <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer mb-3">
                             <input id="settingAgentPhoneEnabled" type="checkbox" class="accent-pink-500"> 允许 AI 操作手机
                         </label>
@@ -3665,6 +3543,57 @@
                             </label>
                         </div>
                         <p class="text-[11px] text-indigo-300 leading-relaxed">读取状态、查看界面、截图不需要确认；点击 / 滑动 / 输入 / 打开应用按上面的策略询问；「执行任意系统命令」无论选哪一项都会单独询问。AI 运行期间屏幕上方会显示状态条，随时可以点「停止」。</p>
+                    </div>
+                </section>
+                </div><!-- /tab-capability -->
+
+                <!-- ============ 高级：程序本身的设置 ============
+                     这里放的是"应用怎么跑"，不是"AI 能做什么"（后者在「能力」）。
+                     日志 / 我的数据 / 访问密码都属于这一层。 -->
+                <div id="tab-advanced" class="settings-tab-panel">
+                <section>
+                    <div class="mt-4 pt-3 border-t border-indigo-100" id="logSettingsSection">
+                        <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> 日志</div>
+                        <div class="text-[11px] text-indigo-400 mb-2 leading-relaxed">
+                            控制<b>写入日志文件</b>的级别。启动窗口（终端）始终显示全部级别，不受这里影响 ——
+                            调高只是为了别让日志文件被无关记录刷满，排查时该看的东西终端里一样都不少。
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2 mb-2">
+                            <label class="text-xs text-indigo-500">落盘级别</label>
+                            <select id="settingLogLevel" class="modal-input text-sm w-32 py-1.5">
+                                <option value="DEBUG">DEBUG · 全部</option>
+                                <option value="INFO">INFO · 默认</option>
+                                <option value="WARN">WARN · 警告以上</option>
+                                <option value="ERROR">ERROR · 仅报错</option>
+                                <option value="CRITICAL">CRITICAL · 仅致命</option>
+                            </select>
+                            <span id="settingLogLevelHint" class="text-[11px] text-indigo-300"></span>
+                        </div>
+                        <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer mb-1">
+                            <input id="settingLogTrace" type="checkbox" class="accent-pink-500"> 记录完整对话内容（追踪日志）
+                        </label>
+                        <p class="text-[11px] text-indigo-300 leading-relaxed mb-2">
+                            追踪日志会完整记下发给模型的提示词、模型的回复和上游报错原文，排查「AI 为什么这么答」时最有用。
+                            但它包含你的聊天内容 —— 对外分享前先看一眼。关闭后只记访问与错误摘要。
+                        </p>
+                        <div id="logStatusBox" class="text-[11px] text-indigo-400 leading-relaxed">读取中…</div>
+                    </div>
+
+                    <div class="mt-4 pt-3 border-t border-indigo-100" id="dataSettingsSection">
+                        <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> 我的数据</div>
+                        <div class="text-[11px] text-indigo-400 mb-2 leading-relaxed">
+                            聊天记录、人设卡、记忆都分类存在 <code class="text-indigo-500">data/</code> 目录里
+                            （人设卡和聊天记录都是<b>一条一个文件</b>），<b>升级软件不会覆盖它们</b>。
+                            换电脑或重装前，先「导出备份」存一份 —— 备份是标准 zip，任何解压工具都能打开，
+                            电脑版与手机版的备份可以互相导入。
+                        </div>
+                        <div id="dataStatusBox" class="text-[11px] text-indigo-400 leading-relaxed mb-2">读取中…</div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button id="dataExportBtn" class="btn-secondary text-xs" type="button">导出备份</button>
+                            <button id="dataImportBtn" class="btn-secondary text-xs" type="button">导入备份</button>
+                            <input id="dataImportFile" type="file" accept=".zip,.json,application/zip,application/json" class="hidden">
+                            <span id="dataActionHint" class="text-[11px] text-indigo-300"></span>
+                        </div>
                     </div>
 
                     <div class="mt-4 pt-3 border-t border-indigo-100">
@@ -3792,9 +3721,6 @@
         }
         #agentStopBtn:active { transform: scale(.96); }
         #agentStopBtn:disabled { opacity: .5; cursor: default; }
-        /* 侧边栏「实现方式」按钮：还没选过实现方式时压暗，提示功能尚未启用 */
-        .sidebar-rail-btn.is-unset { opacity: .42; }
-        .sidebar-rail-btn.is-unset:hover { opacity: .72; }
     </style>
 
     <div id="agentRunBar" class="agent-run-bar hidden fixed items-center gap-2" role="status" aria-live="polite"
@@ -3810,7 +3736,7 @@
                        background:rgba(244,63,94,.94);color:#fff;border:0;cursor:pointer">停止</button>
     </div>
 
-    <!-- 实现方式（后端选择）：由侧边栏的「实现方式」按钮打开 -->
+    <!-- 实现方式（后端选择）：由「设置 → 高级 → 手机操作」里的「选择实现方式」按钮打开 -->
     <div id="backendPanel" class="fixed inset-0 z-[62] hidden items-center justify-center p-4 modal-overlay">
         <div class="modal-panel w-full max-w-md max-h-[86vh] flex flex-col overflow-hidden animate-modal-pop">
             <div class="px-5 py-4 border-b border-white/60 flex items-start gap-3">
@@ -3908,7 +3834,8 @@
         // 内置模型：随 APK 一起打包的只读副本（www/live2d/models/）。
         // APK 里没有服务端，模型只能从本地取；这里在启动时按 manifest.json 把内置模型
         // 复制进应用数据目录，之后列表扫描与资源寻址跟用户上传的模型完全同路，无需另做适配。
-        // 数据目录里已有同名模型（用户传过、或上次已种过）就不动它，不覆盖用户的东西。
+        // 只补"缺的 / 大小对不上的"文件，已完整的模型一律不动 —— 既不覆盖用户自己传的同名模型，
+        // 又能在上次播种中途失败时自愈（见下面的逐项核对）。
         async function seedBundledLive2dModels() {
             if (!IS_NATIVE_APP || !nativeModelRootReady) return;
             const fs = nativeFs();
@@ -3929,14 +3856,27 @@
                 const name = String((entry && entry.name) || '');
                 const files = Array.isArray(entry && entry.files) ? entry.files : [];
                 if (!name || !files.length) continue;
-                try {
-                    const existing = await fs.readdir({ path: 'live2d/models/' + name, directory: dir });
-                    if ((existing.files || []).length) continue; // 已存在，跳过
-                } catch (e) { /* 目录不存在 → 继续种 */ }
-                let written = 0;
+                const sizes = (entry && entry.sizes && typeof entry.sizes === 'object') ? entry.sizes : null;
+                // 数据目录里已有的文件（相对路径 → 字节数）。
+                // 判断"要不要种"不能只看目录非空：上一次播种中途失败（写入报错、进程被杀、
+                // 存储写满）会留下半套文件，目录非空但模型是坏的 —— 只判非空的话这种坏状态
+                // 永远修不回来。所以按清单逐项核对：缺的、以及字节数对不上的，都补种。
+                const existing = new Map();
+                for (const f of await nativeCollectModelFiles(fs, dir, 'live2d/models/' + name)) {
+                    existing.set(f.rel, f.size);
+                }
+                const pending = [];
                 for (const rawRel of files) {
                     const rel = String(rawRel).replace(/\\/g, '/').replace(/^\.?\//, '');
                     if (!rel || rel.split('/').includes('..')) continue; // 防目录穿越
+                    if (!existing.has(rel)) { pending.push(rel); continue; }
+                    // 清单带 sizes 时按字节数核对（能抓出写了一半的坏文件）；没有则只按文件名
+                    const want = sizes && sizes[rel] != null ? Number(sizes[rel]) : null;
+                    if (want != null && existing.get(rel) !== want) pending.push(rel);
+                }
+                if (!pending.length) continue; // 文件齐、大小也对 → 不动它（不覆盖用户自己的东西）
+                let written = 0;
+                for (const rel of pending) {
                     const encoded = rel.split('/').map(encodeURIComponent).join('/');
                     try {
                         const res = await fetch('/live2d/models/' + encodeURIComponent(name) + '/' + encoded);
@@ -3948,7 +3888,7 @@
                         console.warn('[Native] 内置模型文件写入失败:', rel, e);
                     }
                 }
-                console.log('[Native] 内置模型「' + name + '」已就绪:', written + '/' + files.length, '个文件');
+                console.log('[Native] 内置模型「' + name + '」补齐:', written + '/' + pending.length, '个文件（清单共', files.length, '个）');
             }
         }
 
@@ -3979,6 +3919,26 @@
                 }
                 offset += CHUNK;
             }
+        }
+
+        // 递归列出模型目录下的文件，返回 [{ rel, size }]（rel 是相对模型根目录的路径，正斜杠分隔）。
+        // 与服务端 collectModelFiles 保持同一套语义：表情/动作不保证放在固定子目录里，
+        // Cubism 只规定 *.exp3.json / *.motion3.json 的文件格式，放哪由模型作者决定。
+        // 内置的 deepseek 就把 44 个 *.exp3.json 堆在模型根目录、动作放在 motions/，
+        // 早期"只扫 exp/ 子目录"的写法因此一个都列不出来。深度设上限防病态目录树。
+        // 顺带带出 size：readdir 本来就返回它，播种时用它校验已种文件是否完整，不额外多一次调用。
+        async function nativeCollectModelFiles(fs, dir, basePath, relPath = '', depth = 0) {
+            if (depth > 3) return [];
+            let listing;
+            try { listing = await fs.readdir({ path: relPath ? basePath + '/' + relPath : basePath, directory: dir }); }
+            catch (e) { return []; }
+            const out = [];
+            for (const f of (listing.files || [])) {
+                const rel = relPath ? relPath + '/' + f.name : f.name;
+                if (f.type === 'directory') out.push(...await nativeCollectModelFiles(fs, dir, basePath, rel, depth + 1));
+                else out.push({ rel, size: Number(f.size) || 0 });
+            }
+            return out;
         }
 
         // 浏览器端 zip 解压（store + deflate-raw，支持 UTF-8/GBK 文件名、data descriptor）
@@ -4039,20 +3999,19 @@
                     try { entries = await fs.readdir({ path: 'live2d/models', directory: dir }); } catch (e) { entries = { files: [] }; }
                     const models = [];
                     for (const e of (entries.files || [])) {
+                        if (e.type && e.type !== 'directory') continue;
                         const modelName = e.name;
                         try {
-                            const mf = await fs.readdir({ path: 'live2d/models/' + modelName, directory: dir });
-                            const names = (mf.files || []).map(f => f.name);
-                            const modelJson = names.find(f => f.toLowerCase().endsWith('.model3.json')) || null;
+                            const files = (await nativeCollectModelFiles(fs, dir, 'live2d/models/' + modelName)).map(f => f.rel);
+                            // model3.json / vtube.json 优先取根目录下的，避免纹理等子目录里的同名文件抢走
+                            const pickRoot = (pred) => files.find(f => !f.includes('/') && pred(f)) || files.find(pred) || null;
+                            const modelJson = pickRoot(f => f.toLowerCase().endsWith('.model3.json'));
                             if (!modelJson) continue;
-                            let exps = [], motions = [];
-                            try {
-                                const expf = await fs.readdir({ path: 'live2d/models/' + modelName + '/exp', directory: dir });
-                                const expNames = (expf.files || []).map(f => f.name);
-                                exps = expNames.filter(f => f.toLowerCase().endsWith('.exp3.json'));
-                                motions = expNames.filter(f => f.toLowerCase().endsWith('.motion3.json'));
-                            } catch (e) { /* 无 exp 目录 */ }
-                            models.push({ name: modelName, modelJson, exps, motions });
+                            const vtube = pickRoot(f => f.toLowerCase().endsWith('.vtube.json'));
+                            // exps/motions 返回「相对模型根目录的路径」，客户端据此拼资源地址
+                            const exps = files.filter(f => f.toLowerCase().endsWith('.exp3.json')).sort();
+                            const motions = files.filter(f => f.toLowerCase().endsWith('.motion3.json')).sort();
+                            models.push({ name: modelName, modelJson, exps, motions, vtube });
                         } catch (e) { /* 跳过坏目录 */ }
                     }
                     return json({ ok: true, models });
@@ -4112,32 +4071,47 @@
                 .then(seedBundledLive2dModels)
                 .catch((e) => { console.warn('[Native] 内置模型初始化失败', e); });
         }
+        /* 对话 API 格式只留三种。
+           收敛掉 dashscope / gemini / ollama，因为它们的官方接口都能用标准
+           /v1/chat/completions 说话（迁移表见下）—— 分成五个"格式"只是把同一套协议
+           抄了五遍，用户还得猜自己该选哪个；选错了报的错又完全看不出是格式选错。
+
+           注意：id 是持久化进 settings 的，改名必须同步维护 LEGACY_API_FORMAT_ALIASES，
+           否则老用户一升级就被重置回默认值。 */
         const CHAT_API_FORMATS = Object.freeze({
-            openai: {
+            'openai-compatible': {
                 label: 'OpenAI 兼容',
                 defaultBaseUrl: DEEPSEEK_DIRECT_BASE_URL,
-                defaultModel: 'deepseek-chat'
+                defaultModel: 'deepseek-chat',
+                hint: '任何提供标准 /v1/chat/completions 的服务都选这个：DeepSeek、硅基流动、OneAPI、Ollama、千问兼容模式、自建中转。'
             },
-            dashscope: {
-                label: '阿里云千问 Qwen',
-                defaultBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-                defaultModel: 'qwen3.8-max'
+            'openai-responses': {
+                label: 'OpenAI 官方',
+                defaultBaseUrl: 'https://api.openai.com/v1',
+                defaultModel: 'gpt-4.1-mini',
+                hint: 'OpenAI 官方的 /v1/responses 接口。它的请求与响应结构和 chat/completions 不同，本应用单独适配；第三方中转多半不支持，那种情况请选「OpenAI 兼容」。'
             },
             anthropic: {
                 label: 'Anthropic Claude',
                 defaultBaseUrl: 'https://api.anthropic.com',
-                defaultModel: 'claude-sonnet-4-20250514'
-            },
-            gemini: {
-                label: 'Google Gemini',
-                defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-                defaultModel: 'gemini-2.5-flash'
-            },
-            ollama: {
-                label: 'Ollama 本地',
-                defaultBaseUrl: 'http://127.0.0.1:11434',
-                defaultModel: 'qwen3:8b'
+                defaultModel: 'claude-sonnet-4-20250514',
+                hint: 'Anthropic 官方的 /v1/messages 接口。模型列表走它的 Models API（/v1/models），已适配，「获取模型」可用；第三方中转若只认 Bearer 认证，应用会自动换一种再试。'
             }
+        });
+
+        /* 老格式 id → 新格式 id。改格式表时必须同步维护这里，否则老用户一升级就被重置成默认值。 */
+        const LEGACY_API_FORMAT_ALIASES = Object.freeze({
+            openai: 'openai-compatible',
+            dashscope: 'openai-compatible',
+            ollama: 'openai-compatible',
+            gemini: 'openai-compatible'
+        });
+
+        /* 格式被合并后，原来指向"原生协议"的默认地址要改写成对应的 OpenAI 兼容端点。
+           不改的话地址还停在 /v1beta、/ 这种老路径上，请求必然 404 —— 而用户会以为是自己填错了。 */
+        const LEGACY_BASE_URL_REWRITE = Object.freeze({
+            'https://generativelanguage.googleapis.com/v1beta': 'https://generativelanguage.googleapis.com/v1beta/openai',
+            'http://127.0.0.1:11434': 'http://127.0.0.1:11434/v1'
         });
         const MINIMAX_TTS_HTTP = 'https://api.minimaxi.com/v1/t2a_v2';
         const DOUBAO_TTS_V1_URL = 'https://openspeech.bytedance.com/api/v1/tts';
@@ -4203,6 +4177,7 @@
 【状态标签】[位置:left|center|right|上|下] —— 移动角色位置；[大小:大|小|特大|特小|65%] —— 调整角色大小。
 【背景标签】[背景:深蓝|蓝紫|星空|紫罗兰|红蓝|深黑|墨蓝|深紫|玫红|青绿] —— 切换通话背景。
 【操作标签】[操作:打开视频通话] / [操作:结束通话] / [操作:整理记忆] / [操作:静音] / [操作:取消静音] / [操作:隐藏水印] / [操作:显示水印] —— 触发应用功能。
+（手机操作、文件操作是另一组标签，是否可用取决于当前设备与设置，系统会单独告知；不要凭这里猜测。）
 【定时任务标签】[任务:频率 时间 内容] —— 创建未来任务，到点系统会请你以角色身份主动给用户发提醒消息。示例：[任务:每天 09:00 提醒我喝水] / [任务:明天 14:00 提醒我开会] / [任务:每3小时 起来活动一下] / [任务:30分钟后 提醒我休息]。当用户表达"每天给我发消息/提醒我/定时..."等意图时，用此标签创建任务，并在回复正文中自然告知用户已安排好。
 
 【使用要求】情绪标签是角色扮演表达的核心部分：每条回复都应根据内容带 1 个情绪或表情标签（内容完全中性时除外）；当情绪发生变化时（如从开心转为难过、从平静转为惊讶），务必切换到对应的情绪/表情标签，让角色的表情跟随情景变化；标签放在回复开头或情绪表达处，一条回复最多 2 个。`;
@@ -4216,6 +4191,70 @@
             text: 900,
             withVoice: 1400
         });
+
+        /**
+         * 思考链路的 max_tokens 下限（三种对话格式共用）。
+         *
+         * Claude 的 extended thinking 要求 `1024 <= budget_tokens < max_tokens`，
+         * 所以**只要这条链路上开了 thinking，max_tokens 就必须大于 1024**。
+         *
+         * 问题在于"有没有开 thinking"不完全由我们决定 —— 中转站（new-api）会看**模型名的后缀**
+         * （`relaykit/relayconvert/reasoning/suffix.go`）：
+         *   `claude-sonnet-4-5-thinking`      → 开 thinking，预算取 max_tokens 的 80%
+         *   `claude-sonnet-4-5-thinking-2000` → 开 thinking，预算固定 2000
+         *   `claude-sonnet-4-5-nothinking`    → 显式关闭
+         * 于是用户只是照着中转站的说明填了个带 `-thinking` 的模型名，请求就被拒了：
+         *   400 "max_tokens must be greater than 1024 for manual Claude thinking"
+         *
+         * 新版 new-api 遇到这种情况会自己把 max_tokens 抬到 1280；旧版直接报错。
+         * 我们做同一件事，但抬得更高 —— **预算和正文吃的是同一个 max_tokens 额度**：
+         * 抬到 1280 的话思考占掉 1024，正文只剩 256 token，角色扮演必然被截断。
+         * 取 4096 是让思考有 3276、正文还有 820 的空间。
+         *
+         * 抬高没有副作用：`max_tokens` 只是**上限**，没开 thinking 时模型该多短还是多短。
+         * 4096 也是 Claude 各代模型都接受的安全值（claude-3-haiku 的输出上限正好是 4096）。
+         */
+        const ANTHROPIC_MIN_MAX_TOKENS = 4096;
+
+        /**
+         * 模型名后缀要求的输出上限下限（0 = 这个模型名没提任何要求，别动调用方的值）。
+         *
+         * 上面那条注释说的「中转站按后缀替客户端开思考」**不只影响 Anthropic 格式**：
+         * new-api 的 `ApplyReasoning()` 里，跨协议（OpenAI → Claude）一定会走 `RenderClaude`，
+         * 所以用 OpenAI 兼容格式调一个 `…-thinking` 的模型名会踩同一个坑。
+         * 判据抽在这里，三种格式共用。
+         *
+         * 只认结尾的 `-thinking` / `-thinking-<数字>`；`-nothinking` 里没有 `-thinking`
+         * 这个子串（它前面是 o），天然不会命中。
+         */
+        function thinkingSuffixTokenFloor(modelName) {
+            const name = String(modelName || '').trim();
+            if (!/-thinking(?:$|-)/i.test(name)) return 0;
+            // `-thinking-<数字>` 指定了预算，max_tokens 必须**严格大于**它 ——
+            // 否则中转站把预算压到 max_tokens-1，正文一个 token 都不剩。
+            const explicit = /-thinking-(\d+)\s*$/i.exec(name);
+            if (explicit) return Math.max(ANTHROPIC_MIN_MAX_TOKENS, Number(explicit[1]) + 1);
+            return ANTHROPIC_MIN_MAX_TOKENS;
+        }
+
+        /**
+         * 三种对话格式共用的「输出上限」决策。在 `callChatAPI` 分发之前算一次。
+         *
+         * @param {string} model 用户填的模型名（判据只看它）
+         * @param {*} requested 调用方要求的上限，可能是 undefined / NaN
+         * @param {boolean} required Anthropic 原生格式传 true —— 它的 `max_tokens` 是必填字段，
+         *        而且那条链路**永远**要按"可能开思考"保底（用户可以在设置里直接指定 thinking），
+         *        所以下限是无条件的；OpenAI 系两种格式只在模型名带后缀时才抬。
+         * @returns {number|null} null = 不发送这个字段，让服务商用默认值
+         */
+        function resolveOutputTokenLimit(model, requested, required = false) {
+            const floor = required
+                ? Math.max(ANTHROPIC_MIN_MAX_TOKENS, thinkingSuffixTokenFloor(model))
+                : thinkingSuffixTokenFloor(model);
+            const wanted = Number.isFinite(requested) ? Math.max(1, Math.floor(requested)) : null;
+            if (floor <= 0) return wanted;      // 普通模型名：原样透传（null 就是不发这个字段）
+            return Math.max(floor, wanted || 0);
+        }
 
         const DEFAULT_CHARACTER_CARD = {
             name: '伊蕾娜',
@@ -4261,8 +4300,7 @@ ${DEFAULT_CHARACTER_PREFERENCES}
 
         const DEFAULT_SETTINGS = {
             apiProvider: 'byok',
-            providerMode: 'direct',
-            apiFormat: 'openai',
+            apiFormat: 'openai-compatible',
             baseUrl: DEEPSEEK_DIRECT_BASE_URL,
             apiKey: '',
             model: 'deepseek-chat',
@@ -4459,9 +4497,6 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             announcementOverlay: document.getElementById('announcementOverlay'),
             announcementTitle: document.getElementById('announcementTitle'),
             announcementContent: document.getElementById('announcementContent'),
-            announcementKeySection: document.getElementById('announcementKeySection'),
-            announcementKeyInput: document.getElementById('announcementKeyInput'),
-            announcementKeyError: document.getElementById('announcementKeyError'),
             announcementConfirmBtn: document.getElementById('announcementConfirmBtn'),
             conversationPromptOverlay: document.getElementById('conversationPromptOverlay'),
             conversationWorldInput: document.getElementById('conversationWorldInput'),
@@ -4471,14 +4506,13 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             conversationPromptCancelBtn: document.getElementById('conversationPromptCancelBtn'),
             conversationPromptSaveBtn: document.getElementById('conversationPromptSaveBtn'),
             settingApiFormat: document.getElementById('settingApiFormat'),
-            settingProviderMode: document.getElementById('settingProviderMode'),
             settingBaseUrl: document.getElementById('settingBaseUrl'),
             settingChatModel: document.getElementById('settingChatModel'),
             settingApiKey: document.getElementById('settingApiKey'),
             testChatConnectionBtn: document.getElementById('testChatConnectionBtn'),
             testTtsConnectionBtn: document.getElementById('testTtsConnectionBtn'),
             clearApiKeysBtn: document.getElementById('clearApiKeysBtn'),
-            providerModeHint: document.getElementById('providerModeHint'),
+            chatFormatHint: document.getElementById('chatFormatHint'),
             settingTtsProvider: document.getElementById('settingTtsProvider'),
             minimaxTtsFields: document.getElementById('minimaxTtsFields'),
             doubaoTtsFields: document.getElementById('doubaoTtsFields'),
@@ -4489,6 +4523,8 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             ttsVolumeLabel: document.getElementById('ttsVolumeLabel'),
             settingAutoMemory: document.getElementById('settingAutoMemory'),
             settingMemoryEvery: document.getElementById('settingMemoryEvery'),
+            settingLogLevel: document.getElementById('settingLogLevel'),
+            settingLogTrace: document.getElementById('settingLogTrace'),
             memoryBtn: document.getElementById('headerMemoryBtn'),
             memoryStatusDot: document.getElementById('memoryStatusDot'),
             dashscopeAsrFields: document.getElementById('dashscopeAsrFields'),
@@ -4548,6 +4584,9 @@ ${DEFAULT_CHARACTER_PREFERENCES}
                 this.code = code || 'UNKNOWN_ERROR';
                 this.status = Number(options.status || 0);
                 this.retryable = Boolean(options.retryable);
+                // 本次请求是否真的带了图片。只用来决定报错时要不要提"图片转述"——
+                // 以前 400 的提示无条件写死了图片原因，用户没发图也会看到，白白被误导。
+                this.imageHint = Boolean(options.imageHint);
             }
         }
 
@@ -4559,6 +4598,9 @@ ${DEFAULT_CHARACTER_PREFERENCES}
                 payload?.code,
                 payload?.base_resp?.status_msg,
                 payload?.base_resp?.status_code,
+                // FastAPI 系网关把错误套在 detail 里（自建中转站大量如此）
+                typeof payload?.detail === 'string' ? payload.detail : payload?.detail?.error?.message,
+                payload?.detail?.error?.code,
                 rawText
             ].filter(Boolean).join(' ');
         }
@@ -4568,6 +4610,9 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             if (explicitCode) return explicitCode;
             const providerStatus = Number(payload?.base_resp?.status_code || 0);
             const text = getApiErrorText(payload, rawText).toLowerCase();
+            // 「模型名不在这个服务上」是自建中转 / 新服务商最高频的问题。
+            // 不单独给码的话它会落进 UNKNOWN_ERROR，用户只看到"请求失败"，完全无从下手。
+            if (/model_not_found|model.{0,24}not.{0,12}(available|exist|found)|no such model|invalid model/.test(text)) return 'MODEL_NOT_FOUND';
             if (status === 401 || providerStatus === 1004 || /invalid.?api.?key|api.?key.?invalid|key.{0,8}(invalid|expired)|unauthori[sz]ed|authentication/.test(text)) return 'APP_KEY_INVALID';
             if (status === 402 || providerStatus === 1008 || /token[ _-]?plan|quota|insufficient|balance|credit|billing|payment|limit.?exceed|resource.?exhaust/.test(text)) return 'MINIMAX_QUOTA_EXHAUSTED';
             if (status === 429 || providerStatus === 1002 || /rate.?limit|too many requests|请求过于频繁/.test(text)) return 'RATE_LIMITED';
@@ -4619,16 +4664,61 @@ ${DEFAULT_CHARACTER_PREFERENCES}
                 case 'UPSTREAM_RATE_LIMITED':
                     return { title: '请求过于频繁', message: '请求过于频繁，请稍后再试。' };
                 case 'NETWORK_ERROR':
-                    return { title: '网络连接失败', message: '无法直连服务商；Web 版还可能受到浏览器 CORS 限制，可改用自己的兼容地址。' };
+                    return {
+                        title: '网络连接失败',
+                        message: '请求没能发出去。Web 版最常见的原因是服务商没有返回 CORS 响应头 —— '
+                            + '浏览器会直接丢掉响应，报错就是一句 "Failed to fetch"，看不出真实原因。'
+                            + '\n\n· 用 启动.bat 启动、再从 http://127.0.0.1:4173 打开：会自动走本机中转，可绕开这个限制；'
+                            + '\n· 直接双击 index.html 打开时不走中转；'
+                            + '\n· 也请确认地址没写错、电脑能上网。'
+                    };
+                case 'LOCAL_SERVER_UNAUTHORIZED':
+                    return {
+                        title: '本机服务需要重新登录',
+                        message: '访问密码的登录状态已过期，请求被本机服务拒绝了（HTTP 401）。'
+                            + '\n\n这不是 API Key 的问题 —— 刷新页面重新输入访问密码即可。'
+                    };
+                case 'MODEL_NOT_FOUND': {
+                    const detail = String(apiError.message || '').trim();
+                    return {
+                        title: '模型名不可用',
+                        message: '地址和 Key 都是通的，但这个服务商没有你要的模型。'
+                            + (detail ? '\n\n接口返回：' + detail.slice(0, 200) : '')
+                            + '\n\n点「获取模型」从列表里挑一个，或按服务商文档填写正确的模型名。'
+                    };
+                }
                 case 'REQUEST_TIMEOUT':
                     return { title: '请求超时', message: '服务商响应超时，请稍后再试。' };
                 case 'BAD_REQUEST': {
                     const detail = String(apiError.message || '').trim();
+                    // 只有"本次真的带了图片"或"服务商的话本身就在说图片"，才提图片原因。
+                    // 这条提示原来是无条件拼上去的，于是**任何** 400 都会甩一句
+                    // "图片转述常见原因：…"。真实案例：服务商返回
+                    // "System message must be at the beginning."（其实是"system 消息只能有一条"），
+                    // 用户看到图片那行就来问"我没发图片为什么会这样"—— 提示把人带偏了。
+                    const imageRelated = apiError.imageHint === true || /image|vision|multimodal|多模态|图片/i.test(detail);
+                    // 中转站（new-api 系）会按**模型名的后缀**替我们决定要不要开 Claude 的扩展思考：
+                    // 名字里带 `-thinking` 就会开，而扩展思考的预算要求 max_tokens 更大。
+                    // 用户根本不知道模型名里那个后缀是什么意思，看到 "manual Claude thinking" 只会更迷惑
+                    // （他压根没开过思考）—— 所以这条提示必须直接说清"后缀是干什么的、不想要就删掉"。
+                    const thinkingBudgetIssue = /max_tokens/i.test(detail) && /thinking/i.test(detail);
+                    let hint;
+                    if (thinkingBudgetIssue) {
+                        hint = '\n\n这条报错来自模型名里的 -thinking 后缀：中转站看到它就会开启 Claude 的扩展思考，'
+                            + '而扩展思考的预算要求 max_tokens 更大（应用已自动抬高到安全值，若仍报错说明该中转站限制更严）。'
+                            + '\n· 不想要思考：把模型名里的 -thinking 去掉，例如 claude-sonnet-4-5-thinking → claude-sonnet-4-5；'
+                            + '\n· 想要思考：可以用 -thinking-<数字> 指定预算，但数字越大越慢、也越贵。';
+                    } else if (imageRelated) {
+                        hint = '\n\n图片转述常见原因：视觉模型名不对、图片过大、或该模型不支持图片。请检查 设置→视觉 的模型名，或换用 Qwen-VL 等支持图片的模型。';
+                    } else {
+                        hint = '\n\n常见原因：服务商对请求格式有额外要求（例如只接受一条 system 消息）、模型名与接口不匹配、'
+                            + '或该模型不支持当前参数。上面「服务商返回」那行通常已经写明了真正的原因。';
+                    }
                     return {
                         title: '请求内容有误',
                         message: '本次请求内容有误（HTTP 400）。'
                             + (detail ? '\n\n服务商返回：' + detail.slice(0, 200) : '')
-                            + '\n\n图片转述常见原因：视觉模型名不对、图片过大、或该模型不支持图片。请检查 设置→视觉 的模型名，或换用 Qwen-VL 等支持图片的模型。'
+                            + hint
                     };
                 }
                 case 'EMPTY_MODEL_OUTPUT':
@@ -4662,9 +4752,134 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             return raw;
         }
 
+        /**
+         * 是不是 DeepSeek 官方端点。
+         * 以前靠 providerMode === 'direct' 判断"深度思考要不要换成 reasoner 模型"，
+         * 「请求模式」删掉之后改成看地址 —— 这样更准：地址填的是 DeepSeek 的兼容网关时同样生效，
+         * 而填了别家中转时不会被误判。
+         */
+        function isDeepSeekOfficial(baseUrl) {
+            try {
+                return /(^|\.)deepseek\.com$/i.test(new URL(String(baseUrl || '')).hostname);
+            } catch { return false; }
+        }
+
         function getNativeByokHttpPlugin() {
             if (!window.Capacitor?.isNativePlatform?.()) return null;
             return window.Capacitor?.Plugins?.ByokHttp || null;
+        }
+
+        // ===== 本机中转 =====
+        // 页面由 web/serve.mjs 提供时，同源的 /api/server-info 必定存在。
+        // 探测结果缓存成 Promise 而不是布尔量：首个请求可能比探测先到，用 await 接住它。
+        let localRelayProbe = null;
+        function detectLocalRelay() {
+            if (localRelayProbe) return localRelayProbe;
+            localRelayProbe = (async () => {
+                // APK 走原生插件，没有也不需要这个服务；
+                // file:// 打开时 Origin 是 null，服务端会按跨站请求拒掉，别白试一次。
+                if (IS_NATIVE_APP) return false;
+                if (location.protocol !== 'http:' && location.protocol !== 'https:') return false;
+                try {
+                    const response = await fetchWithTimeout('/api/server-info', { method: 'GET' }, 5000);
+                    if (!response.ok) return false;
+                    const info = await response.json();
+                    return Boolean(info && info.ok);
+                } catch {
+                    return false;
+                }
+            })().then((ok) => {
+                // 只有探测成功才缓存。探测失败（服务正在保存大文件、瞬时卡顿、超时）
+                // 若也缓存下来，整个页面会话就会永久退回裸 fetch —— 于是撞 CORS 报
+                // "Failed to fetch"，表现正是"时好时坏、刷新一下又好了"。
+                // 所以失败时把缓存清掉，下次请求重新探。
+                if (!ok) localRelayProbe = null;
+                return ok;
+            });
+            return localRelayProbe;
+        }
+
+        /**
+         * 这台电脑上「桌面 / 文档 / 下载 …」的真实位置，由同源的 serve.mjs 从注册表读出来。
+         *
+         * 为什么非要有这个：用户可以把桌面**移动到任意位置**（桌面右键 → 属性 → 位置 → 移动），
+         * OneDrive 也会把桌面重定向到 OneDrive 下。这时 `C:\Users\<用户名>\Desktop` 根本不存在，
+         * 而 AI 只会按惯例猜这个路径 —— 猜错就是一句「目录不存在」，然后它就没招了。
+         * 实测踩过：用户的桌面在 `D:\桌面`，AI 猜 `C:\Users\Administrator\Desktop`，直接卡死。
+         *
+         * 一律按 permission=computer 询问：服务端只在**本机请求**时才回真实路径，
+         * 局域网访客拿到的是一份没有 path 的列表，不存在越权泄露。
+         */
+        let agentRootsProbe = null;
+        let agentRootsCache = null;
+        function detectAgentRoots() {
+            if (agentRootsProbe) return agentRootsProbe;
+            agentRootsProbe = (async () => {
+                if (IS_NATIVE_APP) return null;
+                if (location.protocol !== 'http:' && location.protocol !== 'https:') return null;
+                try {
+                    const response = await fetchWithTimeout('/api/agent/roots?permission=computer', { method: 'GET' }, 6000);
+                    if (!response.ok) return null;
+                    const info = await response.json();
+                    return info && info.ok && Array.isArray(info.roots) ? info.roots : null;
+                } catch {
+                    return null;
+                }
+            })().then((roots) => {
+                agentRootsCache = roots;
+                // 只缓存成功：失败可能只是服务端在忙，缓存下来会整个会话都拿不到真实路径
+                if (!roots) agentRootsProbe = null;
+                return roots;
+            });
+            return agentRootsProbe;
+        }
+
+        /**
+         * 同步取已探测到的真实位置，拼成给 AI 看的一段提示。
+         * 提示词构造函数是同步的，没法 await，所以只能读缓存（页面启动时就预热了）。
+         * 只在「允许操作电脑」模式下注入 —— 限制模式本来就不该去翻磁盘其他位置。
+         */
+        function agentRootsText() {
+            if ((state.settings.agentPermission || 'app') !== 'computer') return '';
+            const roots = Array.isArray(agentRootsCache) ? agentRootsCache.filter(r => r && r.path) : [];
+            if (!roots.length) return '';
+            return '\n# 这台电脑的真实位置（用户可能把桌面/文档移动过，**不要**按惯例猜 C:\\Users\\<用户名>\\Desktop）\n'
+                + roots.map(r => `${r.label} = ${r.path}`).join('\n')
+                + '\n需要这些位置时直接用上面的绝对路径，或用别名 %DESKTOP% / %DOCUMENTS% / %DOWNLOADS%（服务端会自动换成真实路径）。路径猜错会直接失败，所以不确定就先 [操作:列出文件 %DESKTOP%] 看一眼。';
+        }
+
+        /**
+         * 经本机 Node 进程转发一个请求。
+         *
+         * 这是 Web 版绕开 CORS 的唯一办法：浏览器 → 同源的 /api/relay 不触发预检，
+         * 由 Node 去请求真正的服务商（Node 没有 CORS 这回事）。
+         * 很多中转站根本不发 Access-Control-Allow-Origin，OPTIONS 甚至返回 405，
+         * 这时裸 fetch() 只会抛 "Failed to fetch" —— 这正是"获取模型/对话连不上"的病根。
+         */
+        async function relayRequest(url, { method = 'POST', headers = {}, body, timeoutMs = 120000 } = {}) {
+            const response = await fetchWithTimeout('/api/relay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, method, headers, body, timeoutMs })
+            }, timeoutMs + 10000);
+            const rawText = await response.text();
+            let payload = null;
+            if (rawText) {
+                try { payload = JSON.parse(rawText); } catch {}
+            }
+            // relayError 表示"连目标都没连上"，要和上游自己返回的错误分开报 ——
+            // 否则用户看到 502 会去怪服务商，而实际是 DNS/TLS/超时。
+            if (payload && payload.relayError) {
+                throw new ClientApiError('UPSTREAM_UNAVAILABLE', String(payload.message || '本地中转请求失败'));
+            }
+            // 访问密码的会话过期时，本机服务会返回 401 needLogin。
+            // 不单独识别的话，这个 401 会被当成"服务商返回了 401"→ 报成"Key 无效"，
+            // 用户就会去反复换 Key，而真正该做的是刷新页面重新登录。
+            if (response.status === 401 || payload?.needLogin) {
+                throw new ClientApiError('LOCAL_SERVER_UNAUTHORIZED',
+                    String(payload?.message || '本机服务的登录状态已失效，请刷新页面重新输入访问密码'));
+            }
+            return { ok: response.ok, status: response.status, rawText, payload };
         }
 
         async function postJsonFromDevice(url, body, headers = {}, timeoutMs = 120000) {
@@ -4684,11 +4899,57 @@ ${DEFAULT_CHARACTER_PREFERENCES}
                 return { ok: Boolean(result?.ok), status: Number(result?.status || 0), rawText, payload };
             }
 
+            // Web：能走本机中转就走。裸 fetch 撞上不发 CORS 头的服务商时，
+            // 抛出的 "Failed to fetch" 既没状态码也没原因，排查成本极高。
+            if (await detectLocalRelay()) {
+                return await relayRequest(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', ...headers },
+                    body: JSON.stringify(body),
+                    timeoutMs
+                });
+            }
+
             const response = await fetchWithTimeout(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...headers },
                 body: JSON.stringify(body)
             }, timeoutMs);
+            const rawText = await response.text();
+            let payload = null;
+            if (rawText) {
+                try { payload = JSON.parse(rawText); } catch {}
+            }
+            return { ok: response.ok, status: response.status, rawText, payload };
+        }
+
+        /**
+         * GET 一个 JSON 接口。和 postJsonFromDevice 一样必须走设备层：
+         * APK 里 WebView 的 fetch 会撞 CORS，而服务商并不都发 CORS 头。
+         * 「获取模型」之前就是因为直接用了裸 fetch()，在 APK 上永远失败。
+         */
+        async function getJsonFromDevice(url, headers = {}, timeoutMs = 20000) {
+            const nativePlugin = getNativeByokHttpPlugin();
+            if (nativePlugin?.get) {
+                const result = await nativePlugin.get({
+                    url,
+                    headers,
+                    // 让原生按文本返回。默认是 base64（那是给音频用的），拿回来还得再解一遍
+                    asText: true,
+                    timeoutMs
+                });
+                const rawText = String(result?.body || '');
+                let payload = null;
+                if (rawText) {
+                    try { payload = JSON.parse(rawText); } catch {}
+                }
+                return { ok: Boolean(result?.ok), status: Number(result?.status || 0), rawText, payload };
+            }
+            // Web：同上，优先走本机中转。
+            if (await detectLocalRelay()) {
+                return await relayRequest(url, { method: 'GET', headers: { ...headers }, timeoutMs });
+            }
+            const response = await fetchWithTimeout(url, { method: 'GET', headers: { ...headers } }, timeoutMs);
             const rawText = await response.text();
             let payload = null;
             if (rawText) {
@@ -4743,16 +5004,35 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             };
         }
 
+        /**
+         * 从各种"OpenAI 兼容"实现里把真正的错误文案挖出来。
+         * 各家包法都不一样：标准 OpenAI 是 error.message，DashScope 是 base_resp.status_msg，
+         * 而 FastAPI 系网关（自建中转站大量使用）会套一层 detail.error.message。
+         * 漏掉最后这种时，用户只能看到兜底的"请求失败"，
+         * 而真实原因是"模型名不在这个服务上"—— 完全无从下手。
+         */
+        function extractProviderErrorMessage(payload) {
+            if (!payload || typeof payload !== 'object') return '';
+            const candidates = [
+                payload.base_resp?.status_msg,
+                payload.error?.message,
+                payload.error,
+                payload.message,
+                payload.detail?.error?.message,
+                payload.detail?.message,
+                payload.detail,
+                payload.msg
+            ];
+            for (const item of candidates) {
+                if (typeof item === 'string' && item.trim()) return item.trim();
+            }
+            return '';
+        }
+
         async function throwProviderResponseError(result, fallbackMessage) {
             const payload = result?.payload;
             const rawText = String(result?.rawText || '');
-            const message = String(
-                payload?.base_resp?.status_msg ||
-                payload?.message ||
-                payload?.error?.message ||
-                payload?.error ||
-                fallbackMessage
-            ).trim();
+            const message = String(extractProviderErrorMessage(payload) || fallbackMessage).trim();
             // 完整错误日志：状态码 + 服务商返回原文，方便排查"测试能通、实际报错"
             console.error(`[Provider] 接口返回错误 HTTP ${result?.status}`, {
                 status: Number(result?.status || 0),
@@ -4767,8 +5047,8 @@ ${DEFAULT_CHARACTER_PREFERENCES}
         }
 
         function getChatApiFormat(settings = state.settings) {
-            const format = String(settings.apiFormat || 'openai').toLowerCase();
-            return CHAT_API_FORMATS[format] ? format : 'openai';
+            const format = String(settings.apiFormat || 'openai-compatible').toLowerCase();
+            return CHAT_API_FORMATS[format] ? format : 'openai-compatible';
         }
 
         function stripThinkTags(text) {
@@ -4801,207 +5081,102 @@ ${DEFAULT_CHARACTER_PREFERENCES}
             return text;
         }
 
-        async function callOpenAICompatibleChat(messages, opts, settings) {
-            const { apiKey, model } = settings;
-            if (!apiKey) {
-                throw new ClientApiError('APP_KEY_MISSING', '请先在设置中填写 API Key');
-            }
-            const baseUrl = getChatBaseUrl(settings);
-            const endpoint = /\/chat\/completions$/i.test(baseUrl) ? baseUrl : `${baseUrl}/chat/completions`;
-            const requestModel = settings.providerMode === 'direct' && opts.thinking === true && String(model).trim() === 'deepseek-chat'
-                ? 'deepseek-reasoner'
-                : String(model || 'deepseek-chat').trim();
-            const result = await postJsonFromDevice(endpoint, {
-                model: requestModel,
-                messages,
-                ...(opts.temperature !== undefined && { temperature: opts.temperature }),
-                ...(Number.isFinite(opts.maxTokens) && { max_tokens: Math.max(1, Math.floor(opts.maxTokens)) })
-            }, { Authorization: 'Bearer ' + apiKey });
-            if (!result.ok) await throwProviderResponseError(result, '对话服务请求失败');
-            if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', '对话服务返回格式异常');
-            const message = result.payload.choices?.[0]?.message || {};
-            return normalizeChatReply(message.content, message.reasoning_content || message.reasoning);
+        /* ---------- OpenAI 官方 Responses 接口（/v1/responses）----------
+           它和 chat/completions 不是同一套协议，必须单独适配，不能靠改个路径蒙混：
+             · 系统提示走顶层 instructions，不是 messages 里的一条
+             · 对话内容走 input 数组，每项 { role, content: [{ type:'input_text'|'output_text'|'input_image' }] }
+             · 输出上限参数叫 max_output_tokens，不叫 max_tokens
+             · 回复不在 choices[0].message.content，而在 output[] 里 type === 'message' 那些项的 content 块里
+           这些字段名是官方文档定的，写错会直接 400，而报错往往只说 "unknown parameter"，
+           排查起来很费劲，所以在这里一次写清楚。 */
+
+        /**
+         * 把**开头连续的** system 消息合并成一条。
+         *
+         * 起因：有些自建/中转网关**只接受一条 system 消息**，且必须在位置 0。实测
+         * `developer.amd.com.cn` 的 `self-dploy` 后端就是这样：`[system, user]` 返回 200，
+         * 而 `[system, system, user]` 直接 400 `System message must be at the beginning.`
+         * —— 报错文案有误导性，它说的其实是"system 消息只能有一条，不能有第二条"。
+         *
+         * 而本应用的「分层」提示词结构（layered-v2）一次会发 4~10 条 system：
+         * 核心协议 / 世界观 / 角色卡 / Live2D 标签指南 / 会话专属设定 / 记忆规则 /
+         * 图片一致性 / 配音格式 / 回合锚点 / 模型可用表现 / 水印提示 / Agent 权限。
+         * 在宽容的服务商（OpenAI、DeepSeek 官方）上没问题，撞上这类网关就整个对话发不出去。
+         *
+         * 合并是**语义等价**的：多条 system 与"按顺序拼成一条"对模型没有实质区别，
+         * 内容一字不少（用空行分隔，和 legacy 模式的做法一致）。
+         * 只合并开头那一段 —— 万一将来有人把 system 插到中间，那是另一个错误，不该被这里掩盖。
+         */
+        function mergeLeadingSystemMessages(messages) {
+            const list = Array.isArray(messages) ? messages : [];
+            let end = 0;
+            while (end < list.length && list[end] && list[end].role === 'system') end++;
+            if (end <= 1) return list;   // 0 条或 1 条，不用动
+            const merged = list.slice(0, end)
+                .map(message => extractTextContent(message.content))
+                .filter(text => String(text || '').trim())
+                .join('\n\n');
+            return [{ role: 'system', content: merged }, ...list.slice(end)];
         }
 
-        function anthropicContentBlocks(content) {
-            if (typeof content === 'string') return [{ type: 'text', text: content || ' ' }];
-            const blocks = [];
-            for (const part of Array.isArray(content) ? content : []) {
-                if (part?.type === 'text') {
-                    blocks.push({ type: 'text', text: String(part.text ?? '') });
-                } else if (part?.type === 'image_url') {
-                    const url = String(part.image_url?.url || '');
-                    const match = url.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,([^]+)$/i);
-                    if (match) {
-                        blocks.push({
-                            type: 'image',
-                            source: { type: 'base64', media_type: match[1].toLowerCase(), data: match[2] }
-                        });
-                    } else {
-                        blocks.push({ type: 'text', text: '[图片]' });
-                    }
-                } else {
-                    blocks.push({ type: 'text', text: '[附件]' });
-                }
-            }
-            return blocks.length ? blocks : [{ type: 'text', text: ' ' }];
-        }
-
-        function convertOpenAIToAnthropicMessages(messages) {
-            const systemParts = [];
-            const converted = [];
-            for (const msg of messages || []) {
-                const role = msg?.role;
-                if (role === 'system') {
-                    systemParts.push(extractTextContent(msg.content));
-                } else if (role === 'user') {
-                    converted.push({ role: 'user', content: anthropicContentBlocks(msg.content) });
-                } else if (role === 'assistant') {
-                    converted.push({ role: 'assistant', content: [{ type: 'text', text: stripThinkTags(extractTextContent(msg.content)) || ' ' }] });
-                }
-            }
-            const merged = [];
-            for (const msg of converted) {
-                const last = merged[merged.length - 1];
-                if (last && last.role === msg.role) {
-                    const prevBlocks = Array.isArray(last.content) ? last.content : [{ type: 'text', text: String(last.content || ' ') }];
-                    const nextBlocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: String(msg.content || ' ') }];
-                    last.content = prevBlocks.concat(nextBlocks);
-                } else {
-                    merged.push({ ...msg });
-                }
-            }
-            return { system: systemParts.filter(Boolean).join('\n\n'), messages: merged };
-        }
-
-        async function callAnthropicChat(messages, opts, settings) {
-            const { apiKey, model } = settings;
-            if (!apiKey) {
-                throw new ClientApiError('APP_KEY_MISSING', '请先在设置中填写 Anthropic API Key');
-            }
-            const baseUrl = getChatBaseUrl(settings).replace(/\/+$/, '');
-            const endpoint = /\/messages$/i.test(baseUrl)
-                ? baseUrl
-                : (/\/v\d+$/i.test(baseUrl) ? `${baseUrl}/messages` : `${baseUrl}/v1/messages`);
-            const payload = convertOpenAIToAnthropicMessages(messages);
-            const maxTokens = Number.isFinite(opts.maxTokens) ? Math.max(1, Math.floor(opts.maxTokens)) : 1400;
-            const result = await postJsonFromDevice(endpoint, {
-                model: String(model || '').trim() || 'claude-sonnet-4-20250514',
-                system: payload.system || undefined,
-                messages: payload.messages,
-                max_tokens: maxTokens,
-                ...(opts.temperature !== undefined && { temperature: opts.temperature })
-            }, { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' });
-            if (!result.ok) await throwProviderResponseError(result, 'Anthropic 请求失败');
-            if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', 'Anthropic 返回格式异常');
-            const blocks = Array.isArray(result.payload.content) ? result.payload.content : [];
-            const text = blocks.filter(block => block?.type === 'text').map(block => block.text || '').join('');
-            const reasoning = blocks.filter(block => block?.type === 'thinking').map(block => block.thinking || '').join('');
-            return normalizeChatReply(text, reasoning);
-        }
-
-        function convertOpenAIToGeminiMessages(messages) {
-            const systemParts = [];
-            const contents = [];
-            for (const msg of messages || []) {
-                const role = msg?.role;
-                if (role === 'system') {
-                    systemParts.push(stripThinkTags(extractTextContent(msg.content)));
-                    continue;
-                }
-                const parts = [];
-                const content = msg.content;
-                if (typeof content === 'string') {
-                    parts.push({ text: stripThinkTags(content) || ' ' });
-                } else {
-                    for (const part of Array.isArray(content) ? content : []) {
-                        if (part?.type === 'text') {
-                            parts.push({ text: stripThinkTags(part.text || '') || ' ' });
-                        } else if (part?.type === 'image_url') {
-                            const url = String(part.image_url?.url || '');
-                            const match = url.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,([^]+)$/i);
-                            if (match) {
-                                parts.push({ inline_data: { mime_type: match[1].toLowerCase(), data: match[2] } });
-                            } else if (/^https?:\/\//i.test(url)) {
-                                parts.push({ file_data: { mime_type: 'image/jpeg', file_uri: url } });
-                            } else {
-                                parts.push({ text: '[图片]' });
-                            }
-                        } else {
-                            parts.push({ text: '[附件]' });
-                        }
-                    }
-                }
-                if (!parts.length) parts.push({ text: ' ' });
-                const geminiRole = role === 'assistant' ? 'model' : 'user';
-                const last = contents[contents.length - 1];
-                if (last && last.role === geminiRole) {
-                    last.parts = last.parts.concat(parts);
-                } else {
-                    contents.push({ role: geminiRole, parts });
-                }
-            }
-            return { system: systemParts.filter(Boolean).join('\n\n'), contents };
-        }
-
-        async function callGeminiChat(messages, opts, settings) {
-            const { apiKey, model } = settings;
-            if (!apiKey) {
-                throw new ClientApiError('APP_KEY_MISSING', '请先在设置中填写 Gemini API Key');
-            }
-            const baseUrl = getChatBaseUrl(settings).replace(/\/+$/, '');
-            const requestModel = String(model || '').trim() || 'gemini-2.5-flash';
-            const endpoint = /:generateContent$/i.test(baseUrl)
-                ? baseUrl
-                : `${baseUrl}/models/${encodeURIComponent(requestModel)}:generateContent`;
-            const payload = convertOpenAIToGeminiMessages(messages);
-            const generationConfig = {};
-            if (Number.isFinite(opts.maxTokens)) generationConfig.maxOutputTokens = Math.max(1, Math.floor(opts.maxTokens));
-            if (opts.temperature !== undefined) generationConfig.temperature = opts.temperature;
-            const result = await postJsonFromDevice(endpoint, {
-                ...(payload.system ? { system_instruction: { parts: [{ text: payload.system }] } } : {}),
-                contents: payload.contents,
-                generationConfig
-            }, { 'x-goog-api-key': apiKey });
-            if (!result.ok) await throwProviderResponseError(result, 'Gemini 请求失败');
-            if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', 'Gemini 返回格式异常');
-            const parts = result.payload.candidates?.[0]?.content?.parts || [];
-            const text = parts.filter(part => !part?.thought && part?.text).map(part => part.text).join('');
-            const reasoning = parts.filter(part => part?.thought && part?.text).map(part => part.text).join('');
-            return normalizeChatReply(text, reasoning);
-        }
-
-        async function callOllamaChat(messages, opts, settings) {
-            const { apiKey, model } = settings;
-            const baseUrl = getChatBaseUrl(settings).replace(/\/+$/, '');
-            const endpoint = /\/api\/chat$/i.test(baseUrl) ? baseUrl : `${baseUrl}/api/chat`;
-            const headers = {};
-            if (apiKey) headers.Authorization = 'Bearer ' + apiKey;
-            const result = await postJsonFromDevice(endpoint, {
-                model: String(model || '').trim() || 'qwen3:8b',
-                messages,
-                stream: false,
-                options: {
-                    ...(Number.isFinite(opts.maxTokens) && { num_predict: Math.max(1, Math.floor(opts.maxTokens)) }),
-                    ...(opts.temperature !== undefined && { temperature: opts.temperature })
-                }
-            }, headers);
-            if (!result.ok) await throwProviderResponseError(result, 'Ollama 请求失败');
-            if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', 'Ollama 返回格式异常');
-            if (result.payload.error) throw new ClientApiError('UPSTREAM_UNAVAILABLE', String(result.payload.error));
-            return normalizeChatReply(result.payload.message?.content);
-        }
+        /* ===== 对话 API 格式适配器的依赖注入 =====
+         *
+         * 三种协议（openai-compatible / anthropic / openai-responses）的实现已拆到
+         * web/js/chat-providers.js —— 它们占 176 行、与界面毫无关系，混在这里只会
+         * 让"改对话协议"和"改界面"互相干扰。
+         *
+         * 那是普通 <script>（不是 ES module），文件之间作用域独立 —— 拆出去之后
+         * 直接调用这里的 getChatBaseUrl() 会拿到 undefined。所以依赖显式挂到 window。
+         *
+         * **加新依赖时必须同步加到这里**，漏了不会在加载时报错，而是运行到那一步才炸
+         * （"xxx is not a function"）。scripts/check-chat-providers.mjs 会扫描
+         * chat-providers.js 里所有 deps() 解构出的名字，逐个断言这里挂了 —— 跑 check 就能发现。
+         *
+         * 注意 ClientApiError 是 class：挂的是**类本身**，拆出去那份 new 出来的实例
+         * 仍然是同一个类（instanceof 判断照常工作）。
+         */
+        window.ChatDeps = {
+            ClientApiError,
+            getChatBaseUrl,
+            isDeepSeekOfficial,
+            postJsonFromDevice,
+            normalizeChatReply,
+            throwProviderResponseError,
+            extractTextContent,
+            stripThinkTags,
+            resolveOutputTokenLimit,
+            ANTHROPIC_MIN_MAX_TOKENS,
+        };
 
         async function callChatAPI(messages, opts = {}, settings = state.settings) {
             const format = getChatApiFormat(settings);
-            // 千问（dashscope）可复用 TTS/ASR 的 DashScope Key（阿里云公用 Key）
-            if (format === 'dashscope' && !String(settings.apiKey || '').trim() && String(settings.dashscopeApiKey || '').trim()) {
+            // 千问的兼容端点可以复用语音那边的 DashScope Key（阿里云同一个 Key 通用）。
+            // 以前靠 apiFormat === 'dashscope' 判断，格式合并后改成看地址 —— 行为不变，
+            // 而且用户把地址填成别的兼容服务时不会误用 DashScope 的 Key。
+            if (!String(settings.apiKey || '').trim() && String(settings.dashscopeApiKey || '').trim()
+                && /dashscope\.aliyuncs\.com/i.test(String(settings.baseUrl || ''))) {
                 settings = Object.assign({}, settings, { apiKey: settings.dashscopeApiKey });
             }
-            if (format === 'anthropic') return callAnthropicChat(messages, opts, settings);
-            if (format === 'gemini') return callGeminiChat(messages, opts, settings);
-            if (format === 'ollama') return callOllamaChat(messages, opts, settings);
-            return callOpenAICompatibleChat(messages, opts, settings);
+            // 统一在这里合并，三种格式都受益：Anthropic / Responses 的转换器本来就会把
+            // system 收拢成单条，合并后行为不变；openai-compatible 是原样透传，正是需要这一层的地方。
+            const normalized = mergeLeadingSystemMessages(messages);
+            // 输出上限在这里统一算一次，三种格式都受益 —— 让「模型名后缀是否要求保底」这个判据
+            // 只有一处，而不是散在三个格式函数里（见 resolveOutputTokenLimit 的说明）。
+            // 顺序无碍：openai-compatible 稍后可能把 deepseek-chat 换成 deepseek-reasoner，
+            // 但换出来的名字不含 `-thinking`，先算后算结果一样。
+            const resolvedOpts = Object.assign({}, opts, {
+                maxTokens: resolveOutputTokenLimit(settings.model, opts.maxTokens, format === 'anthropic')
+            });
+            // 把消息形状打进日志：**只记 role，不记内容**（内容可能含对话隐私与图片 base64）。
+            // 排查"服务商拒收请求"时，一眼就能看出是不是 system 的位置/条数不对，
+            // 不用靠猜 —— 这次那条 "System message must be at the beginning." 就是这么定位的。
+            // 顺带记输出上限：`max_tokens must be greater than 1024…` 那类 400 一眼能对上号。
+            console.log(`[Chat] ${format} 发送 ${normalized.length} 条：${normalized.map(m => m && m.role).join(',')}，输出上限 ${Number.isFinite(resolvedOpts.maxTokens) ? resolvedOpts.maxTokens : '服务商默认'}`);
+            // 按格式分发到 chat-providers.js 里的实现（表驱动，不再是 if 链）。
+            // 好处：新增格式只要往那边的 PROVIDERS 表加一行，这里不用动 ——
+            // 改两处就有一处会漏，改一处不会。未知格式由 forFormat 兜底到 openai-compatible，
+            // 与原 if 链最后那个 return 的行为完全一致。
+            return window.ChatProviders.forFormat(format)(normalized, resolvedOpts, settings);
         }
 
         // ==================== 角色设定卡====================
@@ -5153,11 +5328,17 @@ ${lines.join('\n')}
                     messages.push({ role: 'system', content: '当前 Live2D 模型带有作者水印（模型内置水印开关）。请在开场白或合适的时机用 [操作:隐藏水印] 隐藏水印（标签不会显示给用户）；若用户明确要求查看原始水印，再用 [操作:显示水印]。' });
                 }
             } catch (e) { /* ignore */ }
+            // 手机操作能力（随设备与设置变化）。必须注入 —— 否则模型不知道标签存在，
+            // 永远不会输出它，表现为"AI 不能操作手机"（见 agentPhoneSkillText 的说明）。
+            try {
+                const phoneSkill = agentPhoneSkillText();
+                if (phoneSkill) messages.push({ role: 'system', content: phoneSkill });
+            } catch (e) { /* ignore */ }
             // AI Agent 文件操作权限（随设置变化）
             try {
                 const agentPermission = state.settings.agentPermission || 'app';
                 messages.push({ role: 'system', content: agentPermission === 'computer'
-                    ? '# Agent Skill：文件操作（当前：允许操作电脑）\n可用 [操作:列出文件 路径] 查看目录、[操作:查看文件 路径] 读取文件、[操作:保存文件 路径|内容] 写入（新建）文件。当前模式允许读写电脑上的任意路径（用户已授权）。\n⚠️ 重要：只有输出 [操作:...] 标签，文件操作才会真正执行；仅仅在对话里说"我写好了/我已经保存"不会写入任何文件。当用户要求写/读文件时，你必须在回复正文中带上对应的 [操作:...] 标签（标签不会显示给用户）。写文件前先确认路径合理。\n🚫 你没有任何删除、修改、重命名、移动文件的权限（仅可查看、读取、新建文件）。当用户要求删除或改动已有文件时，请礼貌地拒绝并说明你没有删除权限，建议用户自己手动操作。\n🚫 绝对不要编造"已保存/已新建/已删除/已读取/操作成功"之类的操作结果——你没有实际执行就是没执行，未执行的操作必须如实说明没有执行。你不可以假装创建、写入或删除文件。'
+                    ? '# Agent Skill：文件操作（当前：允许操作电脑）\n可用 [操作:列出文件 路径] 查看目录、[操作:查看文件 路径] 读取文件、[操作:保存文件 路径|内容] 写入（新建）文件。当前模式允许读写电脑上的任意路径（用户已授权）。\n⚠️ 重要：只有输出 [操作:...] 标签，文件操作才会真正执行；仅仅在对话里说"我写好了/我已经保存"不会写入任何文件。当用户要求写/读文件时，你必须在回复正文中带上对应的 [操作:...] 标签（标签不会显示给用户）。写文件前先确认路径合理。\n🚫 你没有任何删除、修改、重命名、移动文件的权限（仅可查看、读取、新建文件）。当用户要求删除或改动已有文件时，请礼貌地拒绝并说明你没有删除权限，建议用户自己手动操作。\n🚫 绝对不要编造"已保存/已新建/已删除/已读取/操作成功"之类的操作结果——你没有实际执行就是没执行，未执行的操作必须如实说明没有执行。你不可以假装创建、写入或删除文件。' + agentRootsText()
                     : '# Agent Skill：文件操作（当前：应用内限制）\n可用 [操作:列出文件 路径] 查看目录、[操作:查看文件 路径] 读取文件、[操作:保存文件 路径|内容] 写入（新建）文件。当前模式仅可操作本应用文件夹（web/）内的文件，不要访问其他路径。\n⚠️ 重要：只有输出 [操作:...] 标签，文件操作才会真正执行；仅仅在对话里说"我写好了"不会写入任何文件。当用户要求写/读文件时，你必须在回复正文中带上对应的 [操作:...] 标签（标签不会显示给用户）。\n🚫 你没有任何删除、修改、重命名、移动文件的权限（仅可查看、读取、新建文件）。当用户要求删除或改动已有文件时，请礼貌地拒绝并说明你没有删除权限，建议用户自己手动操作。\n🚫 绝对不要编造"已保存/已新建/已删除/已读取/操作成功"之类的操作结果——你没有实际执行就是没执行，未执行的操作必须如实说明没有执行。你不可以假装创建、写入或删除文件。' });
             } catch (e) { /* ignore */ }
             messages.push(...getRecentHistoryMessages(text));
@@ -5201,6 +5382,12 @@ ${lines.join('\n')}
             }
             systemParts.push(`# Live2D 表情与动作控制（可选标签）
 你可以在回复中插入标签驱动 Live2D 模型，标签不会显示给用户会被剥离。[表情:happy]、[表情:sad]、[表情:blush]、[表情:angry]、[表情:think]、[表情:cry]、[表情:shy]、[动作:wave]、[动作:bow]。只在合适时使用。`);
+            // 手机操作能力：与分层版保持一致（这条是回滚路径，两边都要有，
+            // 否则一旦切回 legacy 就会出现"AI 又不能操作手机了"的诡异差异）
+            try {
+                const phoneSkill = agentPhoneSkillText();
+                if (phoneSkill) systemParts.push(phoneSkill);
+            } catch (e) { /* ignore */ }
             systemParts.push(ROLEPLAY_TURN_ANCHOR);
             const messages = [{ role: 'system', content: systemParts.join('\n\n') }];
             messages.push(...getRecentHistoryMessages(text));
@@ -5261,15 +5448,28 @@ ${lines.join('\n')}
                     );
                 }
             }
+            // 先把「这台电脑的真实位置」探测好再拼提示词 —— 它决定 AI 知不知道桌面在哪。
+            // 命中缓存时只是一次微任务，不会产生额外等待；探测失败会清缓存下次重试。
+            // 整段包 try/catch：拿不到真实路径顶多是 AI 需要多问一次，
+            // 但要是这里抛出去，整个对话就发不出去了 —— 不能让它有这种能力。
+            try { await detectAgentRoots(); } catch { /* 忽略 */ }
             const messages = ROLEPLAY_PROMPT_STRUCTURE_MODE === 'legacy-v1'
                 ? buildLegacyRoleplayMessages(text, options)
                 : buildLayeredRoleplayMessages(text, options);
-            return callChatAPI(messages, {
-                thinking: Boolean(state.settings.thinkingMode),
-                maxTokens: options.includeVoiceJp
-                    ? ROLEPLAY_OUTPUT_TOKEN_LIMITS.withVoice
-                    : ROLEPLAY_OUTPUT_TOKEN_LIMITS.text
-            });
+            // 记下"这次到底有没有带图片"，供 400 报错时决定要不要提图片原因。
+            // 用合并前的 hasImage：走视觉模型转述成功时 options.imageDataUrl 已被清空，
+            // 但那次请求确实处理过图片，报错提示理应还能提到图片。
+            try {
+                return await callChatAPI(messages, {
+                    thinking: Boolean(state.settings.thinkingMode),
+                    maxTokens: options.includeVoiceJp
+                        ? ROLEPLAY_OUTPUT_TOKEN_LIMITS.withVoice
+                        : ROLEPLAY_OUTPUT_TOKEN_LIMITS.text
+                });
+            } catch (err) {
+                if (hasImage && err instanceof ClientApiError) err.imageHint = true;
+                throw err;
+            }
         }
 
         /** 用视觉（多模态）模型直接处理图片 + 用户消息，返回其回应；
@@ -5599,18 +5799,35 @@ ${lines.join('\n')}
                 }
             }
             state.settings.apiProvider = DEFAULT_SETTINGS.apiProvider;
-            if (!['direct', 'custom-proxy'].includes(state.settings.providerMode)) state.settings.providerMode = 'direct';
-            if (!CHAT_API_FORMATS[state.settings.apiFormat]) state.settings.apiFormat = 'openai';
-            const preset = CHAT_API_FORMATS[state.settings.apiFormat] || CHAT_API_FORMATS.openai;
-            if (state.settings.providerMode === 'direct') state.settings.baseUrl = preset.defaultBaseUrl;
+            // 老格式 id 迁移：必须放在下面的合法性校验**之前**，否则会被当成非法值直接重置成默认，
+            // 用户原来配好的地址和模型就白填了。
+            const legacyFormat = String(state.settings.apiFormat || '');
+            if (LEGACY_API_FORMAT_ALIASES[legacyFormat]) {
+                const oldBaseUrl = String(state.settings.baseUrl || '').trim();
+                state.settings.apiFormat = LEGACY_API_FORMAT_ALIASES[legacyFormat];
+                // 地址需要改写的（Gemini / Ollama 原来用的是"原生协议"端点）换成对应的兼容端点。
+                // 其余情况一律保留用户原来的地址不动 —— Base URL 现在是一个始终可编辑的普通输入框，
+                // 不会再被"请求模式"覆盖，所以不需要为保住地址做额外处理。
+                const rewritten = LEGACY_BASE_URL_REWRITE[oldBaseUrl];
+                if (rewritten) state.settings.baseUrl = rewritten;
+            }
+            // 「请求模式」已经删掉：以前它会把 baseUrl 覆盖成格式默认值，是"换了格式就连不上"和
+            // "迁移后地址被冲掉"两处问题的共同来源。现在 baseUrl 只由用户输入决定，只在为空时补默认值。
+            delete state.settings.providerMode;
+            if (!CHAT_API_FORMATS[state.settings.apiFormat]) state.settings.apiFormat = 'openai-compatible';
+            const preset = CHAT_API_FORMATS[state.settings.apiFormat] || CHAT_API_FORMATS['openai-compatible'];
             if (!String(state.settings.baseUrl || '').trim()) state.settings.baseUrl = preset.defaultBaseUrl;
             if (!String(state.settings.model || '').trim()) state.settings.model = preset.defaultModel;
             if (!['browser', 'aliyun', 'mimo'].includes(state.settings.asrProvider)) state.settings.asrProvider = 'browser';
             // 手机操作授权策略：非法值一律回落到「每次都询问」（安全默认）
             if (!['always', 'run', 'off'].includes(state.settings.agentApproval)) state.settings.agentApproval = 'always';
             if (typeof state.settings.agentPhoneEnabled !== 'boolean') state.settings.agentPhoneEnabled = true;
-            // 实现方式：空表示「还没选过」；非法值一律回落到空（要求用户明确选择，不替他决定）
-            if (!['', 'accessibility', 'adb', 'root', 'module'].includes(state.settings.agentBackend)) state.settings.agentBackend = '';
+            // 实现方式：空表示「还没选过」；非法值一律回落到空（要求用户明确选择，不替他决定）。
+            // 注意：这里的 id 列表必须与下面 AGENT_BACKENDS 保持一致 —— 漏一个会让用户选了那种方式后
+            // 一刷新就被重置成"没选过"（加 Shizuku 时就踩过一次）。
+            // 反过来也不能多：ADB 后端已经去掉，这里若还认 'adb'，老用户的旧选择会被当成合法值留下，
+            // 而它已经不对应任何实现方式 —— 白名单只认"真的存在"的那几个。
+            if (!['', 'accessibility', 'shizuku', 'root', 'module'].includes(state.settings.agentBackend)) state.settings.agentBackend = '';
             // 旧版迁移：ASR Key 以前复用 TTS 的 dashscopeApiKey，现迁移到独立 asrApiKey
             if (!String(state.settings.asrApiKey || '').trim() && String(state.settings.dashscopeApiKey || '').trim()) {
                 state.settings.asrApiKey = state.settings.dashscopeApiKey;
@@ -5618,7 +5835,7 @@ ${lines.join('\n')}
             if (!['minimax', 'doubao', 'dashscope'].includes(state.settings.ttsProvider)) state.settings.ttsProvider = 'minimax';
             // 设置加载完再同步一次入口按钮的灰显状态：
             // 脚本顶层那次调用可能早于 loadSettings()，会误把已选的实现方式显示成未选。
-            syncBackendEntryButton();
+            syncBackendSummary();
         }
 
         function isFirstInstall() {
@@ -5637,8 +5854,6 @@ ${lines.join('\n')}
             const announcement = state.announcement || { title: '欢迎使用独立开源版', content: '使用前请在设置中配置 API 密钥。' };
             elements.announcementTitle.textContent = announcement.title;
             elements.announcementContent.textContent = announcement.content;
-            // 不再要求当场输入 Key：提示到设置配置即可
-            if (elements.announcementKeySection) elements.announcementKeySection.classList.add('hidden');
             elements.announcementConfirmBtn.textContent = '我知道了';
             elements.announcementOverlay.classList.remove('hidden');
             elements.announcementOverlay.classList.add('flex');
@@ -6666,9 +6881,22 @@ ${lines.join('\n')}
         });
 
         // ===== 手机操作：解析 [操作:手机xxx …] → 停止检查 → 授权 → 执行 → 回灌 =====
-        // 说明：原生设备能力（无障碍 / Shizuku / 模块 / ADB）尚未接入，这一层先把
-        // 「解析 / 停止 / 授权 / 结果回灌」打通；原生就位后只需实现 window.ElainaDevice.exec()，
-        // 上层逻辑不用改。设计详见 docs/mobile-agent.md。
+        // 原生设备层由 ElainaShellPlugin 提供（@CapacitorPlugin name="ElainaDevice"）。
+        // Capacitor 注册原生插件后会往页面注入 window.Capacitor.Plugins.ElainaDevice，
+        // 这里给它挂一个 window.ElainaDevice 别名，让执行层不用关心它从哪来。
+        // 网页版上这个别名是空的，执行时会明确提示「设备能力还没接入」。
+        // 设计详见 手机Agent设计.md。
+        function deviceBridge() {
+            if (window.ElainaDevice) return window.ElainaDevice;
+            const nativePlugin = window.Capacitor?.Plugins?.ElainaDevice;
+            if (nativePlugin) {
+                window.ElainaDevice = nativePlugin;
+                return nativePlugin;
+            }
+            return null;
+        }
+        // 提前挂一次（正常时序下此时已经注入完毕），拿不到也不影响后续按需获取
+        void deviceBridge();
         const AGENT_PHONE_OPS = [
             '手机查看界面', '手机状态', '手机截图', '手机等待',
             '手机点击', '手机滑动', '手机输入', '手机按键', '手机打开', '手机命令'
@@ -6703,14 +6931,52 @@ ${lines.join('\n')}
         }
 
         async function execPhoneOperation(parsed) {
-            const dev = window.ElainaDevice;
+            const dev = deviceBridge();
             if (!dev || typeof dev.exec !== 'function') {
-                throw new Error('设备能力还没接入：当前版本没有编写手机操作的原生插件，这一步没有真正执行。'
-                    + '（机制本身已就绪：停止与授权都已生效，接入原生能力后即可直接使用）');
+                throw new Error('设备能力还没接入：这个版本里没有手机操作的原生插件，这一步没有真正执行。'
+                    + '（网页版就是这样，请用带原生设备层的 APK）');
             }
-            const res = await dev.exec({ action: parsed.action, args: parsed.args });
-            const text = res && (res.text || res.message);
-            return text || (parsed.action + ' 完成');
+            const res = await dev.exec({
+                action: parsed.action,
+                args: parsed.args,
+                // 把用户选的实现方式带下去。原生侧优先用它；它不可用时明确报错，
+                // 而不是偷偷换成另一种 —— 否则用户以为在走 root，实际走的是无障碍，没法排查。
+                backend: currentBackendId()
+            });
+            let text = (res && (res.text || res.message)) || (parsed.action + ' 完成');
+            // 截图：原生把图片以 base64 带回来。交给已配置的视觉模型看一眼，
+            // 把「屏幕上是什么」变成文字回灌给主模型 —— 与「图片理解」复用同一条链路。
+            if (res && res.imageBase64 && parsed.action === '手机截图') {
+                text = await describePhoneScreenshot(res, text);
+            }
+            return text;
+        }
+
+        /** 把手机截图交给视觉模型转述。没配视觉模型时如实说明，不静默吞掉。 */
+        async function describePhoneScreenshot(res, fallbackText) {
+            const dataUrl = 'data:' + (res.imageMime || 'image/jpeg') + ';base64,' + res.imageBase64;
+            const hasVision = Boolean(
+                String(state.settings.visionBaseUrl || '').trim() && String(state.settings.visionModel || '').trim()
+            );
+            if (!hasVision) {
+                return fallbackText + '\n（没有配置视觉模型，所以我拿不到画面内容。'
+                    + '在「设置 → 视觉」填一个多模态模型后我就能看见屏幕了；或者改用「手机查看界面」直接读控件树。）';
+            }
+            try {
+                const described = await describeImageWithVision(
+                    '这是我手机当前的屏幕截图。请简短回答三点：'
+                    + '1) 这是什么界面（哪个应用、什么页面）；'
+                    + '2) 界面上有哪些可点的按钮和输入框，各自大致在什么位置（用「上方/中间/下方 + 左/中/右」描述）；'
+                    + '3) 屏幕上有没有明显的文字提示或弹窗。只描述你确实看到的，不要猜。',
+                    dataUrl
+                );
+                if (!described || !described.trim()) return fallbackText;
+                return fallbackText + '\n\n【画面内容】\n' + described.trim();
+            } catch (err) {
+                const reason = String(err?.message || err || '');
+                console.error('[Agent] 手机截图转述失败:', err);
+                return fallbackText + '\n（截图拿到了，但视觉模型没能看：' + reason.slice(0, 200) + '）';
+            }
         }
 
         async function runAgentPhoneOperation(raw) {
@@ -6722,9 +6988,10 @@ ${lines.join('\n')}
                     + '\n可用写法：手机状态 / 手机查看界面 / 手机截图 / 手机点击 x y / 手机滑动 x1 y1 x2 y2 [时长] / 手机输入 文字 / 手机按键 返回|主页|回车 / 手机打开 包名 / 手机等待 毫秒');
                 return;
             }
-            // 还没选实现方式 → 手机操作不可用（与侧边栏入口按钮的灰显一致）
+            // 还没选实现方式 → 手机操作不可用（与「设置 → 高级 → 手机操作」里的状态提示一致）
             if (!currentBackendId()) {
-                insertAgentResult('已跳过：还没有选择「实现方式」，AI 现在不能操作手机。请点侧边栏的「实现方式」按钮选一种。');
+                insertAgentResult('已跳过：还没有选择「实现方式」，AI 现在不能操作手机。'
+                    + '请到「设置 → 高级 → 手机操作」点「选择实现方式」选一种。');
                 return;
             }
             // 总开关关掉时直接拒绝（设置 → 高级 → 手机操作）
@@ -6751,7 +7018,8 @@ ${lines.join('\n')}
                     return;
                 }
                 rt.assertNotStopped();
-                insertAgentResult(await execPhoneOperation(parsed));
+                // 这一步真的执行了 → 让 AI 接着决定下一步（见 insertAgentResult 的说明）
+                insertAgentResult(await execPhoneOperation(parsed), { continueLoop: true });
             } catch (err) {
                 if (err && err.agentAborted) {
                     insertAgentResult('已停止：用户中止了操作，剩余步骤没有执行。');
@@ -6769,24 +7037,25 @@ ${lines.join('\n')}
         }
 
         // ===== 实现方式（后端选择）=====
-        // 四种执行方式，能力与门槛不同。原生设备层尚未接入，所以除「模块」外都只能显示
-        // 「待接入」——「模块」可以真探测（它的网关在本机 3070 端口）。
-        // 设计详见 docs/mobile-agent.md 第三节。
+        // 四种执行方式，能力与门槛不同。入口在「设置 → 高级 → 手机操作」里（不在侧边栏：
+        // 手机上侧边栏一收起，那里就进不去了），面板本身是一个独立弹窗（#backendPanel）。
+        // 状态由原生层 ElainaDevice.status() 提供；网页版没有原生层，统一显示「需要在 APK 里使用」。
+        // 设计详见 手机Agent设计.md 第三、六节。
         const AGENT_BACKENDS = [
             {
                 id: 'accessibility', name: '无障碍', tag: '免 root',
-                desc: '用系统自带的无障碍服务点击、输入、读取界面。不用装任何东西，门槛最低。',
+                desc: '用系统自带的无障碍服务点击、输入、读取界面。不用装任何东西，门槛最低；中文输入也只有它能可靠做到。',
                 need: '系统设置 → 无障碍里开启本应用的服务'
             },
             {
-                id: 'adb', name: 'ADB', tag: '需要电脑',
-                desc: '由电脑上的本地服务执行命令，手机只负责显示。能力最全，不受手机端限制。',
-                need: '手机开 USB 或无线调试，且电脑在场'
+                id: 'shizuku', name: 'Shizuku', tag: '免 root',
+                desc: '借 Shizuku 把本应用提到 adb 级别的权限，能力接近 root，但不用 root 手机。',
+                need: '装好 Shizuku 并启动服务，再给本应用授权'
             },
             {
                 id: 'root', name: 'Root', tag: '需要 root',
                 desc: '应用直接以 root 身份执行命令，不依赖电脑。',
-                need: '手机已 root，并给本应用授权一次'
+                need: '手机已 root（KernelSU / Magisk / APatch），并给本应用授权一次'
             },
             {
                 id: 'module', name: '模块', tag: '需要 KernelSU',
@@ -6796,37 +7065,42 @@ ${lines.join('\n')}
         ];
 
         // 每个实现方式对应的「去设置 / 请求权限」引导。
-        // plugin/method 指向原生插件的真跳转（如上游 ElainaPetPlugin 的 openAccessibilitySettings）；
-        // 插件不在时退化成说明弹窗 —— 所以网页版现在就能用，原生接入后自动升级为真跳转。
+        // plugin/method 指向原生插件 ElainaDevice 上的真实方法：在场就真跳转 / 真弹授权框，
+        // 返回的说明（比如"没能拿到 root 权限，原因是…"）会直接展示给用户；
+        // 插件不在（网页版）时退化成下面的说明文字。代码只有一份，两种情况都给出可执行的下一步。
         const AGENT_BACKEND_SETUP = {
             accessibility: {
                 label: '去开启无障碍',
-                plugin: 'ElainaPet', method: 'openAccessibilitySettings',
+                plugin: 'ElainaDevice', method: 'openAccessibilitySettings',
                 guide: [
                     '1. 打开系统的「设置 → 无障碍」（部分机型叫「辅助功能」）',
-                    '2. 在已安装的服务里找到「ElainaChat Open」',
+                    '2. 在已安装的服务里找到「ElainaChat Open 手机操作」',
                     '3. 打开开关并按提示确认',
                     '',
                     '各厂商路径：小米在「更多设置 → 无障碍」；华为 / 荣耀在「辅助功能 → 无障碍」；OPPO / 一加在「系统设置 → 无障碍」。'
                 ].join('\n')
             },
-            adb: {
-                label: '怎么开启调试',
+            shizuku: {
+                label: '请求 Shizuku 授权',
+                plugin: 'ElainaDevice', method: 'requestShizuku',
                 guide: [
-                    '这个方式需要电脑配合，手机只要开启调试：',
+                    'Shizuku 能让本应用获得 adb 级别的能力，接近 root，但不需要手机真的 root。',
                     '',
-                    '1. 「设置 → 关于手机」，连点「版本号」7 次，开启开发者选项',
-                    '2. 回到「设置 → 系统 → 开发者选项」，打开「USB 调试」',
-                    '3. Android 11 及以上还可以打开「无线调试」，这样就不用插数据线',
-                    '4. 把手机连到运行本应用的电脑，再回来点「重新检测」'
+                    '1. 安装 Shizuku 应用（开源，应用商店或 GitHub 都有）',
+                    '2. 打开 Shizuku 并启动服务：已 root 的手机可以直接在 Shizuku 里点「启动」；'
+                    + '没有 root 的话，Shizuku 会让你用电脑通过 adb 启动一次（手机开「无线调试」也可以，不用数据线）',
+                    '3. 回到本应用，点「请求 Shizuku 授权」，在弹框里点「允许」',
+                    '',
+                    '注意：非 root 情况下每次重启手机都要手动启动一次 Shizuku，这是系统限制，不是应用的问题。'
                 ].join('\n')
             },
             root: {
                 label: '请求 root 授权',
-                plugin: 'ElainaShell', method: 'requestRoot',
+                plugin: 'ElainaDevice', method: 'requestRoot',
                 guide: [
-                    '1. 确认手机已经 root（Magisk / KernelSU / APatch 之一）',
-                    '2. 点击请求后会弹出系统授权框，选「允许」并勾选「记住选择」',
+                    '1. 确认手机已经 root（KernelSU / Magisk / APatch 之一）',
+                    '2. 点这个按钮会发起一次 su 请求，管理器会弹出授权框，选「允许」并勾选「记住选择」',
+                    '3. 回来点「重新检测」，状态会变成「已授权」',
                     '',
                     '注意：root 授权等于把整台手机的控制权交给本应用。请确认你信任当前安装的版本，'
                     + '并且只在自己手动触发的场景下使用。'
@@ -6835,13 +7109,14 @@ ${lines.join('\n')}
             module: {
                 label: '怎么刷模块',
                 guide: [
-                    '模块方式需要先在手机上刷入 KernelSU 模块，它会提供一个本地服务（127.0.0.1:3070）。',
+                    '模块方式需要先在手机上刷入 KernelSU 模块，它会提供一个本地服务（默认 127.0.0.1:3070）。',
                     '',
                     '1. 确认手机已刷 KernelSU 并装好管理器',
                     '2. 刷入模块后重启手机',
                     '3. 回来点「重新检测」，状态会变成「已就绪」',
                     '',
-                    '刷上之后 AI 可以后台静默操作手机，不抢占你正在用的界面，是四种方式里体验最好的。'
+                    '刷上之后 AI 可以后台静默操作手机，不抢占你正在用的界面，是几种方式里体验最好的。',
+                    '如果模块用的不是 3070 端口，需要改网关地址（目前只能改代码里的默认值）。'
                 ].join('\n')
             }
         };
@@ -6859,19 +7134,167 @@ ${lines.join('\n')}
             return found ? found.name : '';
         }
 
-        /** 侧边栏入口按钮的灰显状态：没选过实现方式时压暗，提示功能尚未启用 */
-        function syncBackendEntryButton() {
-            const btn = document.getElementById('railBackendBtn');
-            if (!btn) return;
+        /**
+         * 注入系统提示词的「手机操作」能力说明。
+         *
+         * 为什么必须有这一段：整个执行链路（标签解析 → 停止检查 → 授权 → 原生 exec → 结果回灌）
+         * 早就是通的，但**提示词里从来没有告诉过模型它有能力操作手机** ——
+         * LIVE2D_TAG_GUIDE 的【操作标签】只列了 7 个应用内操作，一个 `手机*` 都没有。
+         * 模型不知道标签存在，就永远不会输出它，用户看到的现象正是"AI 好像不能操作手机"。
+         *
+         * 分三档，避免"告诉了却做不到"：
+         *   · 没有原生设备层（网页版）→ 不注入。用户界面上也没有这块设置，提了只会让模型空谈。
+         *   · 有设备层但没选实现方式 / 总开关关着 → 注入"未启用"说明，并**明确禁止输出标签**
+         *     （那些标签会被 runAgentPhoneOperation 直接拒绝）。这样模型会去引导用户开设置，
+         *     而不是编造"我操作好了"。
+         *   · 可用 → 注入完整能力清单 + 工作方式 + 反幻觉约束。
+         */
+        function agentPhoneSkillText() {
+            if (!deviceBridge()) return '';
+            const backend = currentBackendId();
+            const enabled = state.settings.agentPhoneEnabled !== false;
+            if (!backend || !enabled) {
+                return '# Agent Skill：手机操作（当前未启用）\n'
+                    + '这台设备支持手机操作，但用户还没有在「设置 → 高级 → 手机操作」里选好「实现方式」'
+                    + (enabled ? '' : '，或「允许 AI 操作手机」总开关是关闭的') + '。\n'
+                    + '因此你现在**不能**操作手机，也**不要**输出 [操作:手机…] 标签（会被系统直接拒绝，等于白说）。\n'
+                    + '如果用户希望你操作手机，请如实说明还没有启用，并引导他去「设置 → 高级 → 手机操作」'
+                    + '点「选择实现方式」选一种（无障碍门槛最低），并确认「允许 AI 操作手机」已勾选。';
+            }
+            // 能力清单必须按实现方式区分：无障碍**做不到**「手机打开」与「手机命令」
+            // （原生层会明确回失败）。提示词里把它俩写成通用能力，就会造成"说了却做不到"，
+            // 模型反复尝试、用户看到一连串失败 —— 这正是本次要避免的那类问题。
+            const isAccessibility = backend === 'accessibility';
+            const lines = [
+                '# Agent Skill：手机操作（当前方式：' + backendNameOf(backend) + '）',
+                '你可以操作这台安卓手机：读取界面、点击、滑动、输入文字、按键'
+                    + (isAccessibility ? '、截图' : '、打开应用、截图、执行命令') + '。',
+                '可用标签（写在回复正文里，标签不会显示给用户）：',
+                '· [操作:手机状态] —— 查询设备与当前后端状态',
+                '· [操作:手机查看界面] —— 读取当前屏幕的控件树（含控件文字与可点击坐标）',
+                '· [操作:手机截图] —— 截屏（需在「设置 → 视觉」配好多模态模型，否则拿不到画面内容）',
+                '· [操作:手机点击 x y] —— 点击坐标，例如 [操作:手机点击 540 1200]',
+                '· [操作:手机滑动 x1 y1 x2 y2 [时长毫秒]] —— 例如 [操作:手机滑动 540 1600 540 800 300]',
+                '· [操作:手机输入 文字] —— 向当前获得焦点的输入框输入文字',
+                '· [操作:手机按键 返回|主页|回车|菜单|音量上|音量下] —— 按系统键',
+                '· [操作:手机等待 毫秒] —— 等界面加载完再继续',
+            ];
+            if (isAccessibility) {
+                // 无障碍的能力边界：启动应用与任意命令都做不到。
+                // 明说边界，模型才会去用"点击桌面图标"这类可行路径，而不是反复撞墙。
+                lines.push('· ⛔ 当前方式**不支持** [操作:手机打开]（启动应用）与 [操作:手机命令]（任意命令）'
+                    + ' —— 无障碍方式做不到这两件事。');
+                lines.push('  要启动某个应用，请先用 [操作:手机查看界面] 找到它的图标，再点击图标坐标；'
+                    + '或请用户到「设置 → 高级 → 手机操作」换成 Shizuku / Root / 模块 方式。');
+                lines.push('· 按键也只支持「返回 / 主页 / 最近任务」三个，其它按键需要换实现方式。');
+            } else {
+                lines.push('· [操作:手机打开 包名] —— 启动应用，例如 [操作:手机打开 com.tencent.mm]');
+                lines.push('· [操作:手机命令 命令] —— 执行系统命令（危险，每次都会单独询问用户）');
+            }
+            lines.push(
+                '',
+                '【工作方式】',
+                '1. 不知道屏幕上有什么时，先 [操作:手机查看界面] 读控件树，**不要凭猜测点坐标**。',
+                '2. 控件树里的坐标就是屏幕绝对坐标，可直接用于 [操作:手机点击 x y]。',
+                '3. 要输入中文：先点击输入框让它获得焦点，再用 [操作:手机输入 文字]。',
+                '4. 每一步的结果会以「【AI 操作结果】」回灌给你，据此决定下一步；界面没变化就换个方式，不要重复同一步。',
+                '5. 点击/滑动/输入/打开应用都会弹窗询问用户，用户可能拒绝 —— 被拒绝时如实说明并换个思路。',
+                '6. 若某一步回灌了「不支持」，说明那是当前实现方式的能力边界，'
+                    + '**不要重复尝试**，改用别的方式或如实告诉用户需要换实现方式。',
+                '7. ⚠️ 只有输出 [操作:…] 标签才会真正执行。**绝不编造**"我已经点了/已经打开了/操作成功"；',
+                '   没有标签就是没执行，执行结果一律以系统回灌的「【AI 操作结果】」为准。'
+            );
+            return lines.join('\n');
+        }
+
+        /**
+         * 刷新「设置 → 手机操作」里那块实现方式的显示。
+         *
+         * 注意：这里**只更新文字和徽标，不禁用任何东西**。
+         * 实现方式只是"AI 走哪条路"的选择，下面的总开关和确认策略跟它无关，
+         * 没选实现方式也照样能改 —— 把设置锁住只会让人以为坏了。
+         */
+        function syncBackendSummary() {
             const chosen = currentBackendId();
-            btn.classList.toggle('is-unset', !chosen);
-            btn.title = chosen ? ('实现方式：' + backendNameOf(chosen)) : '实现方式（尚未选择）';
+            const summary = document.getElementById('settingBackendSummary');
+            const badge = document.getElementById('settingBackendBadge');
+            const bridge = document.getElementById('settingBackendBridge');
+            if (badge) badge.innerHTML = chosen ? backendStatusBadge(backendStatus[chosen]) : '';
+            if (bridge) {
+                // 这一行是拿来回答"为什么检测不到"的：是原生层没接上，还是还没授权
+                if (deviceBridge()) {
+                    const info = backendDeviceInfo;
+                    bridge.textContent = '原生设备层：已连接'
+                        + (info && info.model ? `（${info.model} / Android ${info.android}）` : '');
+                    bridge.style.color = '#059669';
+                } else {
+                    bridge.textContent = '原生设备层：不在（当前是网页版，手机操作只能在安卓版 App 里用）';
+                    bridge.style.color = '#b45309';
+                }
+            }
+            if (!summary) return;
+            if (!chosen) {
+                summary.textContent = '还没有选择实现方式，AI 现在不能操作手机。点下面的「选择实现方式」选一种。';
+                summary.style.color = '#b45309';
+                return;
+            }
+            const st = backendStatus[chosen];
+            const ready = st && st.state === 'ready';
+            const checking = !st || st.state === 'checking';
+            const stateWord = checking ? '检测中' : (ready ? '已就绪' : '现在还不能用');
+            const detail = st && st.text ? '：' + st.text : '';
+            summary.textContent = '当前实现方式：' + backendNameOf(chosen) + '（' + stateWord + detail + '）';
+            summary.style.color = ready ? '#059669' : '#b45309';
+        }
+
+        /**
+         * 设备状态只问原生一次，四个后端共用 —— 否则 status() 会被连问四遍，
+         * 而它内部要 ping Shizuku、连一次 3070 网关，四遍纯属浪费。
+         */
+        let backendStatusCache = null;
+        let backendDeviceInfo = null;
+
+        async function fetchDeviceStatus(force) {
+            const dev = deviceBridge();
+            if (!dev || typeof dev.status !== 'function') return null;
+            if (backendStatusCache && !force) return backendStatusCache;
+            try {
+                const st = await dev.status();
+                backendStatusCache = st || {};
+                backendDeviceInfo = {
+                    model: backendStatusCache.model || '',
+                    android: backendStatusCache.android || ''
+                };
+                return backendStatusCache;
+            } catch (e) {
+                console.warn('[Agent] 原生设备层状态查询失败:', e);
+                backendStatusCache = null;
+                return null;
+            }
         }
 
         /** 探测某个后端当前是否可用 */
         async function detectBackend(id) {
-            // 「模块」可以直接探测（网关在本机 3070）。no-cors 读不到响应内容，
-            // 但"有没有响应"足够判断它在不在。
+            // 原生设备层在场时，直接问它 —— 这是唯一准的来源（它能真的试 su、ping Shizuku）。
+            const dev = deviceBridge();
+            if (dev && typeof dev.status === 'function') {
+                const st = await fetchDeviceStatus(false);
+                if (st) {
+                    const item = st[id];
+                    if (item) {
+                        const detail = String(item.detail || '');
+                        return item.available
+                            ? { state: 'ready', text: detail || '已就绪' }
+                            : { state: 'unavailable', text: detail || '不可用' };
+                    }
+                    return { state: 'unavailable', text: '这个版本里没有这种实现方式' };
+                }
+                // 走到这里说明原生层在场但 status() 没回答。
+                // 别说成"网页版"——那会把人引到完全错的方向，如实报错。
+                return { state: 'unavailable', text: '原生设备层没有响应，重启一下应用再试' };
+            }
+            // 网页版没有原生层。只有「模块」能真探测：它的网关在本机 3070，
+            // no-cors 的 fetch 读不到响应内容，但"有没有响应"足够判断它在不在。
             if (id === 'module') {
                 try {
                     const ctrl = new AbortController();
@@ -6883,28 +7306,27 @@ ${lines.join('\n')}
                     return { state: 'unavailable', text: '未检测到' };
                 }
             }
-            // 其余三个依赖原生设备层（window.ElainaDevice），当前版本还没编写，
-            // 只能显示「待接入」。接入后改成读 dev.status() 的真实结果即可。
-            const dev = window.ElainaDevice;
-            if (!dev || typeof dev.status !== 'function') return { state: 'pending', text: '待接入' };
-            try {
-                const st = await dev.status();
-                const available = !!(st && st[id] && st[id].available);
-                return available ? { state: 'ready', text: '已就绪' } : { state: 'unavailable', text: '不可用' };
-            } catch (e) {
-                return { state: 'unavailable', text: '检测失败' };
-            }
+            // 网页版没有原生层，几种实现方式都探测不了，也不需要探测：
+            // 「手机操作」只在安卓版 App 里可用（浏览器没有点击/输入屏幕的能力）。
+            return { state: 'pending', text: '需要在安卓版 App 里使用' };
         }
 
         function backendStatusBadge(st) {
             const map = {
                 ready: ['已就绪', 'color:#059669;background:#ecfdf5'],
-                unavailable: ['未检测到', 'color:#b45309;background:#fffbeb'],
-                pending: ['待接入', 'color:#818cf8;background:#eef2ff'],
+                unavailable: ['不可用', 'color:#b45309;background:#fffbeb'],
+                pending: ['仅 APK', 'color:#818cf8;background:#eef2ff'],
                 checking: ['检测中', 'color:#818cf8;background:#eef2ff']
             };
             const pair = map[st && st.state] || map.checking;
             return '<span style="' + pair[1] + ';font-size:10px;padding:2px 7px;border-radius:7px;white-space:nowrap">' + pair[0] + '</span>';
+        }
+
+        /** 后端返回的说明文字直接来自原生层，插进 HTML 前统一转义 */
+        function escapeBackendText(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
 
         function renderBackendList() {
@@ -6916,6 +7338,11 @@ ${lines.join('\n')}
             box.innerHTML = tip + AGENT_BACKENDS.map((b) => {
                 const active = b.id === cur;
                 const setup = AGENT_BACKEND_SETUP[b.id];
+                const st = backendStatus[b.id];
+                // 状态说明来自原生层（"还没授权，点「请求 root 授权」"这种），
+                // 必须显示出来 —— 手机上没法 hover，只给个"不可用"用户不知道该做什么
+                const detail = (st && st.state !== 'checking' && st.text) ? escapeBackendText(st.text) : '';
+                const detailColor = (st && st.state === 'ready') ? '#059669' : '#b45309';
                 // 用 div 而不是 button：卡片里还要放「去设置」按钮，而 button 不能嵌套 button
                 return '<div data-backend="' + b.id + '" role="button" tabindex="0"'
                     + ' class="w-full text-left rounded-2xl border px-4 py-3 transition cursor-pointer"'
@@ -6923,8 +7350,9 @@ ${lines.join('\n')}
                     + '<div class="flex items-center gap-2">'
                     + '<span class="text-sm font-semibold text-indigo-950">' + b.name + '</span>'
                     + '<span style="font-size:10px;color:#818cf8;background:#eef2ff;padding:2px 6px;border-radius:7px;white-space:nowrap">' + b.tag + '</span>'
-                    + '<span class="ml-auto">' + backendStatusBadge(backendStatus[b.id]) + '</span>'
+                    + '<span class="ml-auto">' + backendStatusBadge(st) + '</span>'
                     + '</div>'
+                    + (detail ? '<p class="text-[11px] mt-1 leading-relaxed" style="color:' + detailColor + '">' + detail + '</p>' : '')
                     + '<p class="text-[11px] text-indigo-400 mt-1 leading-relaxed">' + b.desc + '</p>'
                     + '<div class="flex items-center gap-2 mt-1">'
                     + '<span class="text-[11px] text-indigo-300 leading-relaxed flex-1">需要：' + b.need + '</span>'
@@ -6957,23 +7385,44 @@ ${lines.join('\n')}
             if (!AGENT_BACKENDS.some((b) => b.id === id)) return;
             state.settings.agentBackend = id;
             persistSettings();
-            syncBackendEntryButton();
+            syncBackendSummary();
             renderBackendList();
             console.log('[Agent] 实现方式已选为:', id);
+            // 选了但还没就绪时提醒一句：直接告诉用户该点哪个按钮去授权。
+            // 否则他会在对话里试半天，最后收到一句"你还不能用"的回灌。
+            const st = backendStatus[id];
+            // 只提醒"已经确定不可用"的情况。
+            // checking 是面板刚打开、原生状态还没回来的窗口，这时候弹
+            // 「它现在还不能用：检测中」纯属误报 —— 用户刚点完就被自己的界面否掉。
+            if (st && st.state !== 'ready' && st.state !== 'checking') {
+                const setupLabel = (AGENT_BACKEND_SETUP[id] || {}).label || '去设置';
+                void showCustomAlert(
+                    '已选择「' + backendNameOf(id) + '」，但它现在还不能用：' + (st.text || '状态未知') +
+                    '\n\n点这张卡片右侧的「' + setupLabel + '」完成授权，然后点「重新检测」。',
+                    '还需要一步'
+                );
+            }
         }
 
         /**
          * 「去设置 / 请求权限」：原生插件在场就走真跳转（打开无障碍设置页、弹 root 授权框），
-         * 否则弹出该方式的操作说明 —— 网页版和原生未接入时都能给出可执行的下一步。
+         * 并把原生返回的说明展示出来；否则弹出该方式的操作说明。
+         * 网页版和 APK 两种情况都能给出可执行的下一步。
          */
         async function openBackendSetup(id) {
             const cfg = AGENT_BACKEND_SETUP[id];
             if (!cfg) return;
             if (cfg.plugin && cfg.method) {
-                const plugin = window.Capacitor?.Plugins?.[cfg.plugin];
+                const plugin = window.Capacitor?.Plugins?.[cfg.plugin]
+                    || (cfg.plugin === 'ElainaDevice' ? deviceBridge() : null);
                 if (plugin && typeof plugin[cfg.method] === 'function') {
                     try {
-                        await plugin[cfg.method]();
+                        const res = await plugin[cfg.method]();
+                        // 原生返回的文字必须展示：比如"没能拿到 root 权限：Permission denied"，
+                        // 那正是用户下一步该做什么的依据，吞掉的话这个按钮就等于没用
+                        const message = (res && res.text) ? String(res.text) : cfg.guide;
+                        await showCustomAlert(message, cfg.label);
+                        void refreshBackendStatus();
                         return;
                     } catch (e) {
                         console.warn('[Agent] 原生设置跳转失败，改用说明:', e);
@@ -6984,10 +7433,17 @@ ${lines.join('\n')}
         }
 
         async function refreshBackendStatus() {
+            // 必须先把原生状态缓存清掉。
+            // 否则「重新检测」只是把界面重置成"检测中"，再拿回同一份旧数据 —— 看起来刷新了，其实没有。
+            // 而授权流程恰恰是「点授权 → 点重新检测 → 状态变已就绪」，
+            // 不清缓存这一步就永远是空的，用户会以为授权没成功。
+            backendStatusCache = null;
             AGENT_BACKENDS.forEach((b) => { backendStatus[b.id] = { state: 'checking', text: '检测中' }; });
             renderBackendList();
+            syncBackendSummary();
             await Promise.all(AGENT_BACKENDS.map(async (b) => { backendStatus[b.id] = await detectBackend(b.id); }));
             renderBackendList();
+            syncBackendSummary();
         }
 
         function openBackendPanel() {
@@ -6995,7 +7451,8 @@ ${lines.join('\n')}
             if (!el) return;
             el.classList.remove('hidden');
             el.classList.add('flex');
-            el.style.zIndex = '100002';   // 高于 Live2D 通话界面（99999）与运行状态条（100000）
+            // 层级（100002，盖在设置之上）写在样式表的 #backendPanel 规则里，
+            // 这里不设 style.zIndex —— .modal-overlay 上的 !important 会让内联值失效
             renderBackendList();
             void refreshBackendStatus();
         }
@@ -7005,11 +7462,18 @@ ${lines.join('\n')}
             if (!el) return;
             el.classList.add('hidden');
             el.classList.remove('flex');
+            // 关掉面板时刷新一次：用户可能刚在里面选了一种方式
+            syncBackendSummary();
         }
 
-        document.getElementById('railBackendBtn')?.addEventListener('click', openBackendPanel);
+        // 入口在「设置 → 手机操作」里（不在侧边栏 —— 手机上侧边栏收起后那里进不去）
+        document.getElementById('settingBackendChooseBtn')?.addEventListener('click', openBackendPanel);
+        document.getElementById('settingBackendRefreshBtn')?.addEventListener('click', () => { void refreshBackendStatus(); });
         document.getElementById('backendRefresh')?.addEventListener('click', () => { void refreshBackendStatus(); });
-        syncBackendEntryButton();
+        syncBackendSummary();
+        // 预热「这台电脑的真实位置」（桌面/文档/下载…）。服务端要起一次 PowerShell 读注册表，
+        // 大约一两秒；提前拉一次，用户真让 AI 操作文件时提示词里就已经带着真实路径了。
+        void detectAgentRoots();
         document.getElementById('backendPanelClose')?.addEventListener('click', closeBackendPanel);
         document.getElementById('backendPanel')?.addEventListener('click', (e) => {
             if (e.target && e.target.id === 'backendPanel') closeBackendPanel();
@@ -7042,7 +7506,24 @@ ${lines.join('\n')}
                         insertAgentResult('已取消写入：在「允许操作电脑」模式下没有确认这次操作。\n目标：' + (path || '（未提供路径）'));
                         return;
                     }
-                    result = await postJsonFromDevice('/api/agent/write', { permission, path, content }, {}, 30000);
+                    // 必须用**同源 fetch**，不能用 postJsonFromDevice。
+                    //
+                    // postJsonFromDevice 是给"外部服务商"用的：它会走本机中转
+                    // （/api/relay，用来绕开 CORS）。而 /api/agent/write 是**同源本地接口**，
+                    // 把相对路径交给中转 → 中转的 `new URL('/api/agent/write')` 解析失败 →
+                    // 报「目标地址无效」，写入**永远不可能成功**。
+                    //
+                    // 真实故障：日志里能看到 `[Relay] [WARN] 目标地址无效：/api/agent/write`，
+                    // 而 ls / read 走的是同源 fetch 所以正常 —— 表现为"读取能用、写入不行"。
+                    const res = await fetch('/api/agent/write', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ permission, path, content })
+                    });
+                    result = await res.json();
+                    // 同源 fetch 不像 postJsonFromDevice 那样带 rawText，补一份便于错误提示
+                    if (!result.rawText) result.rawText = JSON.stringify(result);
+                    if (!('ok' in result)) result.ok = res.ok;
                 } else {
                     const q = 'permission=' + encodeURIComponent(permission) + (path ? '&path=' + encodeURIComponent(path) : '');
                     const res = await fetch(`/api/agent/${action}?${q}`);
@@ -7059,48 +7540,223 @@ ${lines.join('\n')}
                 if (result.ok) {
                     let resultText;
                     if (action === 'ls') {
-                        resultText = `目录内容（${result.path || ''}）：\n` + (result.entries || []).map(e => (e.type === 'dir' ? '📁 ' : '📄 ') + e.name).join('\n');
+                        // 「（链接）」标记 Windows 的 junction（`All Users`、`My Documents` 这类）。
+                        // 它们既不是普通文件夹也不是文件，不标出来会让人以为列表列错了。
+                        const lines = (result.entries || []).map(e => {
+                            const icon = e.type === 'dir' ? '📁 ' : '📄 ';
+                            return icon + e.name + (e.link ? '（链接）' : '');
+                        });
+                        resultText = `目录内容（${result.path || ''}）：\n` + lines.join('\n');
                     } else if (action === 'read') {
                         resultText = `文件内容（${result.path || ''}）：\n${result.content || '（空文件）'}`;
                     } else {
                         resultText = `✅ 已保存到：${result.path || path}`;
                     }
-                    insertAgentResult(resultText);
+                    insertAgentResult(resultText, { continueLoop: true });
+                    agentConsecutiveFailures = 0; // 成功了就把重试预算还回去
                 } else {
                     // 失败：把原因交给 AI，让它以角色口吻自然解释（不直接甩原始错误）
+                    agentConsecutiveFailures += 1;
                     await explainAgentFailure(errMsg);
                 }
             } catch (err) {
+                agentConsecutiveFailures += 1;
                 await explainAgentFailure(err.message || String(err));
             }
         }
 
+        // 连续失败计数：AI 解释完失败原因后，允许它**自动重试一次**。
+        // 为什么需要：最常见的失败是「AI 猜错了路径」（例如桌面被移动过），而失败原因里
+        // 已经带着真实路径（见 serve.mjs 的 shellFolderHint）—— 它本来就能自己纠正，
+        // 却因为「解释失败」这条路径不执行标签而只能干等着用户说"继续"。
+        // 必须限次：否则「失败 → 解释 → 重试 → 再失败」会变成无限循环，一次误判就能刷光额度。
+        let agentConsecutiveFailures = 0;
+        const AGENT_FAILURE_MAX_RETRY = 1;
+
         // 操作失败 → AI 以角色身份自然向用户解释原因与建议（像正常对话一样）
         async function explainAgentFailure(reason) {
             const conv = getCurrentConversation();
-            if (!conv) { showCustomAlert('操作失败：' + reason, 'AI 操作结果'); return; }
+            // 失败原因里可能带着「这台电脑的真实位置」那段提示（serve.mjs 的 shellFolderHint），
+            // 原来截到 300 字会把它切掉一半，AI 就拿不到纠正所需的路径了。
+            const shortReason = String(reason).slice(0, 600);
+            if (!conv) { showCustomAlert('操作失败：' + shortReason, 'AI 操作结果'); return; }
+            const canRetry = agentConsecutiveFailures <= AGENT_FAILURE_MAX_RETRY;
+            const prompt = `（系统内部通知：刚才你尝试执行的文件操作失败了，原因：${shortReason}。`
+                + '请以你的角色身份，用自然、真诚的口吻向用户解释为什么无法完成这个操作，并给出可行的解决办法建议'
+                + '（例如检查 Agent 权限模式、路径是否正确、服务是否可用等）。不要提及"系统通知""标签"等词，'
+                + '就像你真的尝试过并遇到问题一样，自然地说明和道歉。）'
+                + (canRetry ? '\n（如果上面的原因里已经给出了正确的位置，请在解释的同时**直接用正确的路径重新发起一次操作**'
+                    + ' —— 照常输出 [操作:…] 标签，标签不会显示给用户。不要只是道歉。）' : '');
+            let raw;
             try {
-                const prompt = `（系统内部通知：刚才你尝试执行的文件操作失败了，原因：${String(reason).slice(0, 300)}。请以你的角色身份，用自然、真诚的口吻向用户解释为什么无法完成这个操作，并给出可行的解决办法建议（例如检查 Agent 权限模式、路径是否正确、服务是否可用等）。不要提及"系统通知""标签"等词，就像你真的尝试过并遇到问题一样，自然地说明和道歉。）`;
-                const raw = await callAI(prompt);
-                const text = window.Live2DCall && typeof window.Live2DCall.stripTags === 'function' ? window.Live2DCall.stripTags(raw) : raw;
+                raw = await callAI(prompt);
+            } catch (e) {
+                // 模型偶尔只回思考内容（EMPTY_MODEL_OUTPUT，思考型模型在"系统内部通知"这种
+                // 元提示上尤其容易这样），原样重试一次基本就好；再失败就只把原因显示出来，
+                // 不要把「（AI 解释失败：模型只返回了思考内容…）」这种嵌套文案甩给用户。
+                if (e instanceof ClientApiError && e.code === 'EMPTY_MODEL_OUTPUT') {
+                    try { raw = await callAI(prompt); } catch { raw = ''; }
+                } else {
+                    raw = '';
+                }
+            }
+            const text = window.Live2DCall && typeof window.Live2DCall.stripTags === 'function'
+                ? window.Live2DCall.stripTags(raw || '')
+                : (raw || '');
+            const wantsRetry = canRetry && /\[操作[:：]/.test(raw || '');
+            if (text) {
                 const aiMessage = { id: generateId(), role: 'ai', text, timestamp: new Date().toLocaleTimeString() };
                 conv.messages.push(aiMessage);
                 saveConversations();
                 if (state.currentConversationId === conv.id) renderMessage(aiMessage);
-            } catch (e) {
-                // AI 解释失败时兜底直接显示原因
-                insertAgentResult('操作失败：' + reason + (e && e.message ? `（AI 解释失败：${e.message}）` : ''));
+            } else if (!wantsRetry) {
+                // 一句可见回复都没拿到，而且也没有重试 —— 至少把原因摆出来，别让用户对着空气等。
+                //
+                // continueLoop: false 是必须的：这句是**失败说明**，不是"操作成功的结果"。
+                // 若它触发续跑，就会绕过失败路径自己的重试预算（AGENT_FAILURE_MAX_RETRY = 1），
+                // 变成"失败 → 续跑 → 再失败 → 再续跑"一直撞到续跑上限（8 次）才停 ——
+                // 两套预算互相打架，用户看到的是 AI 对着一个不存在的路径反复尝试。
+                insertAgentResult('操作失败：' + shortReason, { continueLoop: false });
+            }
+            // 解释里带了新的 [操作:…] → 真的执行它（走同一条标签管线，停止/授权照常生效）
+            if (wantsRetry && window.Live2DCall && typeof window.Live2DCall.drive === 'function') {
+                window.Live2DCall.drive(raw);
             }
         }
 
         // 把 Agent 操作结果作为一条消息插入当前对话（作为上下文，AI 下轮可参考）
-        function insertAgentResult(text) {
+        //
+        // **默认不自动续跑**，只有 `continueLoop: true` 才续跑。
+        //
+        // 为什么默认关：这个函数是 18 处调用的公共收口，其中大多数是
+        // 「无权限 / 未启用 / 用户取消 / 未识别」这类**被拒绝**的结果。
+        // 那些如果也触发续跑，就变成"被拒绝 → 续跑 → 又试一次 → 又被拒绝"的无效循环，
+        // 用户看到 AI 对着一个做不到的事反复尝试。
+        // 只有"真的做完了某件事"才值得让 AI 接着决定下一步。
+        function insertAgentResult(text, options = {}) {
             const conv = getCurrentConversation();
             if (!conv) { showCustomAlert(text, 'AI 操作结果'); return; }
             const msg = { id: generateId(), role: 'ai', text: '【AI 操作结果】\n' + text, timestamp: new Date().toLocaleTimeString() };
             conv.messages.push(msg);
             saveConversations();
             if (state.currentConversationId === conv.id) renderMessage(msg);
+            if (options.continueLoop === true) scheduleAgentContinue();
+        }
+
+        // ===== Agent 自动续跑：操作做完自己接着走，不用用户说"继续" =====
+        //
+        // 症状：AI 读取/写入/点击之后就不动了，必须用户手动说一句"继续"才走下一步。
+        //
+        // 根因是一个**不对称**：
+        //   · 失败路径 explainAgentFailure() 会调 callAI()，所以 AI 能自己解释并重试；
+        //   · 成功路径只 insertAgentResult() 把结果塞进对话，**从不调 callAI()** ——
+        //     AI 看不到"我刚做完的事"，自然不会有下一步。
+        // 日志里能直接看到：执行完 [操作:保存文件 …] 后，下一次请求的末条消息是
+        // **user**（用户手动打的"继续"），而不是由操作结果触发的续跑。
+        //
+        // 三条硬约束：
+        //   1. **有预算**：否则"读文件 → 续跑 → 再读 → 再续跑"会烧光额度。
+        //      （失败路径早就因为同样的理由加了 AGENT_FAILURE_MAX_RETRY。）
+        //   2. **用户停止后不再续跑**：停止的意义就是让 AI 停下，续跑必须让位。
+        //   3. **合并触发**：一条回复里可能有多个操作标签，结果会连着插进来 ——
+        //      用防抖合成一次续跑，否则会并发打出好几个请求。
+        const AGENT_CONTINUE_MAX_STEPS = 8;
+        const AGENT_CONTINUE_PROMPT = '（系统内部通知：你刚才发起的操作已经执行完，结果已作为'
+            + '「【AI 操作结果】」放进对话。请根据结果继续推进用户交代的任务。）\n'
+            + '规则：\n'
+            + '1. 还需要继续操作，就照常输出 [操作:…] 标签（标签不会显示给用户），系统会接着执行；\n'
+            + '2. 任务已经完成，就直接用你的角色身份自然告诉用户结果，**不要再输出任何操作标签**；\n'
+            + '3. 如果结果里显示某一步失败了或不被支持，不要重复同一步，换个方式或如实说明；\n'
+            + '4. 不要提及"系统通知""标签"这类词，就像你自己在做这件事一样。';
+        let agentContinueUsed = 0;
+        let agentContinueTimer = null;
+
+        /** 每来一条新的用户消息就重置预算（一次用户请求 = 一个预算） */
+        function resetAgentContinueBudget() {
+            agentContinueUsed = 0;
+            if (agentContinueTimer) { clearTimeout(agentContinueTimer); agentContinueTimer = null; }
+        }
+
+        function scheduleAgentContinue() {
+            if (agentContinueTimer) clearTimeout(agentContinueTimer);
+            agentContinueTimer = setTimeout(() => {
+                agentContinueTimer = null;
+                void continueAgentLoop();
+            }, 400);
+        }
+
+        async function continueAgentLoop() {
+            const rt = window.agentRuntime;
+            if (!rt) return;
+            // 用户按了停止 → 绝不再自动往下走（否则"停止"会被续跑顶掉）
+            if (typeof rt.isHalted === 'function' && rt.isHalted()) return;
+            if (agentContinueUsed >= AGENT_CONTINUE_MAX_STEPS) {
+                console.warn('[Agent] 自动续跑达到上限，停下等待用户');
+                // continueLoop: false —— 这句是系统说明，不是操作结果。
+                // 若它也触发续跑，就会"到上限 → 插提示 → 又调度 → 再到上限"无限循环。
+                insertAgentResult('（已连续自动执行 ' + AGENT_CONTINUE_MAX_STEPS + ' 步，先停在这里。'
+                    + '如果还需要继续，跟我说一声就行。）', { continueLoop: false });
+                rt.endRun();
+                return;
+            }
+            const conv = getCurrentConversation();
+            if (!conv) return;
+            agentContinueUsed += 1;
+            // 只在"还没在跑"时 beginRun：它会清空 approvedThisRun，
+            // 无条件调用会让「同一次运行内允许过就不再问」这条策略在每次续跑时失效
+            // （用户点了允许，下一步又问一遍）。runAgentPhoneOperation 也是这么写的。
+            if (!rt.isRunning()) rt.beginRun();
+            rt.setStep(rt.getStep() + 1, '继续处理');
+            console.log('[Agent] 自动续跑第 ' + agentContinueUsed + '/' + AGENT_CONTINUE_MAX_STEPS + ' 步');
+            let raw;
+            try {
+                raw = await callAI(AGENT_CONTINUE_PROMPT);
+            } catch (e) {
+                // 思考型模型在"系统内部通知"这种元提示上偶尔只回思考内容（EMPTY_MODEL_OUTPUT），
+                // 与 explainAgentFailure 同样处理：原样重试一次，再失败就安静收尾。
+                if (e instanceof ClientApiError && e.code === 'EMPTY_MODEL_OUTPUT') {
+                    try { raw = await callAI(AGENT_CONTINUE_PROMPT); } catch { raw = ''; }
+                } else {
+                    raw = '';
+                }
+            }
+            // 续跑途中用户按了停止 → 不渲染这半截回复
+            if (typeof rt.isHalted === 'function' && rt.isHalted()) return;
+            const text = window.Live2DCall && typeof window.Live2DCall.stripTags === 'function'
+                ? window.Live2DCall.stripTags(raw || '')
+                : (raw || '');
+            if (text) {
+                const aiMessage = { id: generateId(), role: 'ai', text, timestamp: new Date().toLocaleTimeString() };
+                conv.messages.push(aiMessage);
+                conv.updatedAt = new Date().toISOString();
+                saveConversations();
+                // 这三步必须和 handleUserInput 的 commitAiMessageOnce 保持一致，
+                // 否则会出现"回复已经存进对话、界面上却看不见，得再发一句才冒出来"：
+                //   · removeThinkingMessage() —— 否则"伊蕾娜正在想…"气泡一直挂着，
+                //     而新回复被压在它下面（用户以为 AI 没回）；
+                //   · 渲染前判当前会话与 notes/diary 模式 —— 在别的页面时不该往聊天区插节点；
+                //   · 渲染后更新状态与滚动。
+                removeThinkingMessage();
+                if (state.currentConversationId === conv.id && !state.notesMode && !state.diaryMode
+                    && !document.getElementById(`msg-${aiMessage.id}`)) {
+                    renderMessage(aiMessage);
+                }
+                state.voiceState = 'idle';
+                updateUI();
+            }
+            // 回复里带了新的 [操作:…] → 真的执行它（走同一条标签管线，
+            // 停止/授权照常生效；执行完又会 insertAgentResult → 继续下一步）。
+            //
+            // 判据要**同步看有没有操作标签**，不能靠"等一下再看 agentContinueTimer"：
+            // drive() 里的操作是异步的（要先弹授权、再发请求），此刻定时器还没被设上，
+            // 那样判断会误判成"AI 已收尾"而提前 endRun。
+            const hasMoreOps = /\[操作[:：]/.test(String(raw || ''));
+            if (hasMoreOps && window.Live2DCall && typeof window.Live2DCall.drive === 'function') {
+                window.Live2DCall.drive(raw || '');
+                return;   // 后续由新一轮 insertAgentResult 接力
+            }
+            // 没有操作标签 → AI 认为任务完成，结束本次运行（收起状态条）
+            rt.endRun();
         }
 
         // ===== 自然语言触发表情 =====
@@ -7136,87 +7792,15 @@ ${lines.join('\n')}
             return false;
         }
 
-        // ===== 自然语言触发文件写入 =====
-        // 用户用自然语言（如"在D盘根目录写入文件 测试.txt，内容是 测试成功"）直接触发，不依赖 AI 输出标签。
-        function parseFileWriteIntent(s) {
-            // 找路径（遇到"写/保存"等动词词尾即截断，避免"写入文件"被吞进路径）
-            let path = '';
-            let pathMatch = s.match(/([A-Za-z]:[\\/][^\s，。,;；|"'（）()：:写]*)/);
-            if (pathMatch) {
-                path = pathMatch[1].trim();
-            } else {
-                const drive = s.match(/([A-Za-z])盘\s*(根目录|桌面|用户目录)?/);
-                const fileMatch = s.match(/["']([^"']+\.(?:txt|md|json|log|ini))["']|([\w\u4e00-\u9fff.\-]+\.(?:txt|md|json|log|ini))/);
-                if (drive) {
-                    // 用户没给文件名 → 用默认文件名（"在D盘桌面创建一个TXT文件"）
-                    const fn = fileMatch ? (fileMatch[1] || fileMatch[2] || '').trim() : '伊蕾娜的留言.txt';
-                    path = drive[1].toUpperCase() + ':\\' + (drive[2] === '桌面' ? 'Desktop\\' : '') + fn;
-                }
-            }
-            if (!path) return null;
-
-            // 提取内容
-            let content = '';
-            // a) "内容[:：为是]? xxx" 句式（最明确）
-            const cm = s.match(/(?:内容|内容为|内容是)[:：为是]?\s*["']?([^"'，。；\n到为]{1,200})["']?/);
-            if (cm) content = cm[1].trim();
-            // b) 动词 + 内容 + 到/为 + 路径（如 "写入 魔法笔记 到 D:\memo.txt"）
-            if (!content) {
-                const pre = s.slice(0, s.indexOf(path));
-                const vm = pre.match(/(?:保存|写入|写到|存到)\s*(?:内容|文件)?\s*["']?([^到为"'，。；]{1,200})["']?\s*(?:到|为)\s*$/);
-                if (vm && vm[1].trim() && !/^(内容|文件)$/.test(vm[1].trim())) content = vm[1].trim();
-            }
-            // c) 祈使词 + 内容 + 保存为/到（如 "帮我把 你好呀 保存为 D:\a.txt"）
-            if (!content) {
-                const pre = s.slice(0, s.indexOf(path));
-                const verbIdx = pre.search(/(保存为|保存到|写入|写到|存到|保存)/);
-                if (verbIdx > 0) {
-                    const candidate = pre.slice(0, verbIdx).replace(/^(?:请|帮我|麻烦你|帮|把|将|给|为|到|于\s*)+/, '').trim();
-                    if (candidate && !/^(内容|文件)$/.test(candidate)) content = candidate;
-                }
-            }
-            // d) 路径之后的剩余文本（如 "写入 D:\a.txt 内容 你好" 或 "路径：内容"）
-            if (!content) {
-                const afterPath = s.slice(s.indexOf(path) + path.length).replace(/[，。；,;、：:\s]+/g, ' ').trim();
-                // 纯动词短语（"写入文件"等）不算内容 → 保持默认
-                if (!/^(写入|保存|创建|新建|写到|存到|生成|做个?文件|弄个?文件)\s*(?:文件|一个文件|txt|文本)?$/.test(afterPath)) {
-                    content = afterPath.replace(/^(内容|内容是|内容为|写入|写成|保存)\s*[:：]?\s*/, '').trim();
-                }
-            }
-            if (!content) content = '（自动写入）';
-            // 路径无文件扩展名 → 视为目录，自动补默认文件名（用户只说"在XX目录写入文件"时）
-            if (!/\.[A-Za-z0-9]{1,5}$/.test(path)) {
-                path = path.replace(/[\\/]+$/, '') + '\\伊蕾娜的笔记.txt';
-            }
-            return { path, content };
-        }
-
-        // 待写入的"AI 留言"：用户要求"写入你想说的话"时，等 AI 回复生成后把回复写入文件
-        let pendingAutoWrite = null;
-
-        function maybeAutoFileWrite(text) {
-            const s = String(text || '').trim();
-            if (!s) return false;
-            // 删除/修改意图：明确提示无权限（不执行任何操作）
-            if (/(删除|删掉|移除|清除|重命名|改名).*(文件|[A-Za-z]:[\\/]|盘|\.txt|\.md|\.json)/.test(s)) {
-                insertAgentResult('AI 没有删除/修改文件的权限（仅可查看、读取、新建文件），删除请手动操作。');
-                return true;
-            }
-            if (!/(写入|保存|写到|存到|创建文件|新建文件)/.test(s)) return false;
-            if (!/(文件|盘|[A-Za-z]:[\\/]|\.txt|\.md|\.json|\.log|\\\\|\/)/.test(s)) return false;
-            const parsed = parseFileWriteIntent(s);
-            if (!parsed) return false;
-            const permission = state.settings.agentPermission || 'app';
-            // "写入你想说的话/随便写/你的话" → 等 AI 回复生成后，把回复内容写入文件
-            if (/(你想说|想说的话|你的话|随便写|自由发挥|随你写)/.test(s)) {
-                pendingAutoWrite = { path: parsed.path, permission };
-                console.log('[Agent] 待 AI 回复后写入留言:', parsed.path);
-                return true;
-            }
-            console.log('[Agent] 自然语言触发写文件:', parsed);
-            void doAgentFile('write', parsed, permission);
-            return true;
-        }
+        // ===== 自然语言触发文件写入（已移除）=====
+        // 这里原来有 parseFileWriteIntent() / maybeAutoFileWrite() / pendingAutoWrite：
+        // 用户在消息里说"在D盘写入文件 xxx"时，**由前端正则直接执行写文件**，不经过 AI。
+        //
+        // 已整体删除，原因见 handleUserInput 里的说明（绕过 AI、正则误伤、与授权脱节）。
+        // 注意 pendingAutoWrite 也一并删掉了 —— 它唯一的写入者就是 maybeAutoFileWrite，
+        // 留着会让 commitAiMessageOnce 里那段"待写入 AI 留言"成为永远进不去的死分支，
+        // 而它还会调 doAgentFile('write')，属于"看起来能用、实际永不可达"的陷阱代码。
+        // 现在"把你想说的话写进文件"由 AI 输出 [操作:保存文件 …] 完成。
 
         // ==================== AI 定时任务（未来任务） ====================
         // LLM 回复可用 [任务:每天 09:00 提醒我喝水] 等创建定时任务；到点 AI 自动以角色身份发消息。
@@ -7820,8 +8404,10 @@ ${lines.join('\n')}
 
                 elements.customModal.classList.remove('hidden');
                 elements.customModal.classList.add('flex');
-                // 弹窗必须显示在 Live2D 通话界面（z-index 99999）之上
-                elements.customModal.style.zIndex = '100001';
+                // 层级不在这里设：.modal-overlay 上的 z-index !important 会让内联值完全失效，
+                // 写了也只是看着像生效（曾经写过一个 panelOpen ? '100003' : '100001' 的分支，
+                // 实际上永远走不到 100001）。真正的分层写在样式表的
+                // 「弹窗之间的层叠顺序必须写死」那段 —— #customModal 是 100003，永远在最上面。
 
                 let settled = false;
                 const done = (value) => {
@@ -10013,9 +10599,18 @@ ${lines.join('\n')}
                 conversation = state.conversations.find(c => c.id === state.currentConversationId);
             }
             if (!conversation) return;
-            // 自然语言触发：用户消息包含"写入/保存文件 到 路径"等意图时，直接执行文件操作（不依赖 AI 标签）
-            maybeAutoFileWrite(String(message?.text || ''));
-            // 自然语言触发表情：用户明确要求"做出XX表情"时直接驱动 Live2D
+            // 自然语言**不再**直接触发文件操作。
+            //
+            // 原实现（maybeAutoFileWrite）会在把消息发给 AI **之前**做正则匹配，
+            // 命中「写入/保存 + 文件/盘/D:\/.txt」就直接执行 —— 也就是**用户打的字本身
+            // 就是触发源，与 AI 无关**。这带来三个问题：
+            //   1. 绕过 AI：AI 全程不知情，对话里只有一条「【AI 操作结果】」；
+            //   2. 正则误伤：聊到 `D:\...` 这种写法就可能被当成指令；
+            //   3. 与授权脱节：写文件会弹确认框，但读/列目录不会 —— 用户感觉"我就说句话它怎么动了"。
+            //
+            // 现在一律交给 AI 判断：由它决定要不要输出 [操作:…] 标签，
+            // 行为可预测、AI 全程知情、也走同一条「停止 + 授权」管线。
+            // （maybeAutoExpression 保留：它只驱动 Live2D 表情，不碰文件与系统。）
             maybeAutoExpression(String(message?.text || ''));
             const replyTaskKey = `${conversation.id}:${message.id}`;
             if (activeReplyTasks.has(replyTaskKey)) {
@@ -10024,6 +10619,10 @@ ${lines.join('\n')}
             }
             activeReplyTasks.add(replyTaskKey);
             let automaticVoiceMessageKey = '';
+            // 新一轮用户请求 → 重置 Agent 续跑预算。
+            // 不重置的话预算是"整个页面会话共享 8 步"，用过一次就再也不续跑了 ——
+            // 用户会看到"第一次能用、后面又不动了"这种更难查的现象。
+            resetAgentContinueBudget();
 
             const t0 = performance.now();
 
@@ -10088,13 +10687,9 @@ ${lines.join('\n')}
                     conversation.messages.push(aiMessage);
                     conversation.updatedAt = new Date().toISOString();
                     saveConversations();
-                    // 用户要求"写入你想说的话"→ 把 AI 回复内容写入文件
-                    if (pendingAutoWrite) {
-                        const pw = pendingAutoWrite;
-                        pendingAutoWrite = null;
-                        console.log('[Agent] 写入 AI 留言:', pw.path);
-                        void doAgentFile('write', { path: pw.path, content: aiMessage.text || '' }, pw.permission);
-                    }
+                    // （原来这里有一段 pendingAutoWrite："用户说写入你想说的话"时把 AI 回复写进文件。
+                    //   它唯一的写入者是已删除的 maybeAutoFileWrite，属于永不可达的死分支，一并移除。
+                    //   现在这个需求由 AI 输出 [操作:保存文件 …] 完成。）
                     renderFolderList();
                     updateCurrentConversationTitle();
                     removeThinkingMessage();
@@ -10938,10 +11533,12 @@ ${lines.join('\n')}
 
         // 把 state.settings / state.characterCard 填充到设置表单（打开设置 / 恢复默认后调用）
         function fillSettingsForm() {
-            elements.settingApiFormat.value = state.settings.apiFormat || 'openai';
-            elements.settingProviderMode.value = state.settings.providerMode || DEFAULT_SETTINGS.providerMode;
-            elements.settingBaseUrl.value = state.settings.baseUrl || DEFAULT_SETTINGS.baseUrl;
-            elements.settingChatModel.value = state.settings.model || DEFAULT_SETTINGS.model;
+            // 回落用"当前格式"的预设，不要用 DEFAULT_SETTINGS —— 后者写死 DeepSeek 的地址和模型，
+            // 选 Anthropic 时清空输入框会回落到 DeepSeek 的 URL，看起来像"格式没生效"。
+            const fillPreset = CHAT_API_FORMATS[state.settings.apiFormat] || CHAT_API_FORMATS['openai-compatible'];
+            elements.settingApiFormat.value = state.settings.apiFormat || 'openai-compatible';
+            elements.settingBaseUrl.value = state.settings.baseUrl || fillPreset.defaultBaseUrl;
+            elements.settingChatModel.value = state.settings.model || fillPreset.defaultModel;
             elements.settingApiKey.value = state.settings.apiKey;
             elements.settingTtsProvider.value = state.settings.ttsProvider || 'minimax';
             document.getElementById('settingMinimaxApiKey').value = state.settings.minimaxApiKey || '';
@@ -10975,7 +11572,7 @@ ${lines.join('\n')}
             document.querySelectorAll('input[name="asrProvider"]').forEach(r => {
                 r.checked = (r.value === (state.settings.asrProvider || 'browser'));
             });
-            updateProviderModeUI();
+            updateChatFormatUI();
             updateAsrProviderUI();
             updateTtsProviderUI();
 
@@ -11001,6 +11598,330 @@ ${lines.join('\n')}
             fillCharacterCardForm();
             settingsContent.scrollTop = 0;
             renderScheduledTaskList();
+            void refreshLogSettings();
+            void refreshDataSettings();
+        }
+
+        // ==================== 日志设置（服务端） ====================
+        // 与其它设置不同：日志级别存在**服务端**（data/logs/log-settings.json），因为它管的是
+        // 服务进程往文件里写什么，跟浏览器无关。所以它不进 state.settings，也不等「保存设置」，
+        // 改完立刻 POST 生效 —— 否则用户会以为改完没生效（要重启服务才生效的话更是如此）。
+        const LOG_LEVEL_HINT = {
+            DEBUG: '最详细，含前端调试信息',
+            INFO: '默认，日常排查够用',
+            WARN: '只看警告与报错',
+            ERROR: '只看报错',
+            CRITICAL: '只看致命错误（如端口占用）',
+        };
+
+        function renderLogLevelHint() {
+            const sel = elements.settingLogLevel;
+            const hint = document.getElementById('settingLogLevelHint');
+            if (!sel || !hint) return;
+            hint.textContent = LOG_LEVEL_HINT[sel.value] || '';
+        }
+
+        async function refreshLogSettings() {
+            const box = document.getElementById('logStatusBox');
+            const sel = elements.settingLogLevel;
+            const traceBox = elements.settingLogTrace;
+            const section = document.getElementById('logSettingsSection');
+            if (!box) return;
+            try {
+                const res = await fetch('/api/logs/settings');
+                if (!res.ok) { box.textContent = '无法读取日志设置（HTTP ' + res.status + '）'; return; }
+                const json = await res.json();
+                if (!json.ok) { box.textContent = '无法读取日志设置'; return; }
+                if (sel) sel.value = json.level || 'INFO';
+                if (traceBox) traceBox.checked = Boolean(json.trace);
+                renderLogLevelHint();
+                if (!json.fileEnabled) {
+                    box.textContent = '当前以 LOG_TO_FILE=0 启动，日志不落盘，级别设置不生效（只打终端）。';
+                    return;
+                }
+                const files = [];
+                if (json.mainFile) files.push('主日志 ' + json.mainFile);
+                if (json.trace && json.traceFile) files.push('追踪日志 ' + json.traceFile);
+                box.innerHTML = '当前落盘级别 <code class="text-indigo-500">' + escapeHtml(json.level || 'INFO')
+                    + '</code>，每次启动一组文件、保留最近 ' + escapeHtml(String(json.keep || 10)) + ' 次，'
+                    + '单文件上限 ' + escapeHtml(String(json.maxMb || 8)) + 'MB。<br>'
+                    + '位置：<code class="text-indigo-500">' + escapeHtml(json.logDir || 'data/logs') + '</code>'
+                    + (files.length ? '<br>' + files.map(f => escapeHtml(f)).join('<br>') : '');
+            } catch (e) {
+                // 安卓 App（Capacitor 本地文件）没有本地服务：日志落盘这件事在 APK 上根本不存在。
+                // 整块隐藏，而不是留一个能点、点了却弹"修改失败"的下拉框 —— 那比没有更糟。
+                // （与「电脑操作权限」按设备形态隐藏是同一种处理。）
+                if (section) section.classList.add('hidden');
+            }
+        }
+
+        async function applyLogSettings() {
+            const sel = elements.settingLogLevel;
+            const traceBox = elements.settingLogTrace;
+            if (!sel) return;
+            // 整块已被隐藏（无本地服务）时不再发请求：否则会弹出"修改失败"，
+            // 而用户在 APK 上本来就没有这个功能，弹窗只会让人以为坏了。
+            const section = document.getElementById('logSettingsSection');
+            if (section && section.classList.contains('hidden')) return;
+            try {
+                const res = await fetch('/api/logs/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        level: sel.value,
+                        trace: traceBox ? traceBox.checked : undefined
+                    })
+                });
+                const json = await res.json();
+                if (!json.ok) { showCustomAlert(json.message || '日志设置修改失败', '日志'); return; }
+                await refreshLogSettings();
+            } catch (e) {
+                showCustomAlert('日志设置修改失败：' + (e.message || e), '日志');
+            }
+        }
+
+        // ==================== 我的数据（导出 / 导入 / 位置） ====================
+        // 后端把数据分类落在 data/ 下（人设卡一卡一文件、聊天记录、记忆各自独立）。
+        // 这里只负责"让用户能看见、能备份、能恢复" —— 换机器和升级前的那道保险。
+        //
+        // 两种运行环境，两条路径：
+        //   Web：数据在服务端 data/ 下 → 走 /api/data/*
+        //   APK：没有本地服务 → 走 web/js/chat-backup.js，直接读写 localStorage
+        //
+        // **APK 侧以前是整块隐藏的**，但那恰恰是最需要备份的地方 ——
+        // 数据存在应用私有目录，卸载即丢，用户连手动拷出来都做不到。
+        // 现在两边都提供导入导出，而且备份格式同构，可以互相导入。
+        async function refreshDataSettings() {
+            const box = document.getElementById('dataStatusBox');
+            const section = document.getElementById('dataSettingsSection');
+            if (!box) return;
+
+            // ---- APK：本地统计，不发请求 ----
+            if (IS_NATIVE_APP && window.ChatBackup) {
+                try {
+                    let cards = 0;
+                    let convs = 0;
+                    let mem = 0;
+                    try { cards = JSON.parse(localStorage.getItem('elaina_open_character_cards') || '[]').length; } catch { /* 忽略 */ }
+                    try { convs = JSON.parse(localStorage.getItem('elaina_open_conversations') || '[]').length; } catch { /* 忽略 */ }
+                    try { mem = (JSON.parse(localStorage.getItem('elaina_open_memory_core') || '{}').diary || []).length; } catch { /* 忽略 */ }
+                    box.innerHTML = '数据位置：<code class="text-indigo-500">应用私有目录</code>'
+                        + '<span class="text-indigo-300">（安卓应用数据，卸载会一并删除）</span><br>'
+                        + '人设卡 <b>' + escapeHtml(String(cards)) + '</b> 张'
+                        + ' · 对话 <b>' + escapeHtml(String(convs)) + '</b> 个'
+                        + ' · 记忆 <b>' + escapeHtml(String(mem)) + '</b> 条';
+                } catch (e) {
+                    box.textContent = '无法读取本地数据统计';
+                }
+                return;
+            }
+
+            // ---- Web：走后端 ----
+            try {
+                const res = await fetch('/api/data/info');
+                if (!res.ok) { if (section) section.classList.add('hidden'); return; }
+                const json = await res.json();
+                if (!json.ok) { if (section) section.classList.add('hidden'); return; }
+                const c = json.counts || {};
+                box.innerHTML = '数据位置：<code class="text-indigo-500">' + escapeHtml(json.dir || 'data')
+                    + '</code><br>'
+                    + '人设卡 <b>' + escapeHtml(String(c.characters || 0)) + '</b> 张'
+                    + ' · 对话 <b>' + escapeHtml(String(c.conversations || 0)) + '</b> 个'
+                    + ' · 记忆 <b>' + escapeHtml(String(c.memoryEntries || 0)) + '</b> 条';
+            } catch (e) {
+                if (section) section.classList.add('hidden');
+            }
+        }
+
+        function setDataHint(text, isError) {
+            const hint = document.getElementById('dataActionHint');
+            if (!hint) return;
+            hint.textContent = text || '';
+            hint.className = isError ? 'text-[11px] text-red-500' : 'text-[11px] text-indigo-300';
+        }
+
+        async function exportDataBackup() {
+            setDataHint('导出中…');
+
+            // ---- APK：本地生成 zip 并**写进应用文档目录**（没有后端可用）----
+            //
+            // 为什么不用 <a download> + blob URL：**安卓 WebView 不处理 blob: 下载**。
+            // 桌面浏览器会把 blob 交给下载器，WebView 里点下去通常毫无反应
+            //（这也是 Capacitor 社区反复提到的一点）。所以 APK 侧走 Capacitor Filesystem，
+            // 把备份真正写到磁盘上，再把路径告诉用户。
+            if (IS_NATIVE_APP && window.ChatBackup) {
+                try {
+                    const fs = nativeFs();
+                    if (!fs) { setDataHint('导出失败：文件系统插件不可用', true); return; }
+                    const blob = await window.ChatBackup.buildBackupBlob();
+                    if (!blob.size) { setDataHint('导出失败：本地数据为空', true); return; }
+                    const bytes = new Uint8Array(await blob.arrayBuffer());
+                    const t = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+                    const fileName = 'elainachat-backup-' + t + '.zip';
+                    // Documents 目录：用户能用系统文件管理器找到（比 Data 私有目录友好）
+                    const dir = (fs.Directory && fs.Directory.Documents) ? fs.Directory.Documents : 'DOCUMENTS';
+                    await nativeWriteFile(fileName, dir, bytes);
+                    // 同时取一个 WebView 能访问的 URL，方便用户直接点开/分享
+                    let where = '文档目录';
+                    try {
+                        const uri = await fs.getUri({ path: fileName, directory: dir });
+                        if (uri && uri.uri) where = uri.uri;
+                    } catch { /* 拿不到就只报目录名 */ }
+                    setDataHint('已导出：' + fileName + '（' + Math.round(bytes.length / 1024) + ' KB）');
+                    showCustomAlert(
+                        '备份已保存到手机的**文档目录**：\n\n' + fileName
+                        + '\n\n大小 ' + Math.round(bytes.length / 1024) + ' KB。'
+                        + '\n\n用系统「文件管理」进 文档 / Documents 就能看到它。'
+                        + '传到电脑后，在网页版的「我的数据 → 导入备份」里可以直接还原。',
+                        '导出完成');
+                } catch (e) {
+                    setDataHint('导出失败：' + (e.message || e), true);
+                }
+                return;
+            }
+
+            // ---- Web：走后端 ----
+            try {
+                const res = await fetch('/api/data/export');
+                if (!res.ok) { setDataHint('导出失败（HTTP ' + res.status + '）', true); return; }
+                const blob = await res.blob();
+                // 空响应要明确报错，而不是静默存下一个 0 字节文件。
+                // 什么时候会空：装了迅雷/FDM 之类下载器的浏览器，其扩展会拦走带
+                // attachment 的响应（后端已刻意不发那个头，但旧版服务或别的中间层
+                // 仍可能造成空响应）。这种情况用户拿到的文件是坏的，必须说出来。
+                if (!blob.size) {
+                    setDataHint('导出失败：服务端返回了空内容。若装了迅雷/FDM，请先关掉它的浏览器扩展再试。', true);
+                    return;
+                }
+                // 文件名走自定义头（后端不再发 Content-Disposition，避免被下载器识别成下载）
+                let name = res.headers.get('X-Backup-Filename') || '';
+                if (!name) {
+                    const cd = res.headers.get('Content-Disposition') || '';
+                    const m = cd.match(/filename="?([^";]+)"?/);
+                    if (m && m[1]) name = m[1];
+                }
+                if (!name) {
+                    const t = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+                    name = 'elainachat-backup-' + t + '.zip';
+                }
+                // blob: 是内存地址，外部下载器接管不了，也不会弹它的窗口
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = name;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 10000);
+                setDataHint('已导出：' + name + '（' + Math.round(blob.size / 1024) + ' KB）');
+            } catch (e) {
+                setDataHint('导出失败：' + (e.message || e), true);
+            }
+        }
+
+        /**
+         * APK 侧导入入口：先看文档目录里有没有导出过的备份，有就让用户选；
+         * 一个都没有（或插件不可用）时退回系统文件选择器。
+         *
+         * 为什么要有这条路径：安卓 WebView 的 <input type="file"> 行为在各厂商 ROM 上
+         * 差异很大（有的能选、有的只能选图片）。而"自己导出的备份就在文档目录里"是
+         * **最常见的使用场景**（导完想恢复），走 Filesystem 读取最可靠。
+         */
+        async function importFromDocumentsOrPicker() {
+            const fs = nativeFs();
+            let names = [];
+            try {
+                const dir = (fs.Directory && fs.Directory.Documents) ? fs.Directory.Documents : 'DOCUMENTS';
+                const res = await fs.readdir({ path: '', directory: dir });
+                names = (res && res.files ? res.files : [])
+                    .filter((f) => /^elainachat-backup-.*\.(zip|json)$/i.test(f.name))
+                    .map((f) => f.name)
+                    .sort()
+                    .reverse();   // 最新的排前面
+            } catch { /* 目录读不到就当没有 */ }
+
+            if (!names.length) {
+                // 没有备份 → 交给系统文件选择器（用户可能从微信/下载目录里选了传进来的）
+                document.getElementById('dataImportFile')?.click();
+                return;
+            }
+
+            const picked = await showCustomModal({
+                title: '从手机里选择备份',
+                message: '文档目录里找到 ' + names.length + ' 个备份（最新的在最前）：\n\n'
+                    + names.slice(0, 8).map((n, i) => (i + 1) + '. ' + n).join('\n')
+                    + (names.length > 8 ? '\n…还有 ' + (names.length - 8) + ' 个' : '')
+                    + '\n\n输入序号导入；留空则改用系统文件选择器。',
+                input: true,
+                defaultValue: '1',
+                placeholder: '序号，如 1',
+            });
+            if (picked === null || picked === undefined || String(picked).trim() === '') {
+                document.getElementById('dataImportFile')?.click();
+                return;
+            }
+            const idx = Number(String(picked).trim()) - 1;
+            if (!Number.isInteger(idx) || idx < 0 || idx >= names.length) {
+                setDataHint('序号无效', true);
+                return;
+            }
+            const fileName = names[idx];
+            try {
+                const dir = (fs.Directory && fs.Directory.Documents) ? fs.Directory.Documents : 'DOCUMENTS';
+                const read = await fs.readFile({ path: fileName, directory: dir });
+                // Capacitor 返回 base64（v7 起固定返回 data 字段）
+                const b64 = String(read && read.data ? read.data : '');
+                if (!b64) { setDataHint('读不到文件内容', true); return; }
+                const bin = atob(b64);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                const file = new File([bytes], fileName, { type: 'application/zip' });
+                await importDataBackup(file);
+            } catch (e) {
+                setDataHint('读取备份失败：' + (e.message || e), true);
+            }
+        }
+
+        async function importDataBackup(file) {
+            if (!file) return;
+            // 合并模式：只覆盖备份里有的数据，本机其它数据不动 —— 比"替换"安全得多，
+            // 所以默认用它，且不做二次确认之外的额外询问。
+            const okToGo = await showCustomConfirm(
+                '导入备份会覆盖同名的数据（聊天记录 / 人设卡 / 记忆 / 设置），本机其它数据保留。\n\n'
+                + '继续导入吗？', '导入备份');
+            if (!okToGo) { setDataHint('已取消'); return; }
+            setDataHint('导入中…');
+
+            // ---- APK：本地写回 localStorage（没有后端可用）----
+            if (IS_NATIVE_APP && window.ChatBackup) {
+                try {
+                    const r = await window.ChatBackup.applyBackup(file);
+                    setDataHint('已导入 ' + r.keys + ' 项数据（' + (r.source === 'zip' ? 'zip' : '旧版 JSON') + '）');
+                    await refreshDataSettings();
+                    showCustomAlert('已导入 ' + r.keys + ' 项数据。\n\n刷新页面后即可看到导入的聊天记录与人设卡。', '导入完成');
+                } catch (e) {
+                    setDataHint('导入失败：' + (e.message || e), true);
+                }
+                return;
+            }
+
+            // ---- Web：交给后端 ----
+            try {
+                // 直接把文件原样发上去：备份是 zip（二进制），不能走 JSON 包装。
+                // 后端两种都认（zip 与 v1 的单 JSON 旧备份），所以这里不用判断类型。
+                const res = await fetch('/api/data/import?mode=merge', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                    body: file
+                });
+                const json = await res.json().catch(() => ({ ok: false, message: '服务端返回了非 JSON 内容（HTTP ' + res.status + '）' }));
+                if (!json.ok) { setDataHint(json.message || '导入失败', true); return; }
+                setDataHint(json.message || '导入完成');
+                await refreshDataSettings();
+                showCustomAlert((json.message || '导入完成') + '。\n\n刷新页面后即可看到导入的聊天记录与人设卡。', '导入完成');
+            } catch (e) {
+                setDataHint('导入失败：' + (e.message || e), true);
+            }
         }
 
         // ==================== 访问密码（局域网鉴权） ====================
@@ -11105,35 +12026,42 @@ ${lines.join('\n')}
             elements.dashscopeTtsFields?.classList.toggle('hidden', provider !== 'dashscope');
         }
 
-        function updateProviderModeUI() {
-            const apiFormat = elements.settingApiFormat.value || 'openai';
-            const preset = CHAT_API_FORMATS[apiFormat] || CHAT_API_FORMATS.openai;
-            const direct = elements.settingProviderMode.value === 'direct';
-            if (direct) elements.settingBaseUrl.value = preset.defaultBaseUrl;
-            elements.settingBaseUrl.readOnly = direct;
+        // 只负责"刷新提示文案 + 占位符"，不再改写 Base URL 的值。
+        // 以前这里会因为「请求模式 = 直接连接」把输入框锁成只读并强行覆盖成预设地址，
+        // 用户想用自建中转时根本没地方改 —— 那个下拉已删除。
+        function updateChatFormatUI() {
+            const apiFormat = elements.settingApiFormat.value || 'openai-compatible';
+            const preset = CHAT_API_FORMATS[apiFormat] || CHAT_API_FORMATS['openai-compatible'];
+            elements.settingBaseUrl.readOnly = false;
             elements.settingChatModel.placeholder = preset.defaultModel;
-            elements.settingApiKey.placeholder = apiFormat === 'ollama'
+            const currentBase = String(elements.settingBaseUrl.value || '').trim();
+            const looksLocal = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?/i.test(currentBase);
+            elements.settingApiKey.placeholder = looksLocal
                 ? '本地服务可留空；远程服务按需填写'
-                : (apiFormat === 'dashscope'
+                : (/dashscope\.aliyuncs\.com/i.test(currentBase)
                     ? 'sk-...（留空则复用语音里已填的 DashScope Key）'
                     : 'sk-...（只保存在本机）');
-            const label = preset.label;
-            elements.providerModeHint.textContent = direct
-                ? `请求从当前设备直接发给 ${label}，不经过作者服务器。Android Key 使用系统 Keystore 加密；Web Key 仅保存在当前标签页会话。`
-                : `请求只发往你填写的 ${label} Base URL；请使用自己信任的服务，并确认它允许浏览器跨域请求。`;
+            // 每个格式"什么时候该选它"直接写在旁边。
+            // 选错格式报的错完全看不出是格式选错，这句话放在这里比放在文档里有用的多。
+            const hintEl = document.getElementById('apiFormatHint');
+            if (hintEl) hintEl.textContent = preset.hint || '';
+            if (elements.chatFormatHint) {
+                elements.chatFormatHint.textContent = `请求从当前设备直接发给 ${preset.label}，不经过作者服务器。Android Key 使用系统 Keystore 加密；Web Key 仅保存在当前标签页会话。`;
+            }
         }
 
         function readProviderSettingsForm() {
-            const providerMode = elements.settingProviderMode.value === 'custom-proxy' ? 'custom-proxy' : 'direct';
-            const apiFormat = elements.settingApiFormat.value || 'openai';
-            const preset = CHAT_API_FORMATS[apiFormat] || CHAT_API_FORMATS.openai;
+            const apiFormat = elements.settingApiFormat.value || 'openai-compatible';
+            const preset = CHAT_API_FORMATS[apiFormat] || CHAT_API_FORMATS['openai-compatible'];
             return {
                 ...state.settings,
                 apiProvider: DEFAULT_SETTINGS.apiProvider,
                 apiFormat,
-                providerMode,
-                baseUrl: providerMode === 'direct' ? preset.defaultBaseUrl : elements.settingBaseUrl.value.trim(),
-                model: elements.settingChatModel.value.trim() || DEFAULT_SETTINGS.model,
+                baseUrl: elements.settingBaseUrl.value.trim() || preset.defaultBaseUrl,
+                // 回落必须用"当前格式"的默认模型，不能用 DEFAULT_SETTINGS.model ——
+                // 后者硬编码 deepseek-chat，选 Anthropic 时清空模型框就会把 deepseek-chat 发过去，
+                // 而 placeholder 显示的却是 Claude 的模型名，界面上完全看不出来。
+                model: elements.settingChatModel.value.trim() || preset.defaultModel,
                 apiKey: elements.settingApiKey.value.trim(),
                 minimaxApiKey: document.getElementById('settingMinimaxApiKey')?.value.trim() || '',
                 minimaxVoice: document.getElementById('settingMinimaxVoice')?.value.trim() || '',
@@ -11391,32 +12319,124 @@ ${card.characterPrompt}
             document.getElementById('resetSettingsBtn')?.addEventListener('click', restoreDefaultSettings);
             document.getElementById('authChangeBtn')?.addEventListener('click', changeAccessPassword);
             document.getElementById('authLogoutBtn')?.addEventListener('click', logoutAccess);
-            // 获取模型列表（OpenAI 兼容 /v1/models）
-            async function fetchOpenAIModelList(baseUrl, apiKey) {
+            // 日志设置：改完立即生效（服务端运行时热更新），不需要点「保存设置」
+            elements.settingLogLevel?.addEventListener('change', () => { renderLogLevelHint(); void applyLogSettings(); });
+            elements.settingLogTrace?.addEventListener('change', () => { void applyLogSettings(); });
+            // 我的数据：导出直接下载备份，导入选文件后合并进 data/
+            document.getElementById('dataExportBtn')?.addEventListener('click', exportDataBackup);
+            document.getElementById('dataImportBtn')?.addEventListener('click', () => {
+                // APK 优先让用户从**已经导出到文档目录的备份**里挑（纯 Filesystem，不依赖 WebView 的文件选择器）；
+                // 挑不到（没有备份 / 插件不可用）再退回系统文件选择器。
+                if (IS_NATIVE_APP && nativeFs()) { void importFromDocumentsOrPicker(); return; }
+                document.getElementById('dataImportFile')?.click();
+            });
+            document.getElementById('dataImportFile')?.addEventListener('change', (ev) => {
+                const input = ev.target;
+                const file = input.files && input.files[0];
+                // 先清空 value：同一个文件连选两次也要能触发 change
+                input.value = '';
+                void importDataBackup(file);
+            });
+            // 获取模型列表。**三种格式都支持** —— Anthropic 也有 Models API（`GET /v1/models`），
+            // 返回 `{ data: [{ id, display_name, … }] }`，和 OpenAI 的 `{ data: [{ id }] }` 同构，
+            // 所以解析逻辑可以共用，差别只在**地址**和**认证头**。
+            // 以前这里写着"Anthropic 不可用"，其实不是它没这个接口，是地址拼错了（见 modelsEndpointFor）。
+
+            /**
+             * 模型列表接口的地址。
+             *
+             * 版本段是唯一的坑：OpenAI 系的 Base URL 惯例上**就带** `/v1`
+             * （默认值就是 `https://api.openai.com/v1`），所以和发对话一样直接拼 `/models`；
+             * Anthropic 的惯例是**不带**（默认 `https://api.anthropic.com`），而它的 Models API 在
+             * `/v1/models` —— 直接拼 `/models` 会 404。
+             *
+             * 这条规则必须和 `web/js/chat-providers.js` 里 `callAnthropicChat` 拼 `/messages` 的规则保持一致，
+             * 否则会出现"对话能通、获取模型 404"这种最费解的现象。
+             */
+            function modelsEndpointFor(baseUrl, apiFormat) {
                 let base = String(baseUrl || '').trim().replace(/\/+$/, '');
                 if (!base) throw new Error('请先填写 API Base URL');
-                if (/\/chat\/completions$/i.test(base)) base = base.replace(/\/chat\/completions$/i, '');
-                const endpoint = /\/models$/i.test(base) ? base : base + '/models';
-                const response = await fetchWithTimeout(endpoint, {
-                    method: 'GET',
-                    headers: { Authorization: 'Bearer ' + String(apiKey || '').trim() }
-                }, 20000);
-                const raw = await response.text();
-                if (!response.ok) {
-                    let msg = 'HTTP ' + response.status;
-                    try { const j = JSON.parse(raw); msg = j?.error?.message || j?.message || msg; } catch { /* ignore */ }
-                    throw new Error(msg);
-                }
-                let payload;
-                try { payload = JSON.parse(raw); } catch { throw new Error('接口返回不是有效 JSON'); }
-                const models = ((payload && payload.data) || []).map(m => m && m.id).filter(Boolean);
-                return models.sort((a, b) => String(a).localeCompare(String(b)));
+                // 用户可能把完整的功能地址整条粘进来（chat/completions、responses、messages），先剥掉再拼
+                base = base.replace(/\/(?:chat\/completions|responses|messages)$/i, '');
+                if (/\/models$/i.test(base)) return base;
+                if (apiFormat === 'anthropic' && !/\/v\d+$/i.test(base)) return base + '/v1/models';
+                return base + '/models';
             }
-            async function populateModelSelect({ btn, input, select, baseUrl, apiKey }) {
+
+            /** 从模型列表响应里取模型名（OpenAI 与 Anthropic 的 `data[].id` 同构） */
+            function parseModelList(payload) {
+                const raw = Array.isArray(payload?.data) ? payload.data : [];
+                return raw
+                    .map(item => (typeof item === 'string' ? item : item?.id))
+                    .filter(Boolean)
+                    .map(String)
+                    .sort((a, b) => a.localeCompare(b));
+            }
+
+            async function fetchModelList(baseUrl, apiKey, apiFormat) {
+                const endpoint = modelsEndpointFor(baseUrl, apiFormat);
+                const key = String(apiKey || '').trim();
+                // Anthropic 的认证头是 x-api-key，不是 Authorization: Bearer —— 用错了会 401，
+                // 而它只回 authentication_error，看不出是头用错了。
+                // 但第三方中转（new-api 系）的 /v1/models 常常只认 Bearer，所以失败后**退一步再试**。
+                // `limit=1000` 是 Anthropic 的上限（默认只回 20 条，不指定会静默截断）。
+                const attempts = apiFormat === 'anthropic'
+                    ? [
+                        { url: endpoint + '?limit=1000', headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } },
+                        { url: endpoint, headers: { Authorization: 'Bearer ' + key } }
+                    ]
+                    : [{ url: endpoint, headers: { Authorization: 'Bearer ' + key } }];
+                let failure = null;
+                for (const attempt of attempts) {
+                    let result;
+                    try {
+                        // 关键：走设备层，不要裸 fetch。
+                        // APK 的 WebView 里裸 fetch 会撞 CORS，而服务商并不都发 CORS 头 ——
+                        // 这正是「获取模型」在手机上一直失败的原因。
+                        result = await getJsonFromDevice(attempt.url, attempt.headers, 20000);
+                    } catch (error) {
+                        // 连不上 / 被中断：换一条路也一样，别白打第二次
+                        if (!failure) failure = error;
+                        break;
+                    }
+                    const models = result.ok ? parseModelList(result.payload) : [];
+                    if (models.length) return models;
+                    if (!failure) {
+                        const fromPayload = result.payload?.error?.message || result.payload?.message || '';
+                        // 200 却拿回 HTML —— 这是"地址少了版本段"最典型的症状：请求打到了
+                        // 站点首页/网关页，而不是 API。原来的文案说"可能该服务不支持 /models"，
+                        // 会把人引到完全错误的方向。
+                        // 实测：`https://newapi.gay/models` → text/html 首页；
+                        //       `https://newapi.gay/v1/models` 才是真接口。
+                        const looksHtml = /^\s*<(!doctype|html|head|body)/i.test(String(result.rawText || ''));
+                        const baseNoModels = endpoint.replace(/\/models$/, '');
+                        if (!result.ok) {
+                            failure = new Error(fromPayload || ('HTTP ' + result.status));
+                        } else if (looksHtml) {
+                            failure = new Error('接口返回的是网页（HTML），不是 API 响应'
+                                + '\n· 实际请求：' + attempt.url
+                                + '\n· 多半是 Base URL 少了版本段，试试：' + baseNoModels + '/v1'
+                                + '\n  （OpenAI 兼容的 Base URL 惯例上就带 /v1，例如 https://api.deepseek.com/v1）');
+                        } else if (result.payload === null) {
+                            failure = new Error('接口返回的不是有效 JSON'
+                                + '\n· 实际请求：' + attempt.url
+                                + '\n· 原文开头：' + String(result.rawText || '(空)').slice(0, 120));
+                        } else {
+                            failure = new Error('接口返回的 JSON 里没有模型列表（data 为空）'
+                                + '\n· 实际请求：' + attempt.url
+                                + '\n· 如果这个服务确实有模型，可能是它的 /models 路径不同，或该账号下没有可用模型。');
+                        }
+                    }
+                    // 只有"这条路明显走不通"才换下一条。5xx / 超时换一条也一样失败。
+                    if (![401, 403, 404].includes(Number(result.status))) break;
+                }
+                throw failure || new Error('获取模型列表失败');
+            }
+            async function populateModelSelect({ btn, input, select, baseUrl, apiKey, apiFormat, defaultModels }) {
                 const old = btn.textContent;
                 btn.textContent = '⏳ 获取中…';
                 try {
-                    const models = await fetchOpenAIModelList(baseUrl, apiKey);
+                    const models = await fetchModelList(baseUrl, apiKey, apiFormat);
                     if (!models.length) throw new Error('接口未返回模型列表（data 为空），可能该服务不支持 /models');
                     select.innerHTML = '';
                     for (const m of models) {
@@ -11426,9 +12446,49 @@ ${card.characterPrompt}
                     }
                     select.classList.remove('hidden');
                     select.onchange = () => { input.value = select.value; };
-                    if (input.value && models.includes(input.value)) select.value = input.value;
+                    // 必须把模型名**填进输入框** —— 真正发给服务商的是 input 的值
+                    // （见 readProviderSettingsForm），只填下拉框等于这个功能没生效。
+                    //
+                    // 真实故障：Anthropic 下切格式时会自动填预设名 `claude-sonnet-4-20250514`，
+                    // 而它通常不在服务端真实返回的列表里。原来的代码只在"输入框的值恰好
+                    // 在列表里"时才回写下拉框选中项，从不写 input —— 于是列表拉出来了，
+                    // 发出去的还是那个不存在的预设名，一对话就 404。
+                    //
+                    // 四种情况分开处理（**顺序很重要**）：
+                    //   ① 输入框的值在列表里          → 原样保留。这一条必须放最前：
+                    //      预设名恰好有效时也该保留，否则会把用户当前用的模型
+                    //      悄悄换成列表里字母序第一个（如 claude-haiku），属于越权改动。
+                    //   ② 输入框为空                  → 填列表第一项（否则"拉到了但没选"，等于没用）
+                    //   ③ 输入框里是**预设默认值**     → 覆盖成列表第一项。那是切格式时应用自动填的，
+                    //                                   已证明不在真实列表里，留着必然 404。
+                    //   ④ 其它手填的值不在列表里       → **不覆盖**（可能是中转站的私有别名，
+                    //                                   用户是故意填的），但下拉框选中第一项，
+                    //                                   用户点一下即可换过去。
+                    const current = String(input.value || '').trim();
+                    const isStalePreset = Array.isArray(defaultModels) && defaultModels.includes(current);
+                    if (current && models.includes(current)) {
+                        select.value = current;
+                    } else if (!current || isStalePreset) {
+                        input.value = models[0];
+                        select.value = models[0];
+                    } else {
+                        select.value = models[0];
+                    }
                 } catch (err) {
-                    showCustomAlert('获取模型列表失败：' + (err?.message || err) + '\n\n请确认 API 地址与 Key 正确，且该服务支持 /v1/models 接口。', '获取模型');
+                    // 上面各分支已经给出**具体**原因（HTML 首页 / 非 JSON / data 为空 / HTTP 码）。
+                    // 这里只兜底浏览器层失败 —— 那种情况错误信息里只有一句 "Failed to fetch"，
+                    // 不说清的话用户会以为是地址或 Key 写错了。
+                    const detail = String(err?.message || err);
+                    const isNetwork = /Failed to fetch|NetworkError|Load failed/i.test(detail);
+                    showCustomAlert(
+                        '获取模型列表失败：' + detail
+                        + (isNetwork
+                            ? '\n\n这是**浏览器层面**的失败，不是地址或 Key 错。最常见的原因是服务商没发 CORS 响应头；'
+                              + '\n用 启动.bat 打开页面会自动走本机中转绕开它，直接双击 index.html 则不走中转。'
+                            : '')
+                        + '\n\n拉不到列表不影响使用 —— 把模型名直接手填进上面的输入框即可。',
+                        '获取模型'
+                    );
                 } finally {
                     btn.textContent = old;
                 }
@@ -11439,7 +12499,10 @@ ${card.characterPrompt}
                     input: document.getElementById('settingChatModel'),
                     select: document.getElementById('chatModelsSelect'),
                     baseUrl: elements.settingBaseUrl.value,
-                    apiKey: elements.settingApiKey.value
+                    apiKey: elements.settingApiKey.value,
+                    apiFormat: elements.settingApiFormat.value,
+                    // 各格式的预设模型名：用来识别"输入框里是切格式时自动填的、并非用户手填"
+                    defaultModels: Object.values(CHAT_API_FORMATS).map(f => f.defaultModel)
                 });
             });
             document.getElementById('fetchVisionModelsBtn')?.addEventListener('click', () => {
@@ -11452,16 +12515,22 @@ ${card.characterPrompt}
                 });
             });
             elements.settingApiFormat.addEventListener('change', () => {
-                const apiFormat = elements.settingApiFormat.value || 'openai';
-                const preset = CHAT_API_FORMATS[apiFormat] || CHAT_API_FORMATS.openai;
+                const apiFormat = elements.settingApiFormat.value || 'openai-compatible';
+                const preset = CHAT_API_FORMATS[apiFormat] || CHAT_API_FORMATS['openai-compatible'];
                 const currentBaseUrl = elements.settingBaseUrl.value.trim();
                 const usesDefault = !currentBaseUrl || Object.values(CHAT_API_FORMATS).some(format => format.defaultBaseUrl === currentBaseUrl);
-                if (elements.settingProviderMode.value === 'direct' || usesDefault) {
+                if (usesDefault) {
                     elements.settingBaseUrl.value = preset.defaultBaseUrl;
                 }
-                updateProviderModeUI();
+                // 切换格式时必须同步换掉模型名。
+                // 否则切到 Anthropic 后框里还留着 deepseek-chat，会被原样发过去 → 404，
+                // 而界面上完全看不出是这个原因（用户以为改格式就够了）—— 这就是"换了格式就连不上"。
+                // 只替换"空"或"恰好等于某个预设默认值"的情况；用户自己填过的名字不动。
+                const currentModel = String(elements.settingChatModel.value || '').trim();
+                const isPresetDefault = Object.values(CHAT_API_FORMATS).some(format => format.defaultModel === currentModel);
+                if (!currentModel || isPresetDefault) elements.settingChatModel.value = preset.defaultModel;
+                updateChatFormatUI();
             });
-            elements.settingProviderMode.addEventListener('change', updateProviderModeUI);
             elements.settingTtsProvider.addEventListener('change', updateTtsProviderUI);
             elements.testChatConnectionBtn.addEventListener('click', testChatConnection);
             elements.testTtsConnectionBtn.addEventListener('click', testTtsConnection);

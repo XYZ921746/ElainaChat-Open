@@ -333,6 +333,25 @@
     return base + encodeURIComponent(name) + '/';
   }
 
+  /**
+   * 拼出模型内某个资源的完整 URL。
+   * relPath 是「相对模型根目录」的路径，由 /api/live2d/models 返回，可能带子目录
+   * （如 `motions/idle.motion3.json`、`exp/脸红.exp3.json`，也可能就是根目录下的
+   * `脸红.exp3.json`）。
+   *
+   * 历史包袱：这里原来一律写成 `modelBaseUrl(name) + 'exp/' + 文件名`，即假定每个模型
+   * 都把表情和动作放在 exp/ 子目录里。但这不是 Cubism 的规范，只是某几个模型的个人习惯——
+   * 仓库内置的 deepseek 把 50 多个 *.exp3.json 直接堆在模型根目录、动作放在 motions/，
+   * 于是它的表情/动作请求全部 404，表现出来就是"打包进去的模型没有表情"。
+   * 现在改为按清单里的真实相对路径拼，exp/ 约定照样兼容。
+   *
+   * 注意逐段编码：整串 encodeURIComponent 会把路径分隔符也编成 %2F，服务端就找不到文件了。
+   */
+  function modelAssetUrl(name, relPath) {
+    const rel = String(relPath || '').split('/').filter(Boolean).map(encodeURIComponent).join('/');
+    return modelBaseUrl(name) + rel;
+  }
+
   async function deleteModel(name) {
     if (!name) return;
     if (!window.confirm('确定删除模型「' + name + '」？此操作不可恢复。')) return;
@@ -380,8 +399,7 @@
     watermarkExp = hit;
     // 读取表情内容，拿到它设置的参数 Id 与隐藏值（用于直接驱动参数，比 expression 播放更可靠）
     try {
-      const base = modelBaseUrl(selectedModel) + 'exp/';
-      const res = await fetch(base + encodeURIComponent(hit));
+      const res = await fetch(modelAssetUrl(selectedModel, hit));
       const json = await res.json();
       const p = json && Array.isArray(json.Parameters) ? json.Parameters[0] : null;
       if (p && p.Id) {
@@ -409,8 +427,7 @@
       }
       // 兜底：无参数信息时用表情播放
       if (watermarkOn) {
-        const base = modelBaseUrl(selectedModel) + 'exp/';
-        void model.expression(base + encodeURIComponent(watermarkExp));
+        void model.expression(modelAssetUrl(selectedModel, watermarkExp));
       } else {
         void model.expression();
       }
@@ -836,8 +853,7 @@
         if (tag) tag.textContent = '未在模型中找到 .model3.json';
         return;
       }
-      const base = modelBaseUrl(modelName);
-      const modelJsonPath = base + encodeURIComponent(info.modelJson);
+      const modelJsonPath = modelAssetUrl(modelName, info.modelJson);
       if (model) { try { app.stage.removeChild(model); model.destroy?.(); } catch { /* ignore */ } model = null; }
       // 等待 cubism4 核心就绪
       if (PIXI.live2d?.cubism4Ready) await PIXI.live2d.cubism4Ready;
@@ -1021,20 +1037,23 @@
   // 在当前模型 exps/motions 里模糊匹配目标名（子串 → 同义词组）
   // 注意：双向 includes 在 target 只有 1 个字符时会命中任意文件名（"a" 命中 "脸a红"），
   // 因此要求两者的有效长度都 >= 2 再参与模糊匹配。
+  // 清单里的元素是「相对模型根目录的路径」（可能带子目录），比较时只看文件名部分，
+  // 返回时把完整相对路径带回去 —— 调用方要用它拼 URL。
   function fuzzyMatchFileName(target, files, ext) {
     const t = String(target || '').trim();
     if (t.length < 2) return null;
     const strip = (f) => f.replace(new RegExp('\\.' + ext + '\\.json$', 'i'), '');
+    const baseNameOf = (f) => strip(f).split('/').pop();
     const usable = (base) => base.length >= 2;
     const hit1 = files.find(f => {
-      const base = strip(f);
+      const base = baseNameOf(f);
       return usable(base) && (base.includes(t) || t.includes(base));
     });
     if (hit1) return strip(hit1);
     const group = EXP_SYNONYM_GROUPS.find(g => g.some(w => t.includes(w) || w.includes(t)));
     if (group) {
       const hit2 = files.find(f => {
-        const base = strip(f);
+        const base = baseNameOf(f);
         return usable(base) && group.some(w => base.includes(w) || w.includes(base));
       });
       if (hit2) return strip(hit2);
@@ -1054,12 +1073,19 @@
     if (!currentModelExps.length) {
       // 清单已知却为空 → 这个模型没有任何表情文件，别再发注定 404 的请求
       if (modelAssetListKnown) {
-        console.warn('[Live2D] 当前模型没有 exp 目录，表情标签已忽略:', raw);
+        console.warn('[Live2D] 当前模型没有表情文件，表情标签已忽略:', raw);
         return '';
       }
       return mapped; // 清单未知时保持原行为
     }
-    if (currentModelExps.some(f => f === mapped + '.exp3.json')) return mapped;
+    // 清单元素是「相对模型根目录的路径」。先按整条路径比（调用方直接给路径时），
+    // 再按文件名比（绝大多数情况：AI 只知道表情叫什么）。
+    // 返回值同样是相对路径（去掉扩展名），调用方据此拼 URL —— 不能只返回文件名，
+    // 否则子目录里的文件会拼错地址。
+    const byPath = currentModelExps.find(f => f.replace(/\.exp3\.json$/i, '') === mapped);
+    if (byPath) return byPath.replace(/\.exp3\.json$/i, '');
+    const byBase = currentModelExps.find(f => f.split('/').pop().replace(/\.exp3\.json$/i, '') === mapped);
+    if (byBase) return byBase.replace(/\.exp3\.json$/i, '');
     const fuzzy = fuzzyMatchFileName(mapped, currentModelExps, 'exp3');
     if (fuzzy) return fuzzy;
     // 明确匹配不到 → 返回空串让调用方跳过，不要再去 fetch 一个必然 404 的路径
@@ -1078,7 +1104,10 @@
       }
       return mapped; // 动作列表未知时保持原行为
     }
-    if (currentModelMotions.some(f => f === mapped + '.motion3.json')) return mapped;
+    const byPath = currentModelMotions.find(f => f.replace(/\.motion3\.json$/i, '') === mapped);
+    if (byPath) return byPath.replace(/\.motion3\.json$/i, '');
+    const byBase = currentModelMotions.find(f => f.split('/').pop().replace(/\.motion3\.json$/i, '') === mapped);
+    if (byBase) return byBase.replace(/\.motion3\.json$/i, '');
     const fuzzy = fuzzyMatchFileName(mapped, currentModelMotions, 'motion3');
     if (fuzzy) return fuzzy;
     console.warn('[Live2D] 当前模型没有可用的动作文件:', raw, '（映射为', mapped + '）');
@@ -1126,8 +1155,7 @@
       return false;
     }
     try {
-      const base = modelBaseUrl(modelName) + 'exp/';
-      const url = base + encodeURIComponent(expName) + '.exp3.json';
+      const url = modelAssetUrl(modelName, expName + '.exp3.json');
       const res = await fetch(url);
       if (seq !== expressionSeq) return false; // 已有更新的表情请求，丢弃这次结果
       if (res.ok) {
@@ -1176,8 +1204,7 @@
     if (!motionName) return;
     const modelName = selectedModel;
     try {
-      const base = modelBaseUrl(modelName) + 'exp/';
-      await target.motion(base + encodeURIComponent(motionName) + '.motion3.json');
+      await target.motion(modelAssetUrl(modelName, motionName + '.motion3.json'));
       if (model !== target) return; // 期间换了模型，这次动作结果作废
       console.log('[Live2D] 动作:', motionName);
     } catch (err) {
@@ -1578,11 +1605,21 @@
     // 供主应用查询静音状态：静音 = 不播放 AI 语音（[操作:静音]）
     isVoiceMuted() { return aiVoiceMuted; },
     drive: driveText,
-    // 当前模型可用表情/动作（无扩展名），供主应用注入提示词让 AI 决策
+    // 当前模型可用表情/动作（只给文件名，不带目录与扩展名），供主应用注入提示词让 AI 决策。
+    // 清单内部存的是「相对模型根目录的路径」，这里剥成 AI 认识的名字
+    // （AI 该说"脸红"，而不是"exp/脸红.exp3.json"）；同名文件去重，避免提示词里出现重复项。
     getAvailableExpressions() {
+        const names = (list, ext) => {
+            const out = [];
+            for (const f of list) {
+                const base = f.split('/').pop().replace(new RegExp('\\.' + ext + '\\.json$', 'i'), '');
+                if (base && !out.includes(base)) out.push(base);
+            }
+            return out;
+        };
         return {
-            exps: currentModelExps.map(f => f.replace(/\.exp3\.json$/i, '')),
-            motions: currentModelMotions.map(f => f.replace(/\.motion3\.json$/i, ''))
+            exps: names(currentModelExps, 'exp3'),
+            motions: names(currentModelMotions, 'motion3')
         };
     },
     // 当前模型是否带水印开关（供提示词提示 AI 用 [操作:隐藏水印]）
