@@ -327,7 +327,13 @@
   }
 
   // 模型资源基础 URL：Web 版走服务端 /live2d/models/；Capacitor（APK）走本地文件系统
+  //
+  // 注意 `bundled` 那一路：数据目录为空时，模型列表会回退成"直接读打包进 APK 的 assets"
+  // （见 index.html 的 bundledManifestModels）。那种情况下资源**不在数据目录里**，
+  // 必须走 /live2d/models/（WebView 的静态资源），否则会拼出一个指向数据目录的地址而 404。
   function modelBaseUrl(name) {
+    const entry = modelsList.find(m => m.name === name);
+    if (entry && entry.bundled) return '/live2d/models/' + encodeURIComponent(name) + '/';
     const isNative = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
     const base = (isNative && window.__nativeModelBase) ? window.__nativeModelBase : '/live2d/models/';
     return base + encodeURIComponent(name) + '/';

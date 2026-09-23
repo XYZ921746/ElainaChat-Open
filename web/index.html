@@ -3543,6 +3543,24 @@
                             </label>
                         </div>
                         <p class="text-[11px] text-indigo-300 leading-relaxed">读取状态、查看界面、截图不需要确认；点击 / 滑动 / 输入 / 打开应用按上面的策略询问；「执行任意系统命令」无论选哪一项都会单独询问。AI 运行期间屏幕上方会显示状态条，随时可以点「停止」。</p>
+
+                        <!-- 悬浮窗：AI 操作别的 App 时，用户不该被迫切回本应用 -->
+                        <div class="mt-3 pt-3 border-t border-indigo-100">
+                            <div class="flex items-center gap-2 mb-1">
+                                <span id="overlayStatusDot" class="w-2 h-2 rounded-full bg-slate-300 flex-none"></span>
+                                <span class="text-xs font-semibold text-indigo-700">操作悬浮窗</span>
+                                <span id="overlayStatusText" class="text-[11px] text-indigo-400 ml-auto">检测中…</span>
+                            </div>
+                            <p class="text-[11px] text-indigo-400 mb-2 leading-relaxed">
+                                AI 操作的是<b>别的应用</b>。没有悬浮窗时，每一步确认都要你切回本应用来点 ——
+                                而切回来会让被操作的应用退到后台，那一步操作就可能失败，AI 只能重试，看起来像卡住了。
+                                开启后，屏幕上会浮一个小条：<b>随时点停止、需要确认时就地允许</b>，全程不用切回来。
+                            </p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <button id="overlayEnableBtn" class="btn-secondary text-xs" type="button">开启悬浮窗</button>
+                                <button id="overlayCheckBtn" class="btn-secondary text-xs" type="button">重新检测</button>
+                            </div>
+                        </div>
                     </div>
                 </section>
                 </div><!-- /tab-capability -->
@@ -3988,6 +4006,53 @@
         }
 
         // 原生模式下 /api/live2d/* 的本地实现
+        /**
+         * 从**随 APK 打包的** manifest.json 直接列出内置模型。
+         *
+         * <p>为什么需要这条兜底：正常路径是"先把内置模型播种到应用数据目录，再从那个目录列出来"。
+         * 但播种依赖 Capacitor 的 Filesystem 插件 —— 一旦它不可用（插件没注册成功、权限被拒、
+         * 存储写满、ROM 限制），`nativeFs()` 返回 null，播种整段被跳过，**列表就是空的**，
+         * 用户看到「（未上传模型）」，而模型其实明明就在 APK 里（assets 里有完整副本）。
+         *
+         * <p>打包进 APK 的模型本来就能通过 `/live2d/models/...` 直接读到（它是 WebView 的静态资源，
+         * 不需要任何原生插件）。所以这里按 manifest 把清单直接拼成模型列表 —— 不碰文件系统。
+         * 这是"至少让内置模型能用"的保证：上传功能可能坏，内置的不该跟着一起坏。
+         */
+        async function bundledManifestModels() {
+            try {
+                const res = await fetch('/live2d/models/manifest.json', { cache: 'no-store' });
+                if (!res.ok) return [];
+                const manifest = await res.json();
+                const list = Array.isArray(manifest && manifest.models) ? manifest.models : [];
+                const out = [];
+                for (const entry of list) {
+                    const name = String((entry && entry.name) || '');
+                    const files = Array.isArray(entry && entry.files) ? entry.files.map(String) : [];
+                    if (!name || !files.length) continue;
+                    // manifest 里 modelJson 是文件名；没有就在 files 里找
+                    let modelJson = String((entry && entry.modelJson) || '');
+                    if (!modelJson) {
+                        modelJson = files.find((f) => !f.includes('/') && f.toLowerCase().endsWith('.model3.json'))
+                            || files.find((f) => f.toLowerCase().endsWith('.model3.json')) || '';
+                    }
+                    if (!modelJson) continue;
+                    const vtube = files.find((f) => !f.includes('/') && f.toLowerCase().endsWith('.vtube.json'))
+                        || files.find((f) => f.toLowerCase().endsWith('.vtube.json')) || null;
+                    out.push({
+                        name,
+                        modelJson,
+                        exps: files.filter((f) => f.toLowerCase().endsWith('.exp3.json')).sort(),
+                        motions: files.filter((f) => f.toLowerCase().endsWith('.motion3.json')).sort(),
+                        vtube,
+                        bundled: true,   // 标记来源：资源从 assets 取，不依赖数据目录
+                    });
+                }
+                return out;
+            } catch (e) {
+                return [];
+            }
+        }
+
         async function nativeLive2dFetch(url, options) {
             const method = (options && options.method) || 'GET';
             const fs = nativeFs();
@@ -4014,6 +4079,32 @@
                             models.push({ name: modelName, modelJson, exps, motions, vtube });
                         } catch (e) { /* 跳过坏目录 */ }
                     }
+
+                    // ★ 合并**打包进 APK 的**内置模型。
+                    //
+                    // 正常情况（播种成功）下，数据目录里已经有这些模型了，按名字去重后不会有变化。
+                    // 但播种一旦失败（Filesystem 插件不可用、权限被拒、存储写满、ROM 限制），
+                    // 数据目录是空的 —— 此时内置模型不该跟着一起消失：它们就在 assets 里，
+                    // 不依赖任何原生插件。宁可只能看内置模型，也不要让用户对着
+                    // 一句「（未上传模型）」以为 APK 里没带模型。
+                    //
+                    // 用合并而不是"空了才兜底"：否则用户一旦自己上传了模型（目录非空），
+                    // 内置的那两个就会从列表里消失 —— 那是个更奇怪的 bug。
+                    // 同名时以数据目录里的为准（用户可能改过 / 重命名过，资产也从数据目录取）。
+                    try {
+                        const have = new Set(models.map((m) => m.name));
+                        const bundled = await bundledManifestModels();
+                        let added = 0;
+                        for (const b of bundled) {
+                            if (have.has(b.name)) continue;
+                            models.push(b);
+                            added++;
+                        }
+                        if (added) {
+                            console.log('[Native] 补入打包内置模型 ' + added + ' 个（数据目录里没有）');
+                        }
+                    } catch (e) { /* 没有打包模型是正常情况 */ }
+
                     return json({ ok: true, models });
                 }
                 if (url === '/api/live2d/upload' && method === 'POST') {
@@ -6752,6 +6843,13 @@ ${lines.join('\n')}
             const aborters = new Set();          // 在途请求的 AbortController
             let approvalOpen = false;
 
+            // ---- 系统悬浮窗（APK 独有）----
+            // 浮层上常驻「停止」，需要确认时出现「允许 / 拒绝」。
+            // 它的价值在于：AI 操作的是**别的 App**，用户不用切回 ElainaChat 就能操作 ——
+            // 切回来会把目标 App 切到后台，那次操作就失败了（死循环的根源）。
+            let overlayListenerReady = false;
+            let overlayApprovalPending = null;   // 等待浮层回应的 resolve 函数
+
             const barEl = () => document.getElementById('agentRunBar');
             const textEl = () => document.getElementById('agentRunText');
             const stepEl = () => document.getElementById('agentRunStep');
@@ -6802,7 +6900,15 @@ ${lines.join('\n')}
                 for (const c of aborters) { try { c.abort(); } catch (e) { /* 忽略 */ } }
                 aborters.clear();
                 // 关掉正在等待的确认弹窗（按「拒绝」处理）
-                if (approvalOpen) { try { elements.customModalCancelBtn?.click(); } catch (e) { /* 忽略 */ } }
+                if (approvalOpen) {
+                    // 应用内弹窗这条路：点它的「取消」
+                    try { elements.customModalCancelBtn?.click(); } catch (e) { /* 忽略 */ }
+                    // 悬浮窗这条路：把它等着的那个 Promise 了结掉。
+                    // 两条路都要关 —— 只关其中一条会让另一种情况下的 await 永远挂住。
+                    const pending = overlayApprovalPending;
+                    overlayApprovalPending = null;
+                    if (pending) pending(false);
+                }
                 render();
                 return true;
             }
@@ -6840,26 +6946,141 @@ ${lines.join('\n')}
                 if (risk !== 'dangerous' && policy === 'always') {
                     lines.push('', '（想减少打扰：设置 → 高级 → 手机操作授权，可改为「同一次运行内允许过就不再问」）');
                 }
+
+                // ★ 优先走**系统悬浮窗**确认。
+                //
+                // 为什么：AI 操作的是别的 App，而应用内弹窗要用户切回 ElainaChat 才看得到 ——
+                // 切回来这一步会把目标 App 切到后台，那次操作就落到错的位置或直接失败，
+                // AI 重试又弹窗，形成死循环。悬浮窗浮在目标 App 之上，用户不离开当前界面
+                // 就能点「允许 / 拒绝」。
+                //
+                // 悬浮窗不可用（没授权 / 没显示）时**回退到应用内弹窗** ——
+                // 不能因为浮层不可用就静默拒绝，那会让功能看起来"坏了"。
                 approvalOpen = true;
                 let ok = false;
                 try {
-                    ok = await showCustomModal({
-                        title: risk === 'dangerous' ? '危险操作确认' : '敏感操作确认',
-                        message: lines.join('\n'),
-                        confirmText: '允许这次',
-                        cancelText: '拒绝'
-                    });
+                    ok = await requestApprovalViaOverlay(action, detail);
                 } catch (e) { ok = false; }
+                if (ok === null) {
+                    // 悬浮窗这条路走不通 → 应用内弹窗
+                    try {
+                        ok = await showCustomModal({
+                            title: risk === 'dangerous' ? '危险操作确认' : '敏感操作确认',
+                            message: lines.join('\n'),
+                            confirmText: '允许这次',
+                            cancelText: '拒绝'
+                        });
+                    } catch (e) { ok = false; }
+                }
                 approvalOpen = false;
                 if (!ok) return false;
                 if (policy === 'run') approvedThisRun.add(action);
                 return !stopRequested;   // 用户可能在弹窗期间点了停止
             }
 
+            /**
+             * 通过系统悬浮窗请求确认。
+             *
+             * @returns true/false = 用户在浮层上做出了选择；**null = 浮层不可用，调用方应回退到应用内弹窗**
+             */
+            function requestApprovalViaOverlay(action, detail) {
+                const plugin = deviceBridge();
+                // 只有安卓版、且原生层提供了这个方法、且浮层正在显示时才走这条路
+                if (!plugin || typeof plugin.askOverlayApproval !== 'function') return Promise.resolve(null);
+                if (!overlayListenerReady) return Promise.resolve(null);
+
+                return new Promise((resolve) => {
+                    let settled = false;
+                    const finish = (value) => {
+                        if (settled) return;
+                        settled = true;
+                        overlayApprovalPending = null;
+                        resolve(value);
+                    };
+                    // 与"停止"竞争：用户可能在浮层上直接点停止而不是允许/拒绝
+                    overlayApprovalPending = finish;
+
+                    plugin.askOverlayApproval({ action: detail ? (action + ' —— ' + detail) : action })
+                        .then((res) => {
+                            if (res && res.fallback) finish(null);      // 浮层不在 → 回退
+                            else if (res && res.ok === false) finish(null);
+                            // ok=true 时等原生发 overlayApproval 事件
+                        })
+                        .catch(() => finish(null));
+                });
+            }
+
             function setStep(n, action) {
                 step = Number(n) || 0;
                 currentAction = String(action || '');
                 render();
+                // 同步到系统悬浮窗：用户切到别的 App 时，这里是他唯一能看到进度的位置
+                updateOverlayStep();
+            }
+
+            // ==================== 系统悬浮窗的生命周期 ====================
+
+            /** 取原生设备层。与外面那个 deviceBridge 同样的逻辑，这里内联一份避免依赖定义顺序 */
+            function nativeBridge() {
+                if (window.ElainaDevice) return window.ElainaDevice;
+                const p = window.Capacitor?.Plugins?.ElainaDevice;
+                if (p) { window.ElainaDevice = p; return p; }
+                return null;
+            }
+
+            /** 挂一次原生事件监听（悬浮窗上的「停止」「允许/拒绝」由它送进来） */
+            function ensureOverlayListener() {
+                if (overlayListenerReady) return;
+                const plugin = nativeBridge();
+                if (!plugin || typeof plugin.addListener !== 'function') return;
+                overlayListenerReady = true;
+
+                // 用户在浮层上点了「停止」→ 等同于点了应用内的停止
+                plugin.addListener('overlayStop', () => {
+                    requestStop('用户在悬浮窗上点了停止');
+                    // ★ 必须把"正在等确认"的那个 Promise 也了结掉。
+                    // 否则用户点停止（而不是允许/拒绝）时，requestApproval 会永远 await 下去 ——
+                    // 表现是"点了停止没反应"，而这正是用户最需要它立刻停的时刻。
+                    const pending = overlayApprovalPending;
+                    overlayApprovalPending = null;
+                    if (pending) pending(false);
+                });
+
+                // 用户在浮层上点了「允许 / 拒绝」
+                plugin.addListener('overlayApproval', (data) => {
+                    const pending = overlayApprovalPending;
+                    overlayApprovalPending = null;
+                    if (pending) pending(Boolean(data && data.allowed));
+                });
+            }
+
+            /** AI 开始操作手机时显示浮层。没有权限时返回 false（调用方会引导用户去开）。 */
+            async function showOverlay(text) {
+                const plugin = nativeBridge();
+                if (!plugin || typeof plugin.showOverlay !== 'function') return false;
+                ensureOverlayListener();
+                try {
+                    const res = await plugin.showOverlay({ text: text || 'AI 正在操作手机' });
+                    if (res && res.needPermission) return 'need-permission';
+                    return Boolean(res && res.ok);
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            function updateOverlayStep() {
+                const plugin = nativeBridge();
+                if (!plugin || typeof plugin.updateOverlay !== 'function') return;
+                const label = stopRequested
+                    ? '正在停止…'
+                    : ('第 ' + step + ' 步' + (currentAction ? ' · ' + currentAction : ''));
+                try { void plugin.updateOverlay({ text: label }); } catch (e) { /* 浮层没了就忽略 */ }
+            }
+
+            function hideOverlay() {
+                const plugin = nativeBridge();
+                if (!plugin || typeof plugin.hideOverlay !== 'function') return;
+                try { void plugin.hideOverlay(); } catch (e) { /* 忽略 */ }
             }
 
             return {
@@ -6868,7 +7089,11 @@ ${lines.join('\n')}
                 isStopRequested: () => stopRequested,
                 isHalted: () => halted,
                 getStep: () => step,
-                riskOf
+                riskOf,
+                // 悬浮窗
+                showOverlay,
+                hideOverlay,
+                ensureOverlayListener
             };
         })();
 
@@ -6876,6 +7101,8 @@ ${lines.join('\n')}
 
         document.getElementById('agentStopBtn')?.addEventListener('click', () => {
             if (agentRuntime.requestStop('用户点了停止')) {
+                // 停止后收起悬浮窗（否则它会一直挂在屏幕上，用户以为还在跑）
+                if (agentRuntime.hideOverlay) agentRuntime.hideOverlay();
                 insertAgentResult('已停止：用户手动中止了 AI 的手机操作，后续动作没有执行。如需继续，请重新告诉 AI 要做什么，或让它先说明刚才做到哪一步。');
             }
         });
@@ -6904,6 +7131,8 @@ ${lines.join('\n')}
 
         let phoneOpsInFlight = 0;
         let phoneRunEndTimer = null;
+        // 悬浮窗权限提示只说一次，避免每一步操作都往对话里塞一条同样的提示
+        let needOverlayNoticeShown = false;
 
         function parsePhoneOperation(text) {
             const s = String(text || '').trim();
@@ -7007,7 +7236,27 @@ ${lines.join('\n')}
             }
             phoneOpsInFlight += 1;
             clearTimeout(phoneRunEndTimer);
-            if (!rt.isRunning()) rt.beginRun();
+            if (!rt.isRunning()) {
+                rt.beginRun();
+                // ★ 这一步是"不用切回应用就能停"的关键：操作开始时把系统悬浮窗显示出来。
+                // 它浮在目标 App 之上，用户在当前界面就能看到进度、随时点停止。
+                // 这一步**不阻塞**：拿不到权限只是少了个便利，操作照常进行（回退到应用内确认）。
+                if (rt.showOverlay) {
+                    void rt.showOverlay('AI 正在操作手机').then((ok) => {
+                        if (ok === 'need-permission') {
+                            // 只提示一次，别每一步都弹
+                            if (!needOverlayNoticeShown) {
+                                needOverlayNoticeShown = true;
+                                insertAgentResult('提示：AI 正在操作手机，但**悬浮窗权限还没开**，'
+                                    + '所以你必须切回本应用才能点「允许」或「停止」——'
+                                    + '而切回来会让被操作的应用退到后台，操作可能失败。\n'
+                                    + '建议：设置 → 高级 → 手机操作 → 点「开启悬浮窗」，'
+                                    + '在系统设置里打开「显示在其他应用上层」。开了之后就不用切回来了。');
+                            }
+                        }
+                    });
+                }
+            }
             try {
                 rt.assertNotStopped();
                 rt.setStep(rt.getStep() + 1, parsed.action);
@@ -7031,7 +7280,13 @@ ${lines.join('\n')}
                 if (phoneOpsInFlight <= 0) {
                     clearTimeout(phoneRunEndTimer);
                     // 一批操作处理完再收起状态条；若紧接着又来新操作会重新计时
-                    phoneRunEndTimer = setTimeout(() => { if (phoneOpsInFlight <= 0) rt.endRun(); }, 600);
+                    phoneRunEndTimer = setTimeout(() => {
+                        if (phoneOpsInFlight <= 0) {
+                            rt.endRun();
+                            // 悬浮窗与状态条同进退：操作结束就收起，别留在屏幕上碍事
+                            if (rt.hideOverlay) rt.hideOverlay();
+                        }
+                    }, 600);
                 }
             }
         }
@@ -11600,6 +11855,59 @@ ${lines.join('\n')}
             renderScheduledTaskList();
             void refreshLogSettings();
             void refreshDataSettings();
+            void refreshOverlayStatus();
+        }
+
+        // ==================== 操作悬浮窗（APK 独有） ====================
+        // AI 操作的是别的应用。没有悬浮窗时，每一步确认都要用户切回本应用来点，
+        // 而"切回来"会让被操作的应用退到后台，那一步操作就可能失败 → AI 重试 → 看起来像卡住。
+        // 悬浮窗是唯一能打破这个循环的东西：它浮在目标应用之上，不离开当前界面就能确认或停止。
+        //
+        // 注意这是 Android 的**特殊权限**（「显示在其他应用上层」），只能由用户
+        // 在系统设置里手动打开 —— 应用无法弹运行时权限框索取。所以这里只能"跳过去 + 回来复检"。
+        async function refreshOverlayStatus() {
+            const dot = document.getElementById('overlayStatusDot');
+            const text = document.getElementById('overlayStatusText');
+            const btn = document.getElementById('overlayEnableBtn');
+            const wrap = document.getElementById('overlayStatusDot')?.closest('div')?.parentElement;
+            if (!text) return;
+
+            const plugin = deviceBridge();
+            // 网页版没有原生层：整块隐藏（在那个环境里这个设置本来就不适用）
+            if (!plugin || typeof plugin.overlayStatus !== 'function') {
+                if (wrap) wrap.classList.add('hidden');
+                return;
+            }
+            if (wrap) wrap.classList.remove('hidden');
+            try {
+                const res = await plugin.overlayStatus();
+                const ok = Boolean(res && res.canDraw);
+                if (dot) dot.className = 'w-2 h-2 rounded-full flex-none ' + (ok ? 'bg-emerald-400' : 'bg-amber-400');
+                text.textContent = ok ? '已开启' : '未开启';
+                if (btn) btn.textContent = ok ? '去系统设置检查' : '开启悬浮窗';
+            } catch (e) {
+                text.textContent = '检测失败';
+            }
+        }
+
+        async function enableOverlay() {
+            const plugin = deviceBridge();
+            if (!plugin || typeof plugin.requestOverlay !== 'function') {
+                showCustomAlert('当前环境没有原生设备层（电脑版没有这个功能）。', '操作悬浮窗');
+                return;
+            }
+            try {
+                await plugin.requestOverlay();
+                // 跳到系统设置后用户会切走再回来 —— 这时 fillSettingsForm 会重新跑一次，
+                // 但用户也可能直接返回而没触发刷新，所以下面给一句明确的手动提示。
+                showCustomAlert(
+                    '已打开系统设置。\n\n'
+                    + '请找到并打开「显示在其他应用上层」/「悬浮窗」权限，然后返回本应用。\n\n'
+                    + '回来后在设置里点「重新检测」确认状态变成「已开启」。',
+                    '操作悬浮窗');
+            } catch (e) {
+                showCustomAlert('打开系统设置失败：' + (e.message || e), '操作悬浮窗');
+            }
         }
 
         // ==================== 日志设置（服务端） ====================
@@ -12324,6 +12632,9 @@ ${card.characterPrompt}
             elements.settingLogTrace?.addEventListener('change', () => { void applyLogSettings(); });
             // 我的数据：导出直接下载备份，导入选文件后合并进 data/
             document.getElementById('dataExportBtn')?.addEventListener('click', exportDataBackup);
+            // 操作悬浮窗：跳系统设置授权 / 重新检测
+            document.getElementById('overlayEnableBtn')?.addEventListener('click', enableOverlay);
+            document.getElementById('overlayCheckBtn')?.addEventListener('click', () => { void refreshOverlayStatus(); });
             document.getElementById('dataImportBtn')?.addEventListener('click', () => {
                 // APK 优先让用户从**已经导出到文档目录的备份**里挑（纯 Filesystem，不依赖 WebView 的文件选择器）；
                 // 挑不到（没有备份 / 插件不可用）再退回系统文件选择器。
