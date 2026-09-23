@@ -6950,6 +6950,17 @@ ${lines.join('\n')}
             /** 每条 AI 回复的处理入口调用一次：开启新批次，解除上一批留下的停止状态 */
             function beginBatch() {
                 halted = false;
+                // 「每次运行只确认一次」的"本轮"以**批次**为单位，不是 beginRun ——
+                //
+                // 真机实测发现的坑：AI 的每一步之间有"续跑间隔"（模型要生成下一步），
+                // 间隔一超过 phoneRunEndTimer 的 600ms，endRun 就把 running 置 false；
+                // 下一步进来时 beginRun 重新开跑并把 approvedThisRun 清空 ——
+                // 于是**每一步都变成"本轮第一次"**，用户看到的还是每步一确认，
+                // 策略等于没改（这正是用户反复反馈的现象，同步测试根本测不出来）。
+                // 批次只在新的一条 AI 回复时由 beginBatch 重置，才是用户心智里的"一次运行"。
+                if (String(state.settings.agentApproval || 'once') === 'once') {
+                    approvedThisRun.clear();
+                }
             }
 
             function beginRun() {
@@ -6958,7 +6969,13 @@ ${lines.join('\n')}
                 stopReason = '';
                 step = 0;
                 currentAction = '';
-                approvedThisRun.clear();
+                // once 策略下**不清**已确认记录（在 beginBatch 里清）——
+                // run 会因续跑间隔反复启停，clear 放这里等于每步都重置。
+                // run / always 策略保持原行为（run 按 action 名去重也跨步，同样不该被
+                // endRun/re-begRun 冲掉 —— 但为了不改变既有行为，只在 once 生效的新语义里动）。
+                if (String(state.settings.agentApproval || 'once') !== 'once') {
+                    approvedThisRun.clear();
+                }
                 render();
             }
 
