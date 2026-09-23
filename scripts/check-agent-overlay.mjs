@@ -129,16 +129,30 @@ console.log('\n=== 5. 前端：浮层生命周期 ===');
         '停止流程里会收起浮层');
 }
 
-// ============================================================ 6. 前端：权限提示
-console.log('\n=== 6. 前端：权限引导 ===');
+// ============================================================ 6. 前端：权限引导
+console.log('\n=== 6. 前端：权限引导（必须主动请求，不能只写句话）===');
 {
     ok(html.includes('overlayEnableBtn'), '设置里有「开启悬浮窗」按钮');
     ok(html.includes('overlayStatusText'), '设置里有权限状态显示');
     ok(/function\s+refreshOverlayStatus\s*\(/.test(html), '有 refreshOverlayStatus()');
     ok(/function\s+enableOverlay\s*\(/.test(html), '有 enableOverlay()（跳系统设置）');
-    ok(/need-permission/.test(html), '识别"需要授权"并给出引导');
-    // 权限提示不该每步都刷
-    ok(/needOverlayNoticeShown/.test(html), '权限提示只提示一次（避免每步刷屏）');
+    ok(/need-permission/.test(html), '识别"需要授权"');
+
+    // ★ 用户反馈过"应用不主动请求悬浮窗权限"。之前只 insertAgentResult 一句提示，
+    // 用户得自己去设置里找三步。现在必须在操作流程里**主动弹确认框并可一键跳转**。
+    const runStart = html.indexOf('async function runAgentPhoneOperation(');
+    const runEnd = html.indexOf('// ===== 实现方式（后端选择）=====', runStart);
+    const runBody = runStart > 0 && runEnd > runStart ? html.slice(runStart, runEnd) : '';
+    ok(/showCustomModal\s*\(/.test(runBody),
+        '操作流程里主动弹确认框（不只是写一句提示）');
+    ok(/enableOverlay\s*\(\s*\{\s*quiet/.test(runBody),
+        '用户点「去开启」后直达系统设置');
+    ok(/overlayPromptDeclined/.test(html),
+        '用户拒绝过就不再打扰（避免每次都拦）');
+
+    // enableOverlay 在操作流程里要静默，否则说明框会叠在用户眼前
+    ok(/function\s+enableOverlay\s*\(\s*opts\s*\)/.test(html) || /function\s+enableOverlay\s*\(\s*\w/.test(html),
+        'enableOverlay 支持参数（供静默跳转用）');
 }
 
 // ============================================================ 7. 停止时必须了结等待中的确认

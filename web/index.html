@@ -4057,7 +4057,20 @@
             const method = (options && options.method) || 'GET';
             const fs = nativeFs();
             const dir = (fs && fs.Directory && fs.Directory.Data) ? fs.Directory.Data : 'DATA';
-            const json = (obj) => ({ ok: true, status: 200, json: async () => obj });
+
+            // 假 Response。**必须同时有 json() 和 text()** ——
+            // 调用方不只用 json()：设置面板走的是 readJsonSafe()，它第一行就是 `await res.text()`
+            // （为了在服务端返回非 JSON 时给出能看懂的报错）。早期这里只实现了 json()，
+            // 于是设置里的模型列表**静默为空**（TypeError 被 catch 吞掉，显示「未上传模型」），
+            // 而模型其实好好地躺在 APK 里。视频通话那条路只用 json()，所以它当时是好的 ——
+            // 这也是为什么这个 bug 特别难发现：同一个接口，两条调用路径，只有一条炸。
+            const makeRes = (status, obj) => ({
+                ok: status >= 200 && status < 300,
+                status,
+                json: async () => obj,
+                text: async () => JSON.stringify(obj),
+            });
+            const json = (obj) => makeRes(200, obj);
             try {
                 if (url === '/api/live2d/models' && method === 'GET') {
                     let entries;
@@ -4109,12 +4122,12 @@
                 }
                 if (url === '/api/live2d/upload' && method === 'POST') {
                     const body = options && options.body;
-                    if (!body) return { ok: false, status: 400, json: async () => ({ ok: false, message: '无文件' }) };
+                    if (!body) return makeRes(400, { ok: false, message: '无文件' });
                     const buf = new Uint8Array(body instanceof Blob ? await body.arrayBuffer() : await new Response(body).arrayBuffer());
                     const files = await unzipBrowser(buf);
-                    if (!files.length) return { ok: false, status: 400, json: async () => ({ ok: false, message: 'zip 为空或无法解析' }) };
+                    if (!files.length) return makeRes(400, { ok: false, message: 'zip 为空或无法解析' });
                     const modelFile = files.find(f => f.name.toLowerCase().endsWith('.model3.json'));
-                    if (!modelFile) return { ok: false, status: 400, json: async () => ({ ok: false, message: 'zip 内没有 .model3.json（需 Cubism3 模型）' }) };
+                    if (!modelFile) return makeRes(400, { ok: false, message: 'zip 内没有 .model3.json（需 Cubism3 模型）' });
                     const safeId = 'model_' + Date.now().toString(36);
                     const baseDir = 'live2d/models/' + safeId;
                     // 去掉 zip 内的顶层目录（若有）
@@ -4140,9 +4153,9 @@
                     await fs.rmdir({ path: 'live2d/models/' + delMatch[1], directory: dir, recursive: true });
                     return json({ ok: true, deleted: delMatch[1] });
                 }
-                return { ok: false, status: 404, json: async () => ({ ok: false, message: 'Not found' }) };
+                return makeRes(404, { ok: false, message: 'Not found' });
             } catch (err) {
-                return { ok: false, status: 500, json: async () => ({ ok: false, message: err.message || String(err) }) };
+                return makeRes(500, { ok: false, message: err.message || String(err) });
             }
         }
 
@@ -7131,8 +7144,8 @@ ${lines.join('\n')}
 
         let phoneOpsInFlight = 0;
         let phoneRunEndTimer = null;
-        // 悬浮窗权限提示只说一次，避免每一步操作都往对话里塞一条同样的提示
-        let needOverlayNoticeShown = false;
+        // 悬浮窗权限提示：用户明确点过「这次不用」就别每次都拦（那会变成新的打扰）
+        let overlayPromptDeclined = false;
 
         function parsePhoneOperation(text) {
             const s = String(text || '').trim();
@@ -7242,17 +7255,34 @@ ${lines.join('\n')}
                 // 它浮在目标 App 之上，用户在当前界面就能看到进度、随时点停止。
                 // 这一步**不阻塞**：拿不到权限只是少了个便利，操作照常进行（回退到应用内确认）。
                 if (rt.showOverlay) {
-                    void rt.showOverlay('AI 正在操作手机').then((ok) => {
-                        if (ok === 'need-permission') {
-                            // 只提示一次，别每一步都弹
-                            if (!needOverlayNoticeShown) {
-                                needOverlayNoticeShown = true;
-                                insertAgentResult('提示：AI 正在操作手机，但**悬浮窗权限还没开**，'
-                                    + '所以你必须切回本应用才能点「允许」或「停止」——'
-                                    + '而切回来会让被操作的应用退到后台，操作可能失败。\n'
-                                    + '建议：设置 → 高级 → 手机操作 → 点「开启悬浮窗」，'
-                                    + '在系统设置里打开「显示在其他应用上层」。开了之后就不用切回来了。');
-                            }
+                    void rt.showOverlay('AI 正在操作手机').then(async (ok) => {
+                        if (ok !== 'need-permission') return;
+                        // 没有权限 → 主动引导去开，而不是只在对话里写一句话。
+                        //
+                        // 之前只 insertAgentResult 一句提示，结果是：用户要自己在设置里找到
+                        // 「手机操作」、再点「开启悬浮窗」、再跳系统设置 —— 三步都不在眼前，
+                        // 于是实际表现就是"应用从不主动请求悬浮窗权限"。
+                        // 这里改成：弹一个确认框，用户点「去开启」就直接跳系统设置页。
+                        //
+                        // 只问一次：用户明确拒绝过就别每次都拦（那会变成新的打扰）。
+                        // 但**跳去授权后回来**要允许再问 —— 因为那时他可能还没开成功。
+                        if (overlayPromptDeclined) return;
+                        const go = await showCustomModal({
+                            title: '需要悬浮窗权限',
+                            message: 'AI 正在操作手机。\n\n'
+                                + '没有悬浮窗权限时，每一步确认都要你切回本应用来点 ——\n'
+                                + '而切回来会让被操作的应用退到后台，那一步操作就可能失败，\n'
+                                + 'AI 只能重试，看起来像卡住了。\n\n'
+                                + '开了之后屏幕上会浮一个小条：随时点停止、需要确认时就地允许，\n'
+                                + '全程不用切回本应用。\n\n'
+                                + '现在去系统设置里打开「显示在其他应用上层」？',
+                            confirmText: '去开启',
+                            cancelText: '这次不用',
+                        }).catch(() => false);
+                        if (go) {
+                            await enableOverlay({ quiet: true });   // 跳系统设置（不再叠说明框）
+                        } else {
+                            overlayPromptDeclined = true;
                         }
                     });
                 }
@@ -11883,14 +11913,22 @@ ${lines.join('\n')}
                 const res = await plugin.overlayStatus();
                 const ok = Boolean(res && res.canDraw);
                 if (dot) dot.className = 'w-2 h-2 rounded-full flex-none ' + (ok ? 'bg-emerald-400' : 'bg-amber-400');
-                text.textContent = ok ? '已开启' : '未开启';
+                text.textContent = ok ? '已开启' : '未开启（AI 操作时会提示你开）';
                 if (btn) btn.textContent = ok ? '去系统设置检查' : '开启悬浮窗';
             } catch (e) {
                 text.textContent = '检测失败';
             }
         }
 
-        async function enableOverlay() {
+        /**
+         * 跳到系统设置里的「显示在其他应用上层」，让用户开启悬浮窗权限。
+         *
+         * @param opts.quiet 静默模式：不弹"已打开系统设置"的说明框。
+         *   AI 操作流程里要用它 —— 那时用户正要去看 AI 做了什么，
+         *   再叠一个说明框会挡住视线（而且他刚从确认框点过来的，已经知道自己在干什么）。
+         */
+        async function enableOverlay(opts) {
+            const quiet = Boolean(opts && opts.quiet);
             const plugin = deviceBridge();
             if (!plugin || typeof plugin.requestOverlay !== 'function') {
                 showCustomAlert('当前环境没有原生设备层（电脑版没有这个功能）。', '操作悬浮窗');
@@ -11898,6 +11936,7 @@ ${lines.join('\n')}
             }
             try {
                 await plugin.requestOverlay();
+                if (quiet) return;
                 // 跳到系统设置后用户会切走再回来 —— 这时 fillSettingsForm 会重新跑一次，
                 // 但用户也可能直接返回而没触发刷新，所以下面给一句明确的手动提示。
                 showCustomAlert(
