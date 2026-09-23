@@ -61,7 +61,7 @@
             messages,
             ...(opts.temperature !== undefined && { temperature: opts.temperature }),
             ...(Number.isFinite(opts.maxTokens) && { max_tokens: Math.max(1, Math.floor(opts.maxTokens)) })
-        }, { Authorization: 'Bearer ' + apiKey });
+        }, { Authorization: 'Bearer ' + apiKey }, undefined, undefined, opts.signal);
         if (!result.ok) await throwProviderResponseError(result, '对话服务请求失败');
         if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', '对话服务返回格式异常');
         const message = result.payload.choices?.[0]?.message || {};
@@ -151,7 +151,7 @@
             messages: payload.messages,
             max_tokens: maxTokens,
             ...(opts.temperature !== undefined && { temperature: opts.temperature })
-        }, { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' });
+        }, { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }, undefined, undefined, opts.signal);
         if (!result.ok) await throwProviderResponseError(result, 'Anthropic 请求失败');
         if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', 'Anthropic 返回格式异常');
         const blocks = Array.isArray(result.payload.content) ? result.payload.content : [];
@@ -222,7 +222,7 @@
             input: payload.input,
             ...(opts.temperature !== undefined && { temperature: opts.temperature }),
             ...(Number.isFinite(opts.maxTokens) && { max_output_tokens: Math.max(1, Math.floor(opts.maxTokens)) })
-        }, { Authorization: 'Bearer ' + apiKey });
+        }, { Authorization: 'Bearer ' + apiKey }, undefined, undefined, opts.signal);
         if (!result.ok) await throwProviderResponseError(result, 'OpenAI 请求失败');
         if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', 'OpenAI 返回格式异常');
         // 部分兼容实现会把全文直接放在顶层 output_text，先认这个，省得再遍历一遍
