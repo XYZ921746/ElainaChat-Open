@@ -724,15 +724,11 @@
             transform: translateX(8px) scale(0.88);
             pointer-events: none;
         }
-        /* AI 回复中：发送按钮变成红色「停止」 */
+        /* AI 回复中：同一按钮位置整键变「停止」（DSH 式二态）。
+           颜色保持主色调不变 —— 只换图标（箭头→暂停），不做红/蓝突跳。 */
         #initialSendBtn.is-stopping,
         #inputBar .conversation-send-btn.is-stopping {
-            background: #ef4444 !important;
-            color: #fff !important;
-        }
-        #initialSendBtn.is-stopping:hover,
-        #inputBar .conversation-send-btn.is-stopping:hover {
-            background: #dc2626 !important;
+            opacity: 0.85;
         }
         .composer-tools {
             position: relative;
@@ -2888,9 +2884,9 @@
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z"/></svg>
                         </button>
                         <button id="initialSendBtn" onclick="handleComposerButtonClick()" class="composer-send-transition is-hidden btn-primary flex items-center gap-1 text-xs px-4 py-2 flex-shrink-0">
+                            <!-- DSH 式二态：同一位置一个图标，回复中整键变暂停 -->
                             <span class="send-label">发送</span>
-                            <svg class="send-icon w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"/></svg>
-                            <svg class="stop-icon w-3.5 h-3.5 hidden" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                            <svg class="composer-state-icon w-3.5 h-3.5" viewBox="0 0 24 24" aria-hidden="true"></svg>
                         </button>
                     </div>
                 </div>
@@ -3041,8 +3037,8 @@
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z"/></svg>
                     </button>
                     <button id="conversationSendBtn" onclick="handleComposerButtonClick()" class="composer-send-transition is-hidden conversation-send-btn btn-primary flex items-center text-xs flex-shrink-0" type="button" title="发送" aria-label="发送">
-                        <svg class="send-icon w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"/></svg>
-                        <svg class="stop-icon w-3.5 h-3.5 hidden" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                        <!-- DSH 式二态：同一位置只有一个图标。回复中整键换成暂停方块（见 swapStopIcons） -->
+                        <svg class="composer-state-icon w-3.5 h-3.5" viewBox="0 0 24 24" aria-hidden="true"></svg>
                     </button>
                 </div>
             </div>
@@ -5979,9 +5975,21 @@ ${lines.join('\n')}
             if (!String(state.settings.baseUrl || '').trim()) state.settings.baseUrl = preset.defaultBaseUrl;
             if (!String(state.settings.model || '').trim()) state.settings.model = preset.defaultModel;
             if (!['browser', 'aliyun', 'mimo'].includes(state.settings.asrProvider)) state.settings.asrProvider = 'browser';
-            // 手机操作授权策略：非法值一律回落到「每次运行只确认一次」（安全默认）。
-            // 旧版本的 'always' 仍合法 —— 但它的语义已从默认值降级为可选项（最打扰的那档）。
+            // 手机操作授权策略：
+            //   · 非法值 → 回落到「每次运行只确认一次」（安全默认）
+            //   · **迁移**：v1.2.0 前的默认是 'always'，老用户什么都没动过、localStorage 里
+            //     存的却是 'always' —— 只改默认值对他们毫无作用（这是实测发现的：设备上
+            //     装了 v1.2.0、读回来仍是 always）。用 settingsVersion 标记：没迁移过的
+            //     老数据若还是 'always'（即旧默认），一并迁到 'once'。用户后来**主动**
+            //     选过 'always' 的情况无法与"从没动过"区分，统一迁到 once ——
+            //     想要回旧行为去设置里选一次即可，这比"升级后体验毫无变化"好得多。
+            //     （settingsVersion 从未有过 → undefined，视为需要迁移。）
             if (!['once', 'run', 'always', 'off'].includes(state.settings.agentApproval)) state.settings.agentApproval = 'once';
+            if (state.settings.settingsVersion === undefined && state.settings.agentApproval === 'always') {
+                state.settings.agentApproval = 'once';
+            }
+            // 迁移/初始化完成后打上版本标记，下次启动不再动它
+            if (state.settings.settingsVersion === undefined) state.settings.settingsVersion = 2;
             if (typeof state.settings.agentPhoneEnabled !== 'boolean') state.settings.agentPhoneEnabled = true;
             // 实现方式：空表示「还没选过」；非法值一律回落到空（要求用户明确选择，不替他决定）。
             // 注意：这里的 id 列表必须与下面 AGENT_BACKENDS 保持一致 —— 漏一个会让用户选了那种方式后
@@ -10795,14 +10803,23 @@ ${lines.join('\n')}
             }
         }
 
-        /** 切换发送/停止图标 */
+        /**
+         * 切换按钮形态（DSH 式）：**同一个图标槽**，回复中整键变暂停。
+         *
+         * 发送态 = 右箭头（纸飞机太花，DSH 用的就是箭头）；回复中 = 两条竖杠（暂停）。
+         * 颜色不另外变 —— 按钮本来就是主色调（btn-primary），暂停时只是图标换成暂停，
+         * 不像上一版那样突兀地整键变红。
+         */
+        const COMPOSER_ARROW_SVG = '<path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M5 12h13M13 6l6 6-6 6"/>';
+        const COMPOSER_PAUSE_SVG = '<rect fill="currentColor" x="7" y="5.5" width="3.6" height="13" rx="1.2"/><rect fill="currentColor" x="13.4" y="5.5" width="3.6" height="13" rx="1.2"/>';
         function swapStopIcons(button, busy) {
             if (!button) return;
-            const stopIcon = button.querySelector('.stop-icon');
-            const sendIcon = button.querySelector('.send-icon');
-            if (stopIcon) stopIcon.classList.toggle('hidden', !busy);
-            if (sendIcon) sendIcon.classList.toggle('hidden', busy);
-            button.setAttribute('aria-label', busy ? '停止生成' : '发送');
+            const icon = button.querySelector('.composer-state-icon');
+            if (icon) icon.innerHTML = busy ? COMPOSER_PAUSE_SVG : COMPOSER_ARROW_SVG;
+            const label = button.querySelector('.send-label');
+            if (label) label.textContent = busy ? '停止' : '发送';
+            button.title = busy ? '停止生成' : '发送';
+            button.setAttribute('aria-label', button.title);
         }
 
         function closeComposerToolsMenu() {

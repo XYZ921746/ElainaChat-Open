@@ -125,10 +125,15 @@ console.log('\n=== 4. 聊天停止按钮 ===');
     ok(/async function postJsonFromDevice\(url, body, headers = \{\}, timeoutMs = 120000, signal = null\)/.test(html),
         'postJsonFromDevice 收 signal');
     ok(/Promise\.race\(\[run, abortPromise\]\)/.test(html), 'abort 用 race 立即砍掉等待');
-    // 图标二态
-    ok(/class="stop-icon w-3\.5 h-3\.5 hidden"/.test(html) || /stop-icon[^>]*hidden/.test(html), '有停止图标（默认隐藏）');
+    // 图标二态（DSH 式：同一位置一个图标槽，箭头↔暂停）
+    ok(/composer-state-icon/.test(html), '有统一的图标槽（不是两个图标叠着切 hidden）');
+    ok(/COMPOSER_ARROW_SVG/.test(html) && /COMPOSER_PAUSE_SVG/.test(html), '箭头与暂停两套 SVG');
+    ok(/function swapStopIcons/.test(html), 'swapStopIcons 切换图标');
     ok(/is-stopping/.test(html), '有 is-stopping 样式类');
-    ok(/#initialSendBtn\.is-stopping/.test(html) || /\.is-stopping\s*\{/.test(html), '停止态有红色样式');
+    ok(!/#ef4444 !important/.test(html), '停止态不做红色突跳（颜色统一，DSH 式）');
+    // 设置迁移：老用户的 always 要迁到 once
+    ok(/settingsVersion/.test(html), '有 settingsVersion 迁移标记');
+    ok(/agentApproval === 'always'\)\s*\{[\s\S]{0,120}agentApproval = 'once'/.test(html), '迁移逻辑：旧默认 always → once');
     // busy 时按钮可见
     ok(/busy \|\| Boolean\(elements\.initialTextInput\.value\.trim\(\)\)/.test(html), 'busy 时按钮强制可见');
     // 停止时安静收尾
