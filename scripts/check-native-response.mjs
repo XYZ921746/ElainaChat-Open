@@ -72,7 +72,7 @@ console.log('=== 1. 假 Response 必须同时有 json() 与 text() ===');
 console.log('\n=== 2. 行为层：设置面板那条路径（先 text() 再 parse）===');
 
 // 真实打包清单
-const MANIFEST = path.join(ROOT, 'android-app', 'www', 'live2d', 'models', 'manifest.json');
+const MANIFEST = path.join(ROOT, '..', 'android-app', 'www', 'live2d', 'models', 'manifest.json');
 ok(existsSync(MANIFEST), '安卓工程里有 manifest.json');
 const manifestObj = JSON.parse(readFileSync(MANIFEST, 'utf8'));
 

@@ -152,11 +152,11 @@ ok(/window\.agentActions\?\.agentPhoneOperation/.test(live2d)
     'live2d-video.js 会把 [操作:手机…] 转发给主应用');
 ok(/\^\(手机\|设备\)/.test(live2d), 'live2d-video.js 的转发判据认得「手机」前缀');
 ok(/ElainaDevice/.test(html) && /@CapacitorPlugin\(name = "ElainaDevice"\)/.test(
-    readFileSync(path.join(root, 'android-app', 'android', 'app', 'src', 'main', 'java',
+    readFileSync(path.join(root, '..', 'android-app', 'android', 'app', 'src', 'main', 'java',
         'com', 'elainachat', 'opensource', 'ElainaShellPlugin.java'), 'utf8')),
     '原生插件名与前端查找的名字一致（ElainaDevice）');
 ok(/registerPlugin\(ElainaShellPlugin\.class\)/.test(
-    readFileSync(path.join(root, 'android-app', 'android', 'app', 'src', 'main', 'java',
+    readFileSync(path.join(root, '..', 'android-app', 'android', 'app', 'src', 'main', 'java',
         'com', 'elainachat', 'opensource', 'MainActivity.java'), 'utf8')),
     'MainActivity 注册了原生插件（没注册就永远拿不到设备层）');
 

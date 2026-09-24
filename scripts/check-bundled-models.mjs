@@ -109,7 +109,7 @@ function extractFn(src, name) {
 }
 
 // 真实的打包清单（从安卓工程读，那是要打进 APK 的那份）
-const MANIFEST = path.join(ROOT, 'android-app', 'www', 'live2d', 'models', 'manifest.json');
+const MANIFEST = path.join(ROOT, '..', 'android-app', 'www', 'live2d', 'models', 'manifest.json');
 ok(existsSync(MANIFEST), '安卓工程里有打包清单 manifest.json');
 const manifestText = existsSync(MANIFEST) ? readFileSync(MANIFEST, 'utf8') : '{"models":[]}';
 const manifestObj = JSON.parse(manifestText);

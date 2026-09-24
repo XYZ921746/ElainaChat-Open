@@ -33,10 +33,10 @@ function ok(cond, label, detail) {
     else { fail++; failures.push(label); console.log('  FAIL  ' + label + (detail ? '  -> ' + detail : '')); }
 }
 
-const JAVA_DIR = path.join(ROOT, 'android-app', 'android', 'app', 'src', 'main', 'java', 'com', 'elainachat', 'opensource');
+const JAVA_DIR = path.join(ROOT, '..', 'android-app', 'android', 'app', 'src', 'main', 'java', 'com', 'elainachat', 'opensource');
 const OVERLAY_JAVA = path.join(JAVA_DIR, 'ElainaOverlay.java');
 const PLUGIN_JAVA = path.join(JAVA_DIR, 'ElainaShellPlugin.java');
-const MANIFEST = path.join(ROOT, 'android-app', 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
+const MANIFEST = path.join(ROOT, '..', 'android-app', 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
 const html = readFrontend();
 
 // ============================================================ 1. 原生：权限声明

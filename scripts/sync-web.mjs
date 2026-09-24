@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, '..');
 const sourceRoot = path.join(projectRoot, 'web');
-const androidWebRoot = path.join(projectRoot, 'android-app', 'www');
+// android-app 已移到项目**上一级**（D:\222\android-app）—— 构建产物与工具链
+// 不放在项目目录里，避免被误提交、也便于多个项目复用同一套。
+const androidWebRoot = path.join(projectRoot, '..', 'android-app', 'www');
 const modelsSourceRoot = path.join(sourceRoot, 'live2d', 'models');
 const modelsDestRoot = path.join(androidWebRoot, 'live2d', 'models');
 
