@@ -25,6 +25,7 @@ import { mkdtemp, rm, mkdir, writeFile, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -38,7 +39,8 @@ function ok(cond, label, detail) {
 
 // ============================================================ 1. 源码检查
 console.log('=== 1. 前端下载方式（源码）===');
-const html = await readFile(path.join(ROOT, 'web', 'index.html'), 'utf8');
+// 前端拆分后 exportDataBackup 在 web/js/app-*.js 里，必须读整个前端
+const html = readFrontend();
 
 /** 取出 exportDataBackup 函数体（靠大括号配对） */
 function extractFn(source, name) {

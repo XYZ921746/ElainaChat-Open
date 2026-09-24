@@ -22,9 +22,10 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const html = readFileSync(path.join(root, 'web', 'index.html'), 'utf8');
+const html = readFrontend();
 
 let pass = 0;
 const failures = [];

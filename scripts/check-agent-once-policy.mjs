@@ -8,9 +8,10 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const html = readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+const html = readFrontend();
 
 let pass = 0, fail = 0;
 const ok = (c, l, d) => { if (c) { pass++; console.log('  PASS  ' + l); } else { fail++; console.log('  FAIL  ' + l + (d ? '  -> ' + d : '')); } };

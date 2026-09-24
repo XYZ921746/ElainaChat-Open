@@ -22,6 +22,7 @@ import { statSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -139,7 +140,7 @@ try {
     // ==================== 6. 提示词注入：AI 到底知不知道真实位置 ====================
     // 这一段是**关键闭环**：服务端解析得再对，只要没进到提示词里，AI 还是照旧猜路径。
     // 用字符串切片抠出 index.html 里的真实函数体跑一遍（不复制逻辑）。
-    const htmlSrc = readFileSync(path.join(projectRoot, 'web', 'index.html'), 'utf8');
+    const htmlSrc = readFrontend();
     const fnStart = htmlSrc.indexOf('function agentRootsText(');
     if (fnStart < 0) throw new Error('index.html 里找不到 agentRootsText()（重命名了？请同步更新本检查）');
     let depth = 0;

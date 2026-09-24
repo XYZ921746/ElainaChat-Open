@@ -8,9 +8,10 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const html = readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+const html = readFrontend();
 const providers = readFileSync(path.join(ROOT, 'web', 'js', 'chat-providers.js'), 'utf8');
 
 let pass = 0, fail = 0;

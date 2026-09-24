@@ -14,6 +14,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MODELS_ROOT = path.join(projectRoot, 'web', 'live2d', 'models');
@@ -56,7 +57,7 @@ const server = new Function('readdir', 'stat', 'path', 'MODELS_DIR', `
 `)(readdir, stat, path, MODELS_ROOT);
 
 // ==================== Capacitor 原生实现 ====================
-const htmlSrc = readFileSync(path.join(projectRoot, 'web', 'index.html'), 'utf8');
+const htmlSrc = readFrontend();
 /**
  * Capacitor Filesystem 的等价桩：readdir 返回 { files: [{ name, type, size }] }，语义与插件一致。
  * 关键：Capacitor 的 path 是**相对应用数据目录**的（`live2d/models`、`live2d/models/deepseek`），

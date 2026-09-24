@@ -17,6 +17,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROVIDERS_FILE = path.join(ROOT, 'web', 'js', 'chat-providers.js');
@@ -31,7 +32,8 @@ function ok(cond, label, detail) {
 }
 
 const src = readFileSync(PROVIDERS_FILE, 'utf8');
-const html = readFileSync(HTML_FILE, 'utf8');
+// ChatDeps 挂载与 CHAT_API_FORMATS 都随主脚本拆到了 web/js/app-*.js 里
+const html = readFrontend();
 
 // ============================================================ 1. 依赖清单
 console.log('=== 1. 依赖注入是否挂全 ===');

@@ -19,6 +19,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -28,7 +29,7 @@ const ok = (c, l, d) => { if (c) { pass++; console.log('  PASS  ' + l); } else {
 
 const EDGE = path.join(ROOT, 'server', 'edge-tts.mjs');
 const SERVE = readFileSync(path.join(ROOT, 'web', 'serve.mjs'), 'utf8');
-const HTML = readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+const HTML = readFrontend();
 
 // ============================================================ 1. 服务端实现
 console.log('=== 1. 服务端实现（server/edge-tts.mjs）===');

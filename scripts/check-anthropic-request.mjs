@@ -25,9 +25,10 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const html = readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+const html = readFrontend();
 
 /** 按函数名抠出完整函数声明；`async` 前缀必须一起带上，否则里面的 await 会语法错误 */
 function extractFn(name) {

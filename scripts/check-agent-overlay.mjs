@@ -21,6 +21,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -36,7 +37,7 @@ const JAVA_DIR = path.join(ROOT, 'android-app', 'android', 'app', 'src', 'main',
 const OVERLAY_JAVA = path.join(JAVA_DIR, 'ElainaOverlay.java');
 const PLUGIN_JAVA = path.join(JAVA_DIR, 'ElainaShellPlugin.java');
 const MANIFEST = path.join(ROOT, 'android-app', 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
-const html = readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+const html = readFrontend();
 
 // ============================================================ 1. 原生：权限声明
 console.log('=== 1. 原生：权限声明 ===');

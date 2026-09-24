@@ -14,8 +14,9 @@
  * 做法：把 index.html 里的真实函数体抠出来跑，不复制逻辑、不联网。
  */
 import { readFileSync } from 'node:fs';
+import { readFrontend } from './frontend-sources.mjs';
 
-const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+const html = readFrontend();
 
 /** 按函数名抠出完整函数声明；`async` 前缀必须一起带上，否则里面的 await 会语法错误 */
 function extractFn(name) {

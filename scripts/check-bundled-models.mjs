@@ -28,6 +28,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { readFrontend } from './frontend-sources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -39,7 +40,7 @@ function ok(cond, label, detail) {
     else { fail++; failures.push(label); console.log('  FAIL  ' + label + (detail ? '  -> ' + detail : '')); }
 }
 
-const html = readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+const html = readFrontend();
 const video = readFileSync(path.join(ROOT, 'web', 'live2d-video.js'), 'utf8');
 
 // ============================================================ 1. 兜底函数
