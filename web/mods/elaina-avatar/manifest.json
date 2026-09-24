@@ -1,0 +1,8 @@
+{
+    "name": "伊蕾娜立绘与情绪",
+    "version": "1.0.0",
+    "description": "Galgame 与桌宠共用的立绘资源与情绪识别。不单独提供界面，被其他 mod 依赖。",
+    "entry": "index.js",
+    "defaultEnabled": true,
+    "hidden": true
+}

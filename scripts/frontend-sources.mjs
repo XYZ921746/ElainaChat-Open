@@ -3,7 +3,7 @@
 // 为什么需要它：
 //   拆分前，整个前端逻辑都在 web/index.html 里，23 个检查脚本用
 //   `readFileSync('web/index.html')` + 正则去断言（"有没有这个函数""这段逻辑对不对"）。
-//   一旦把 10200 行主脚本拆到 web/js/*.js、把 Galgame/桌宠拆成 web/plugins/*，
+//   一旦把 10200 行主脚本拆到 web/js/*.js、把 Galgame/桌宠拆成 web/mods/*，
 //   那些脚本读到的就只剩 HTML 骨架 —— 断言会全部失败，而且**失败原因是"读错文件"，
 //   不是"功能坏了"**，那种红最难排查。
 //
@@ -32,7 +32,7 @@ export const WEB = path.join(ROOT, 'web');
  *   1. index.html 本身（含内联 <style>，供样式断言用）
  *   2. web/*.js 顶层脚本（live2d-video.js 等）
  *   3. web/js/*.js（按文件名排序，app-01 / app-02 … 前缀保证顺序）
- *   4. web/plugins/<name>/*.js（插件，按名字排序；manifest 里声明了顺序则按其声明）
+ *   4. web/mods/<name>/*.js（插件，按名字排序；manifest 里声明了顺序则按其声明）
  *
  * 只收文本类文件（.html/.js/.css），跳过二进制与 node_modules。
  */

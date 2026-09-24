@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
     <title>ElainaChat Open · 伊蕾娜</title>
     <script src="/vendor/tailwind.js"></script>
+    <!-- Markdown + LaTeX 渲染（离线，随仓库分发，无网络依赖）。
+         消息里的 **加粗**、列表、代码块、表格与 $公式$ 靠它们渲染。
+         两者任一缺失时 renderMessageText 会静默回落成纯文本，不会报错。 -->
+    <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+    <script src="/vendor/marked/marked.min.js"></script>
+    <script src="/vendor/katex/katex.min.js"></script>
     <script src="/vendor/live2dcubismcore.min.js"></script>
     <script src="/vendor/pixi-6.min.js"></script>
     <!-- 对话 API 格式适配器（三种协议的实现 + 分发表）。
@@ -3892,6 +3898,11 @@
     <script src="/js/app-04-ui.js"></script>
     <script src="/js/app-05-voice.js"></script>
     <script src="/js/app-06-settings.js"></script>
+    <!-- 插件系统（mod 加载器）。
+         必须排在 app-07-init.js **之前**：初始化会读插件清单来渲染
+         「设置 → 插件」那一栏，加载器没就位的话那一栏会是空的。
+         但它要排在 app-01..06 之后 —— 插件拿到的宿主 API 依赖这些模块已定义。 -->
+    <script src="/js/mods.js"></script>
     <script src="/js/app-07-init.js"></script>
     <script src="/live2d-video.js"></script>
 </body>

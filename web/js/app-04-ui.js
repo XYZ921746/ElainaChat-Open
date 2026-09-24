@@ -757,6 +757,109 @@ function safeAttrId(id) {
     return String(id == null ? '' : id).replace(/[^A-Za-z0-9_-]/g, '');
 }
 
+/**
+ * 把 AI 回复的文本渲染成 HTML：Markdown + LaTeX（离线，无网络依赖）。
+ *
+ * 为什么需要它（从上游 v1.3.1 合并过来的能力）：
+ *   · 模型很爱输出 `**加粗**`、`- 列表`、```代码块```、表格与数学公式。
+ *     以前一律按纯文本 `whitespace-pre-wrap` 显示，这些标记会原样露出，
+ *     读起来很吵。Markdown 渲染是上游界面的重要体验改进。
+ *   · Galgame mod 也依赖它（对话框要渲染富文本），所以它属于**宿主能力**，
+ *     不能放进某个 mod 里 —— 那样别的 mod 用不到，且 mod 停用就没了。
+ *
+ * 安全（这是关键，不能为了好看牺牲它）：
+ *   ① 先 escapeHtml，**再**交给 marked —— 顺序反了就是 XSS。
+ *   ② 数学公式在转义后用占位符换出，避免 $...$ 里的内容被 Markdown 误解析，
+ *      也避免 KaTeX 拿到已被转义的源码。
+ *   ③ marked / katex 任一不可用（vendor 没加载、离线失败）就**静默回落**到
+ *      纯文本转义 —— 宁可少个样式，也不能白屏或抛错。
+ *   ④ 代码块先挖出来占位再处理，避免把 ``` 里的示例标记当成真指令删掉
+ *      （上游踩过这个坑，注释里写了 OCR 二轮 C）。
+ *
+ * @param {string} text 原始文本
+ * @returns {string} 可安全插入 innerHTML 的 HTML
+ */
+function renderMessageText(text) {
+    const raw0 = String(text == null ? '' : text);
+
+    // ① 先把三反引号围栏整体挖出来占位，避免后续正则误伤代码块里的内容
+    const FENCE = String.fromCharCode(96, 96, 96);
+    const PH0 = String.fromCharCode(0xE100), PH1 = String.fromCharCode(0xE101);
+    const fences = [];
+    let raw = raw0.replace(new RegExp(FENCE + '[\\s\\S]*?' + FENCE, 'g'), (m) => {
+        fences.push(m);
+        return PH0 + (fences.length - 1) + PH1;
+    });
+
+    // ② 剥掉独占一行的场景标记（Galgame 的内部指令，不该显示给用户）
+    raw = raw.replace(/^[ \t]*<scene>[^<\n]{0,64}<\/scene>[ \t]*$/gim, '').trim();
+
+    // ③ 把围栏放回来
+    raw = raw.replace(new RegExp(PH0 + '(\\d+)' + PH1, 'g'), (m, i) => fences[Number(i)] || '');
+
+    // ④ 没有 Markdown 特征就直接纯文本 —— 省掉一次 marked 调用（长回复里它不便宜）
+    //
+    //    注意表格这一项：`| a | b |` + `| --- |` 是 GFM 表格语法，
+    //    但上面的行首特征（#/-/>/```/---）都匹配不到它，会整段被当纯文本。
+    //    上游那份正则就漏了表格，导致"模型输出的表格原样露出管道符"。
+    //    这里补一条：行首以 `|` 开头、且后面出现过分隔行（|---|）。
+    const hasMd = /(^|\n)\s*(#{1,6}\s|[-*+]\s|>\s|\u0060\u0060\u0060|---|\d+\.\s)|(\*\*[^*]+\*\*|\u0060[^\u0060]+\u0060|\[[^\]]+\]\([^)]+\))|(\$\$|(?:^|[^\\])\$[^$\n]{1,200}\$)|(^|\n)\s*\|[^\n]*\|/.test(raw);
+    const mdObj = window.marked;
+    const mdParse = (typeof mdObj === 'function') ? mdObj : (mdObj && typeof mdObj.parse === 'function') ? mdObj.parse.bind(mdObj) : null;
+    if (!hasMd || !mdParse) return escapeHtml(raw);
+
+    // ⑤ 先转义，再用占位符保护数学公式。
+    //
+    //    ⚠️ 这里有个关键细节：escapeHtml 会把反引号转成 &#96;，
+    //    而 marked 认不出 &#96; —— 于是「行内代码」和「代码块」会失效
+    //    （表现为反引号原样显示）。所以先把反引号换成**私有区占位符**
+    //    （U+E200/U+E201，正常文本里不会出现），等 marked 渲染完再换回来。
+    const BT0 = '\uE200', BT1 = '\uE201';
+    const mathStore = [];
+    let safe = escapeHtml(raw);
+    // 三反引号（围栏）与单反引号（行内）分别占位
+    safe = safe.replace(/&#96;&#96;&#96;/g, BT0 + BT0 + BT0);
+    safe = safe.replace(/&#96;/g, BT1);
+    safe = safe.replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => {
+        mathStore.push({ tex, d: true });
+        return '\uE000' + (mathStore.length - 1) + '\uE001';
+    });
+    safe = safe.replace(/(^|[^\\])\$([^$\n]{1,200})\$/g, (m, pre, tex) => {
+        mathStore.push({ tex, d: false });
+        return pre + '\uE000' + (mathStore.length - 1) + '\uE001';
+    });
+    // 把围栏反引号还原成真反引号（交给 marked），行内反引号同理
+    safe = safe.split(BT0).join('`').split(BT1).join('`');
+
+    // ⑥ Markdown 渲染。失败就回落纯文本 —— 样式不该有能力弄挂消息显示
+    let html;
+    try { html = mdParse(safe, { breaks: true, gfm: true }); }
+    catch (e) { return escapeHtml(raw); }
+
+    // ⑦ ★ 安全清洗：marked 会照单全收 `[x](javascript:...)`，生成可点击的
+    //    `href="javascript:..."`。那等于把"点一下就执行任意代码"送给模型输出
+    //    （模型输出受提示词影响，而提示词可以被对话内容影响）。
+    //    这里把所有危险协议的链接/图片降级成纯文本。
+    html = html.replace(/<a\b[^>]*href\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (m, href, text) => {
+        return /^\s*(javascript|data|vbscript|file)\s*:/i.test(href) ? text : m;
+    });
+    html = html.replace(/<img\b[^>]*src\s*=\s*"([^"]*)"[^>]*>/gi, (m, src) => {
+        return /^\s*(javascript|data|vbscript|file)\s*:/i.test(src) ? '' : m;
+    });
+
+    // ⑧ 公式换回 KaTeX。katex 不可用时保留占位符原文（至少不丢内容）
+    if (mathStore.length && window.katex && typeof window.katex.renderToString === 'function') {
+        html = html.replace(/\uE000(\d+)\uE001/g, (m, i) => {
+            const it = mathStore[Number(i)];
+            if (!it) return m;
+            try {
+                return window.katex.renderToString(it.tex, { displayMode: !!it.d, throwOnError: false });
+            } catch (e) { return escapeHtml(it.tex); }
+        });
+    }
+    return html;
+}
+
 function createConversationItem(conv) {
     const div = document.createElement('div');
     const isActive = conv.id === state.currentConversationId;
@@ -1382,7 +1485,7 @@ function renderMessage(message) {
                             </button>
                         </div>
                         ${userImageUrl ? `<img class="message-image" src="${userImageUrl}" alt="${escapeHtml(message.imageName || '用户发送的图片')}">` : ''}
-                        ${message.text ? `<p class="text-indigo-800 text-sm leading-relaxed whitespace-pre-wrap">${escapeHtml(message.text)}</p>` : ''}
+                        ${message.text ? `<p class="text-indigo-800 text-sm leading-relaxed whitespace-pre-wrap">${renderMessageText(message.text)}</p>` : ''}
                     </div>
                 </div>
             </div>
@@ -1417,7 +1520,7 @@ function renderMessage(message) {
                                 <span class="text-xs font-medium">${faved ? '已收藏' : '收藏'}</span>
                             </button>
                         </div>
-                        <p class="text-indigo-950 text-sm leading-relaxed whitespace-pre-wrap">${escapeHtml(message.text)}</p>
+                        <p class="text-indigo-950 text-sm leading-relaxed whitespace-pre-wrap">${renderMessageText(message.text)}</p>
                         ${voiceCard}
                     </div>
                 </div>

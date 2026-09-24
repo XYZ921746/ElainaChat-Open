@@ -1,0 +1,50 @@
+{
+  "comment": "本文件由服务端扫描 mods/ 自动生成（见 server/mods.mjs）。手工改动会在下次扫描时被覆盖。",
+  "plugins": [
+    {
+      "id": "elaina-avatar",
+      "name": "伊蕾娜立绘与情绪",
+      "version": "1.0.0",
+      "description": "Galgame 与桌宠共用的立绘资源与情绪识别。不单独提供界面，被其他 mod 依赖。",
+      "entry": "index.js",
+      "styles": [],
+      "defaultEnabled": true,
+      "after": [],
+      "hidden": true,
+      "hasManifest": true
+    },
+    {
+      "id": "galgame",
+      "name": "Galgame 界面",
+      "version": "1.0.0",
+      "description": "全屏沉浸式剧情界面：场景背景 + 立绘 + 打字机对话框，与主界面共用同一份对话数据。",
+      "entry": "index.js",
+      "styles": [
+        "style.css"
+      ],
+      "defaultEnabled": false,
+      "after": [
+        "elaina-avatar"
+      ],
+      "hidden": false,
+      "hasManifest": true
+    },
+    {
+      "id": "pet",
+      "name": "桌宠",
+      "version": "1.0.0",
+      "description": "悬浮桌宠：立绘 + 聊天气泡，回复情绪自动切换表情。与 Galgame 共用立绘与情绪识别。",
+      "entry": "index.js",
+      "styles": [
+        "style.css"
+      ],
+      "defaultEnabled": false,
+      "after": [
+        "elaina-avatar"
+      ],
+      "hidden": false,
+      "hasManifest": true
+    }
+  ],
+  "generatedAt": "2026-09-24T17:44:27.306Z"
+}

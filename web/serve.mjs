@@ -16,6 +16,7 @@ import { inflateRawSync } from 'node:zlib';
 import dns from 'node:dns';
 import { createStore } from '../server/store.mjs';
 import { synthesizeEdge, probeEdge } from '../server/edge-tts.mjs';
+import { createModManager } from '../server/mods.mjs';
 
 const scryptAsync = promisify(scrypt);
 
@@ -36,6 +37,9 @@ const STORE_MAX_BYTES = 32 * 1024 * 1024; // 端侧数据（聊天记录等）�
 const host = process.env.HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 4173);
 const MODELS_DIR = path.join(root, 'live2d', 'models');
+// 插件（mod）根目录。把 xxx.zip 丢进来就会被自动解压并写进 index.json，
+// 前端只读清单 —— 因为浏览器没法列目录（详见 server/mods.mjs 的说明）。
+const MODS_DIR = path.join(root, 'mods');
 // 模型目录名 = 显示名（真改文件夹）。URL 与文件名都走 encodeURIComponent / decodeURIComponent，
 // 所以中文、空格、emoji 都能用；下面 sanitizeModelDirName 只挡掉文件系统层面真正不合法的字符。
 // 之所以不做"目录名保持 id + 另存显示名"的映射表：多一层状态就多一处会不同步的地方，
@@ -583,7 +587,33 @@ function isUnsafeEntryName(name) {
  *
  * 返回 { files: [{name, data}], blocked: [name] }
  */
-function unzip(buf) {
+/**
+ * 解压 zip。
+ *
+ * @param {Buffer} buf
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowScripts] 是否允许 .js / .mjs 等脚本落盘。
+ *
+ *   **默认 false**，因为 BLOCKED_EXT 的用途是"上传的 Live2D 模型里混进 .html/.js
+ *   就会被同源执行"—— 模型本来就不该带脚本，拦掉是对的。
+ *
+ *   但 **mod（插件）的本质就是 JS**，用它解压 mod 包会把 index.js 一起拦掉，
+ *   表现为"zip 装上了，但里面只有 manifest.json，插件根本跑不起来"。
+ *   所以 mod 那条路显式传 allowScripts: true。
+ *
+ *   注意：开了 allowScripts 也**不等于**放松安全 —— 路径穿越、绝对路径、
+ *   体积上限、.exe/.dll 等本机可执行类型仍然全部拦截，见下面的循环。
+ */
+function unzip(buf, opts = {}) {
+    const allowScripts = opts.allowScripts === true;
+    // 允许脚本时，从黑名单里去掉脚本类扩展名（其余照旧）
+    const SCRIPT_EXTS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts']);
+    const isBlocked = (name) => {
+        const ext = effectiveExt(path.posix.basename(name));
+        if (allowScripts && SCRIPT_EXTS.has(ext)) return false;
+        return BLOCKED_EXT.has(ext);
+    };
+
     if (buf.length < 22 || buf.readUInt32LE(0) !== 0x04034b50) throw new Error('不是有效的 zip 文件');
 
     const decodeName = (nameRaw, flags) => {
@@ -652,7 +682,7 @@ function unzip(buf) {
         if (e.name.endsWith('/') || e.name.endsWith('\\')) continue; // 目录项
         const name = e.name.replace(/\\/g, '/');
         if (isUnsafeEntryName(name)) continue;
-        if (BLOCKED_EXT.has(effectiveExt(path.posix.basename(name)))) { blocked.push(name); continue; }
+        if (isBlocked(name)) { blocked.push(name); continue; }
 
         if (e.localOff + 30 > buf.length || buf.readUInt32LE(e.localOff) !== 0x04034b50) continue;
         const lNameLen = buf.readUInt16LE(e.localOff + 26);
@@ -685,6 +715,17 @@ function unzip(buf) {
     if (!files.length) throw new Error('zip 内没有可用文件');
     return { files, blocked };
 }
+
+// ===== 插件（mod）管理器 =====
+// 复用上面那份 unzip（它已带体积上限、危险类型拦截、路径穿越防护），
+// 而不是另写一份解压 —— 解压是安全敏感代码，只该有一个实现。
+const modManager = createModManager({
+    modsDir: MODS_DIR,
+    unzip,
+    isUnsafeEntryName,
+    effectiveExt,
+    log: (msg) => console.log('[Mod] ' + msg),
+});
 
 /** 处理上传的模型 zip：解压到 models/<name>/ 下 */
 async function handleUpload(req, res) {
@@ -2522,6 +2563,40 @@ const requestHandler = async (request, response) => {
             try { body = await readJsonBody(request); } catch { return jsonResponse(response, 400, { ok: false, message: '请求无效' }); }
             return await renameModel(body, response);
         }
+
+        // ===== 插件（mod）接口 =====
+        //
+        // 列出插件：每次请求都重新扫描目录。为什么不在启动时扫一次就够 ——
+        // 用户完全可能在服务运行期间把 zip 拷进 mods/（那正是"丢个 zip 就装好"
+        // 的用法），启动时扫一次会让他以为没生效。扫描本身很轻（一次 readdir）。
+        if (pathname === '/api/plugins' && request.method === 'GET') {
+            try {
+                const result = await modManager.scanAndSync();
+                return jsonResponse(response, 200, {
+                    ok: true,
+                    plugins: result.installed,
+                    // 回报安装结果：zip 解压失败时必须让用户看到原因，
+                    // 否则"我把 zip 放进去了但没反应"会变成无从排查的问题
+                    installResults: result.results,
+                });
+            } catch (err) {
+                return jsonResponse(response, 500, { ok: false, message: '扫描插件目录失败：' + String((err && err.message) || err) });
+            }
+        }
+        // 卸载插件（删除目录）。仅本机管理员 —— 它能删文件，不该让局域网访客调。
+        const plugDel = pathname.match(/^\/api\/plugins\/([^/]+)$/);
+        if (plugDel && request.method === 'DELETE') {
+            if (!isLocalRequest(request)) {
+                return jsonResponse(response, 403, { ok: false, message: '只有本机可以卸载插件' });
+            }
+            try {
+                await modManager.uninstall(decodeURIComponent(plugDel[1]));
+                return jsonResponse(response, 200, { ok: true });
+            } catch (err) {
+                return jsonResponse(response, 400, { ok: false, message: String((err && err.message) || err) });
+            }
+        }
+
         // API：AI Agent 文件操作（权限模式：app=仅应用文件夹；computer=允许操作电脑）
         const isLocal = isLocalRequest(request);
         if (pathname === '/api/agent/roots' && request.method === 'GET') {
