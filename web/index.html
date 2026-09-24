@@ -3171,11 +3171,30 @@
                               选择会记住，下次打开还是它。
                           </div>
                           <div id="themePickerBox" class="mb-3"></div>
-                          <label class="flex items-center gap-2 py-1 cursor-pointer select-none">
-                              <input type="checkbox" id="themeDarkToggle" class="accent-pink-500">
+
+                          <!-- DIY 自定义主题的编辑区。
+                               只在选中「自定义」时显示（由 theme.js 的 markPicker 控制）——
+                               没选它却摆一堆取色器会让人困惑。
+                               内容（3 个取色器 + 对比度提示）由 theme.js 渲染。 -->
+                          <div id="themeCustomEditor"
+                               style="display:none;padding:10px;border-radius:12px;background:rgba(255,255,255,.5);border:1px solid var(--pixso-line)"></div>
+
+                          <!-- 深色模式：三态（浅色 / 深色 / 跟随系统）
+                               为什么不用单个开关：手机/电脑都有系统级深色设置，
+                               用户通常希望"跟着系统走"（白天浅色、晚上深色）。
+                               只有开/关两态的话，要么每次手动切，要么永远跟不了系统。 -->
+                          <div class="flex items-center gap-2 flex-wrap mt-3">
                               <span class="text-xs text-indigo-700 font-medium">深色模式</span>
-                              <span class="text-[11px] text-indigo-400 ml-1">可与任意主题叠加</span>
-                          </label>
+                              <select id="themeDarkMode" class="modal-input text-xs py-1" style="width:auto;min-width:120px">
+                                  <option value="light">浅色</option>
+                                  <option value="dark">深色</option>
+                                  <option value="system">跟随系统</option>
+                              </select>
+                              <span id="themeDarkHint" class="text-[11px] text-indigo-400"></span>
+                          </div>
+                          <div class="text-[11px] text-indigo-400 mt-1 leading-relaxed">
+                              深色可与任意主题叠加。「跟随系统」会随系统的深色开关自动切换。
+                          </div>
                       </div>
                 </div><!-- /tab-appearance -->
 

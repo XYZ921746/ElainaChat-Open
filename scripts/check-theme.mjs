@@ -45,7 +45,7 @@ console.log('=== 1. 文件与接线 ===');
 
     // 设置界面容器
     ok(/id="themePickerBox"/.test(html), '设置里有 #themePickerBox');
-    ok(/id="themeDarkToggle"/.test(html), '设置里有深色开关');
+    ok(/id="themeDarkMode"/.test(html), '设置里有深色模式控件（三态下拉）');
 }
 
 console.log('\n=== 2. 默认主题不改变外观（关键语义）===');
@@ -57,8 +57,9 @@ console.log('\n=== 2. 默认主题不改变外观（关键语义）===');
     ok(/tpl === 'elaina'/.test(js), '粉紫被显式识别为默认主题');
     // 5 套模板
     const ids = [...js.matchAll(/\{\s*id:\s*'(\w+)',\s*name:/g)].map((m) => m[1]);
-    ok(ids.length === 5, '定义了 5 套模板，实得 ' + ids.length, ids.join(','));
-    for (const id of ['elaina', 'ios', 'claude', 'sage', 'sakura']) {
+    // 5 套预设 + 1 个 DIY「自定义」（颜色由用户定，变量在运行时注入）
+    ok(ids.length === 6, '定义了 6 套模板（5 预设 + 自定义），实得 ' + ids.length, ids.join(','));
+    for (const id of ['elaina', 'ios', 'claude', 'sage', 'sakura', 'custom']) {
         ok(ids.includes(id), '含模板 ' + id);
     }
 }
@@ -78,6 +79,47 @@ console.log('\n=== 3. 覆盖权重（踩过的坑）===');
         '--pixso-cream', '--pixso-line', '--pixso-panel-soft']) {
         ok(css.includes(v + ':'), '★ 覆盖 ' + v);
     }
+
+    // ★★★ 颜色值必须与上游一致（第二版是"自己猜颜色"，导致看着难受）
+    //
+    // 上游那套配色是成体系调过的：主色柔和（#7aa7f0 而非饱和的 #007aff）、
+    // 正文不是纯黑（#253040）、卡片底带冷调（#f7f9fc 而非纯白）。
+    // 这些细节决定"看着舒不舒服"，所以逐个钉住。
+    const upstreamColors = [
+        ['#7aa7f0', '主按钮（上游 --pixso-green，柔和蓝）'],
+        ['#4f7cf0', '主按钮深色（--pixso-green-dark）'],
+        ['#dce2ea', '页面外框（--pixso-canvas）'],
+        ['#253040', '正文（--pixso-brown，不是纯黑）'],
+        ['#566070', '次要文字（--pixso-brown-soft）'],
+        ['#f7f9fc', '卡片底（--pixso-cream，带冷调不是纯白）'],
+        ['#e9eef5', '面板底（--pixso-panel）'],
+        ['#d5dce6', '边框（--pixso-line）'],
+        ['#0d1015', '深色页面底'],
+        ['#dfe6f0', '深色正文'],
+        ['#0a84ff', '深色主色'],
+        ['#1c232d', '深色侧栏竖栏渐变起'],
+    ];
+    for (const [hex, label] of upstreamColors) {
+        ok(css.includes(hex), '★ 配色照抄上游：' + label + ' = ' + hex);
+    }
+
+    // ★ 侧栏竖栏不能复用文字色变量
+    //   宿主里 #sidebar::before 用的是 var(--pixso-brown)（文字色），
+    //   深色下它变浅 → 竖栏变浅灰白，非常刺眼。必须单独指定。
+    ok(/html\[data-theme="dark"\]\s+#sidebar::before/.test(css),
+        '★ 深色下单独指定 #sidebar::before 背景（不能复用文字色变量）');
+
+    // ★ 深色三态（浅色/深色/跟随系统）
+    const themeJs = readFileSync(path.join(WEB, 'js', 'theme.js'), 'utf8');
+    ok(/DARK_MODES\s*=\s*\[[^\]]*'system'/.test(themeJs), '★ theme.js 支持三态（含 system）');
+    ok(/prefers-color-scheme:\s*dark/.test(themeJs), '★ 用 matchMedia 检测系统深色偏好');
+    ok(/addEventListener\('change'/.test(themeJs), '★ 监听系统主题变化（跟随系统要实时响应）');
+    ok(/applyDarkMode/.test(themeJs), '落 DOM 的逻辑统一在一个入口（用户改 / 系统变都走它）');
+
+    const html = readFileSync(path.join(WEB, 'index.html'), 'utf8');
+    ok(/id="themeDarkMode"/.test(html), '★ 设置里有深色模式三态下拉');
+    ok(/value="system">跟随系统</.test(html), '★ 下拉含「跟随系统」选项');
+    ok(/id="themeDarkHint"/.test(html), '有"跟随系统"状态提示元素');
 
     // ★ 必须用 html[data-theme-template] body/ID 形式提升权重
     ok(/html\[data-theme-template\]\s+body\s+\.text-indigo-950/.test(css),
@@ -99,7 +141,6 @@ console.log('\n=== 3. 覆盖权重（踩过的坑）===');
     // !important 仍需用于**类级**覆盖（Tailwind 运行时注入，同权重下它后加载胜出）。
     // 但注意：重写后主要靠覆盖 --pixso-* 变量生效，类级覆盖只是补充，
     // 所以这个数字**不该设得太高** —— 设高了会逼着以后往变量能解决的地方硬加 !important。
-    // 阈值取 20：够挡住"忘了加 !important 导致压不住 Tailwind"的回归，又不误导实现方式。
     const importantCount = (css.match(/!important/g) || []).length;
     ok(importantCount >= 20, '★ 类级覆盖使用了 !important（实得 ' + importantCount + ' 处）');
 
@@ -120,8 +161,8 @@ console.log('\n=== 3.5 主题设置独立成「外观」分栏 ===');
     const advIdx = html.indexOf('id="tab-advanced"');
     const themeIdx = html.indexOf('themeSettingsSection');
     ok(themeIdx > 0 && themeIdx < advIdx, '★ 主题设置已从「高级」移到「外观」');
-    ok(/id="themePickerBox"/.test(html) && /id="themeDarkToggle"/.test(html),
-        '外观分栏里有模板选择器与深色开关');
+    ok(/id="themePickerBox"/.test(html) && /id="themeDarkMode"/.test(html),
+        '外观分栏里有模板选择器与深色三态下拉');
 
     // ★★ 结构完整性：各分栏不能互相嵌套
     //

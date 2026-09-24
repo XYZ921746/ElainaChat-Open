@@ -95,14 +95,17 @@ async function init() {
             e.target.value = '';
         }
     });
-    // 外观主题：深色开关（模板卡片的事件由 theme.js 自己绑）
-    document.getElementById('themeDarkToggle')?.addEventListener('change', (e) => {
-        if (window.ElainaTheme) window.ElainaTheme.setDark(e.target.checked);
+    // 外观主题：深色模式三态（浅色 / 深色 / 跟随系统）。
+    // 用三态而不是单个开关，是因为手机/电脑都有系统级深色设置 ——
+    // "跟随系统"能白天浅色、晚上深色自动切，两态开关做不到。
+    // theme.js 负责落 DOM 与同步控件，这里只转发用户选择。
+    document.getElementById('themeDarkMode')?.addEventListener('change', (e) => {
+        if (window.ElainaTheme) window.ElainaTheme.setDarkMode(e.target.value);
     });
     // 设置面板打开时同步一次状态（用户可能在别处改过主题）
     if (window.ElainaTheme) {
-        const darkToggle = document.getElementById('themeDarkToggle');
-        if (darkToggle) darkToggle.checked = window.ElainaTheme.isDark();
+        const sel = document.getElementById('themeDarkMode');
+        if (sel) sel.value = window.ElainaTheme.darkMode();
     }
     document.getElementById('authChangeBtn')?.addEventListener('click', changeAccessPassword);
     document.getElementById('authLogoutBtn')?.addEventListener('click', logoutAccess);
