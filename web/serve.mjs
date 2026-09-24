@@ -17,6 +17,11 @@ import dns from 'node:dns';
 import { createStore } from '../server/store.mjs';
 import { synthesizeEdge, probeEdge } from '../server/edge-tts.mjs';
 import { createModManager } from '../server/mods.mjs';
+// zip 解压 / 危险扩展名判定：**服务端唯一的实现**在 server/zip.mjs。
+// 原先 serve.mjs 里还另有一份几乎相同的 unzip（含体积上限、危险类型拦截、GBK 解码、
+// zip64 回退），与 zip.mjs 的 readZip 逐段重复 —— 两份实现意味着安全修复要改两处，
+// 漏一处就是个洞。现已合并：这里只保留一个薄包装，语义（{files, blocked}）不变。
+import { readZip, BLOCKED_EXT, effectiveExt } from '../server/zip.mjs';
 
 const scryptAsync = promisify(scrypt);
 
@@ -50,34 +55,9 @@ const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 const MAX_UPLOAD = 200 * 1024 * 1024;      // 上传的压缩包大小上限 200MB
 const MAX_EXTRACTED = 512 * 1024 * 1024;   // 解压后总大小上限（防 zip bomb：200KB 的包可膨胀到数百 MB）
 const MAX_ENTRY_SIZE = 256 * 1024 * 1024;  // 解压后单文件上限
-// 不允许解压落盘的危险类型：这些文件一旦被上传到 web/ 下，就会以同源身份被浏览器执行/渲染
-const BLOCKED_EXT = new Set([
-    '.html', '.htm', '.xhtml', '.shtml', '.hta', '.mhtml',
-    '.js', '.mjs', '.cjs', '.jsx', '.ts',
-    '.svg', '.xml', '.xsl',
-    '.exe', '.dll', '.com', '.scr', '.msi', '.bat', '.cmd', '.ps1', '.psm1', '.vbs', '.wsf', '.jar', '.sh',
-]);
-
-/**
- * 取「最终落盘名」的扩展名，用于 BLOCKED_EXT 判定。
- *
- * 为什么不能直接用 path.extname：Windows 上有三种写法，extname 看到的和真正落盘的
- * **不是同一个名字**，于是黑名单被绕过（实测均可复现）：
- *
- *   x.html::$DATA   → extname 得到 ".html::$data"，但 NTFS 交换数据流语法下
- *                     写它等于写默认流，**落盘就是 x.html**，静态服务照样当 HTML 执行
- *   x.html.         → extname 得到 "."，Windows 会丢掉尾随点，落盘仍是 x.html
- *   x.html␠        → extname 得到 ".html "，尾随空格同样被丢掉
- *
- * 所以先把这些"看不见的尾巴"剥干净，再取扩展名。
- */
-function effectiveExt(name) {
-    let s = String(name == null ? '' : name);
-    const colon = s.indexOf(':');          // NTFS ADS：只保留流名之前的部分
-    if (colon >= 0) s = s.slice(0, colon);
-    s = s.replace(/[. ]+$/, '');           // Windows 会丢弃尾随的点与空格
-    return path.extname(s).toLowerCase();
-}
+// BLOCKED_EXT / effectiveExt 已移到 server/zip.mjs（解压实现所在处），
+// 这里通过上面的 import 使用 —— 危险类型清单属于"解压"的安全约束，
+// 跟着实现走才能保证所有调用方（模型上传 / 数据导入 / mod 安装）都受保护。
 
 /** 该路径是否是禁止在应用文件夹内写入的危险类型 */
 function isBlockedWritePath(target) {
@@ -547,23 +527,9 @@ const contentTypes = new Map([
     ['.svg', 'image/svg+xml'],
 ]);
 
-/** GBK 解码（Windows zip 文件名常用） */
-function gbkDecode(buf) {
-    try {
-        return new TextDecoder('gbk').decode(buf);
-    } catch {
-        return buf.toString('latin1');
-    }
-}
 
-/** 从尾部找 EOCD（中央目录结束记录），找不到返回 -1 */
-function findEocd(buf) {
-    const min = Math.max(0, buf.length - (0xFFFF + 22));
-    for (let i = buf.length - 22; i >= min; i--) {
-        if (buf[i] === 0x50 && buf[i + 1] === 0x4b && buf[i + 2] === 0x05 && buf[i + 3] === 0x06) return i;
-    }
-    return -1;
-}
+
+
 
 /** 条目名是否不安全（绝对路径 / 路径穿越） */
 function isUnsafeEntryName(name) {
@@ -587,133 +553,16 @@ function isUnsafeEntryName(name) {
  *
  * 返回 { files: [{name, data}], blocked: [name] }
  */
+
+
 /**
- * 解压 zip。
+ * 兼容包装：原先 serve.mjs 自带的 unzip 已合并到 server/zip.mjs。
  *
- * @param {Buffer} buf
- * @param {object} [opts]
- * @param {boolean} [opts.allowScripts] 是否允许 .js / .mjs 等脚本落盘。
- *
- *   **默认 false**，因为 BLOCKED_EXT 的用途是"上传的 Live2D 模型里混进 .html/.js
- *   就会被同源执行"—— 模型本来就不该带脚本，拦掉是对的。
- *
- *   但 **mod（插件）的本质就是 JS**，用它解压 mod 包会把 index.js 一起拦掉，
- *   表现为"zip 装上了，但里面只有 manifest.json，插件根本跑不起来"。
- *   所以 mod 那条路显式传 allowScripts: true。
- *
- *   注意：开了 allowScripts 也**不等于**放松安全 —— 路径穿越、绝对路径、
- *   体积上限、.exe/.dll 等本机可执行类型仍然全部拦截，见下面的循环。
+ * 保留这个名字与返回形态（{files, blocked}）是为了不动调用点 ——
+ * 模型上传与 mod 安装都按这个形态取值。实现只有一份，在 zip.mjs。
  */
 function unzip(buf, opts = {}) {
-    const allowScripts = opts.allowScripts === true;
-    // 允许脚本时，从黑名单里去掉脚本类扩展名（其余照旧）
-    const SCRIPT_EXTS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts']);
-    const isBlocked = (name) => {
-        const ext = effectiveExt(path.posix.basename(name));
-        if (allowScripts && SCRIPT_EXTS.has(ext)) return false;
-        return BLOCKED_EXT.has(ext);
-    };
-
-    if (buf.length < 22 || buf.readUInt32LE(0) !== 0x04034b50) throw new Error('不是有效的 zip 文件');
-
-    const decodeName = (nameRaw, flags) => {
-        if (flags & 0x800) return nameRaw.toString('utf8');
-        const utf8 = nameRaw.toString('utf8');
-        return utf8.includes('\uFFFD') ? gbkDecode(nameRaw) : utf8;
-    };
-
-    // 1) 优先从中央目录读取条目表（这是 zip 的权威元数据）
-    const entries = [];
-    let fromCentral = false;
-    const eocdOff = findEocd(buf);
-    if (eocdOff >= 0) {
-        const total = buf.readUInt16LE(eocdOff + 10);
-        const cdSize = buf.readUInt32LE(eocdOff + 12);
-        const cdOff = buf.readUInt32LE(eocdOff + 16);
-        const isZip64 = cdOff === 0xFFFFFFFF || cdSize === 0xFFFFFFFF || total === 0xFFFF;
-        if (!isZip64 && cdOff + cdSize <= buf.length) {
-            let off = cdOff;
-            let ok = true;
-            for (let i = 0; i < total; i++) {
-                if (off + 46 > buf.length || buf.readUInt32LE(off) !== 0x02014b50) { ok = false; break; }
-                const flags = buf.readUInt16LE(off + 8);
-                const method = buf.readUInt16LE(off + 10);
-                const compSize = buf.readUInt32LE(off + 20);
-                const nameLen = buf.readUInt16LE(off + 28);
-                const extraLen = buf.readUInt16LE(off + 30);
-                const commentLen = buf.readUInt16LE(off + 32);
-                const localOff = buf.readUInt32LE(off + 42);
-                const nameRaw = buf.subarray(off + 46, off + 46 + nameLen);
-                entries.push({ name: decodeName(nameRaw, flags), method, compSize, localOff });
-                off += 46 + nameLen + extraLen + commentLen;
-            }
-            fromCentral = ok;
-            if (!ok) entries.length = 0;
-        }
-    }
-
-    // 2) 回退：没有可用中央目录（流式/损坏/ZIP64）时按 local header 顺序走。
-    //    带 data descriptor 的条目无法从头部得知数据长度，宁可直接报错，也不要靠猜导致静默损坏。
-    if (!fromCentral) {
-        let off = 0;
-        while (off + 30 <= buf.length) {
-            if (buf.readUInt32LE(off) !== 0x04034b50) break;
-            const flags = buf.readUInt16LE(off + 6);
-            const method = buf.readUInt16LE(off + 8);
-            const compSize = buf.readUInt32LE(off + 18);
-            const nameLen = buf.readUInt16LE(off + 26);
-            const extraLen = buf.readUInt16LE(off + 28);
-            const nameRaw = buf.subarray(off + 30, off + 30 + nameLen);
-            if (flags & 0x8) {
-                throw new Error('该 zip 缺少可用的中央目录，且条目使用了 data descriptor（无法确定数据长度）。请用 7-Zip / zipfile 等标准工具重新打包后上传。');
-            }
-            entries.push({ name: decodeName(nameRaw, flags), method, compSize, localOff: off });
-            off = off + 30 + nameLen + extraLen + compSize;
-        }
-    }
-
-    if (!entries.length) throw new Error('zip 内没有文件');
-
-    // 3) 逐条解压（带体积上限与类型/路径校验）
-    const files = [];
-    const blocked = [];
-    let extracted = 0;
-    for (const e of entries) {
-        if (e.name.endsWith('/') || e.name.endsWith('\\')) continue; // 目录项
-        const name = e.name.replace(/\\/g, '/');
-        if (isUnsafeEntryName(name)) continue;
-        if (isBlocked(name)) { blocked.push(name); continue; }
-
-        if (e.localOff + 30 > buf.length || buf.readUInt32LE(e.localOff) !== 0x04034b50) continue;
-        const lNameLen = buf.readUInt16LE(e.localOff + 26);
-        const lExtraLen = buf.readUInt16LE(e.localOff + 28);
-        const dataStart = e.localOff + 30 + lNameLen + lExtraLen;
-        const data = buf.subarray(dataStart, dataStart + e.compSize);
-
-        if (e.method !== 0 && e.method !== 8) throw new Error(`不支持的压缩方式: ${e.method}（${name}）`);
-        const remaining = MAX_EXTRACTED - extracted;
-        if (e.compSize > MAX_ENTRY_SIZE || e.compSize > remaining) {
-            throw new Error(`解压后体积超过上限（单文件上限 ${Math.round(MAX_ENTRY_SIZE / 1024 / 1024)}MB，总计 ${Math.round(MAX_EXTRACTED / 1024 / 1024)}MB），已拒绝上传`);
-        }
-        let content;
-        if (e.method === 0) {
-            content = Buffer.from(data);
-        } else {
-            try {
-                content = inflateRawSync(data, { maxOutputLength: Math.min(MAX_ENTRY_SIZE, remaining) });
-            } catch (err) {
-                if (err && (err.code === 'ERR_BUFFER_TOO_LARGE' || /too large/i.test(String(err.message)))) {
-                    throw new Error(`解压后体积超过上限（单文件上限 ${Math.round(MAX_ENTRY_SIZE / 1024 / 1024)}MB，总计 ${Math.round(MAX_EXTRACTED / 1024 / 1024)}MB），已拒绝上传`);
-                }
-                throw new Error(`条目解压失败：${name}（${err.message}）`);
-            }
-        }
-        extracted += content.length;
-        if (extracted > MAX_EXTRACTED) throw new Error('解压后总大小超过上限，已拒绝上传（疑似压缩炸弹）');
-        files.push({ name, data: content });
-    }
-    if (!files.length) throw new Error('zip 内没有可用文件');
-    return { files, blocked };
+    return readZip(buf, { ...opts, returnBlocked: true });
 }
 
 // ===== 插件（mod）管理器 =====

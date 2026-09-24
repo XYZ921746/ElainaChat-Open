@@ -79,16 +79,24 @@ console.log('=== 1. 关键实现存在且语义正确 ===');
     const mods = readFileSync(path.join(ROOT, 'server', 'mods.mjs'), 'utf8');
     const serve = readFileSync(path.join(ROOT, 'web', 'serve.mjs'), 'utf8');
     const loader = readFileSync(path.join(ROOT, 'web', 'js', 'mods.js'), 'utf8');
+    // 解压实现已合并到 server/zip.mjs（原先 serve.mjs 里另有一份几乎相同的 unzip）。
+    // 所以 BLOCKED_EXT / effectiveExt / allowScripts 这些要看**实现那份**，
+    // 不能再断言它们在 serve.mjs 里 —— 那是合并前的布局。
+    const zip = readFileSync(path.join(ROOT, 'server', 'zip.mjs'), 'utf8');
 
     ok(/export function createModManager/.test(mods), 'server/mods.mjs 导出 createModManager');
     ok(/function scanAndSync/.test(mods), '有 scanAndSync（扫描目录 + 解压 + 生成清单）');
     ok(/function uninstall/.test(mods), '有 uninstall');
     ok(/MOD_ID_RE/.test(mods), '插件名有白名单校验（挡 .. 与绝对路径）');
 
-    // ★ allowScripts：mod 的本质是 JS，但 unzip 默认黑名单含 .js
+    // ★ allowScripts：mod 的本质是 JS，但解压默认黑名单含 .js
     ok(/allowScripts:\s*true/.test(mods), '★ 解压 mod 时传 allowScripts:true（否则 .js 会被拦掉）');
-    ok(/allowScripts/.test(serve), 'serve.mjs 的 unzip 支持 allowScripts 选项');
-    ok(/SCRIPT_EXTS/.test(serve), '脚本类扩展名被单独识别');
+    ok(/allowScripts/.test(zip), '★ server/zip.mjs 的 readZip 支持 allowScripts 选项');
+    ok(/SCRIPT_EXTS/.test(zip), '脚本类扩展名被单独识别');
+    // 合并后的单一实现：serve.mjs 不该再有自己那份 unzip
+    ok(!/^function unzip\(/m.test(serve) || /readZip\(buf, \{ \.\.\.opts, returnBlocked: true \}\)/.test(serve),
+        '★ 解压实现只有一份（serve.mjs 只保留薄包装，不再自带完整实现）');
+    ok(/from '\.\.\/server\/zip\.mjs'/.test(serve), 'serve.mjs 从 zip.mjs 引入解压实现');
 
     // ★ 卸载要连 zip 一起删
     ok(/id \+ ext/.test(mods) || /\.zip/.test(mods.split('function uninstall')[1] || ''),

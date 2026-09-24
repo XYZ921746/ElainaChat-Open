@@ -87,21 +87,26 @@ function extractFn(source, name) {
 // ============================================================ 1. 函数级：扩展名判定
 console.log('=== 1. 写入黑名单：扩展名判定必须看"最终落盘名" ===');
 {
+    // 解压实现合并后，BLOCKED_EXT / effectiveExt 移到了 server/zip.mjs
+    // （危险类型清单属于"解压"的安全约束，跟着实现走）；
+    // isBlockedWritePath 仍留在 serve.mjs（它服务的是 agentWrite）。
+    // 所以两个文件都要读。
+    const zipSrc = readFileSync(path.join(ROOT, 'server', 'zip.mjs'), 'utf8');
     const need = ['effectiveExt', 'isBlockedWritePath', 'BLOCKED_EXT'];
     const missing = need.filter((n) => (n === 'BLOCKED_EXT'
-        ? !/const BLOCKED_EXT = new Set\(\[/.test(src)
-        : !extractFn(src, n)));
-    ok(missing.length === 0, 'serve.mjs 里能找到 effectiveExt / isBlockedWritePath / BLOCKED_EXT',
+        ? !/const BLOCKED_EXT = new Set\(\[/.test(zipSrc)
+        : (n === 'effectiveExt' ? !extractFn(zipSrc, n) : !extractFn(src, n))));
+    ok(missing.length === 0, '能找到 effectiveExt（zip.mjs）/ isBlockedWritePath（serve.mjs）/ BLOCKED_EXT（zip.mjs）',
         missing.length ? '缺少：' + missing.join(', ') : '');
 
     if (!missing.length) {
         // BLOCKED_EXT 常量单独切出来（到 `]);` 为止）
-        const setStart = src.indexOf('const BLOCKED_EXT = new Set([');
-        const setEnd = src.indexOf(']);', setStart) + 3;
+        const setStart = zipSrc.indexOf('const BLOCKED_EXT = new Set([');
+        const setEnd = zipSrc.indexOf(']);', setStart) + 3;
         const ctx = vm.createContext({ path, console });
         vm.runInContext(
-            src.slice(setStart, setEnd) + '\n'
-            + extractFn(src, 'effectiveExt') + '\n'
+            zipSrc.slice(setStart, setEnd) + '\n'
+            + extractFn(zipSrc, 'effectiveExt') + '\n'
             + extractFn(src, 'isBlockedWritePath') + '\n'
             + 'this.__blocked = isBlockedWritePath; this.__ext = effectiveExt;',
             ctx

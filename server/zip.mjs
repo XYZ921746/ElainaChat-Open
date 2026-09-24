@@ -17,6 +17,42 @@
 //  这样 7-Zip / WinRAR / Windows 自带解压 / Python zipfile 都能正确打开。
 
 import { deflateRawSync, inflateRawSync, crc32 } from 'node:zlib';
+import path from 'node:path';
+
+// ============================================================================
+//  危险扩展名（解压落盘的安全底线）
+//
+//  这份清单原来在 web/serve.mjs 里。合并解压实现时一起搬到这里 ——
+//  它属于"解压"这件事的安全约束，跟着实现走才能保证所有调用方都受保护。
+//  serve.mjs 仍然从这里 import 使用（agentWrite 也要用它）。
+// ============================================================================
+export const BLOCKED_EXT = new Set([
+    '.html', '.htm', '.xhtml', '.shtml', '.hta', '.mhtml',
+    '.js', '.mjs', '.cjs', '.jsx', '.ts',
+    '.svg', '.xml', '.xsl',
+    '.exe', '.dll', '.com', '.scr', '.msi', '.bat', '.cmd', '.ps1', '.psm1', '.vbs', '.wsf', '.jar', '.sh',
+]);
+
+/**
+ * 取「最终落盘名」的扩展名。
+ *
+ * 为什么不能直接用 path.extname：Windows 上有三种写法，extname 看到的和真正落盘的
+ * **不是同一个名字**，于是黑名单被绕过（实测均可复现）：
+ *
+ *   x.html::$DATA   → extname 得到 ".html::$data"，但 NTFS 交换数据流语法下
+ *                     写它等于写默认流，**落盘就是 x.html**，静态服务照样当 HTML 执行
+ *   x.html.         → extname 得到 "."，Windows 会丢掉尾随点，落盘仍是 x.html
+ *   x.html␠        → extname 得到 ".html "，尾随空格同样被丢掉
+ *
+ * 所以先把这些"看不见的尾巴"剥干净，再取扩展名。
+ */
+export function effectiveExt(name) {
+    let s = String(name == null ? '' : name);
+    const colon = s.indexOf(':');          // NTFS ADS：只保留流名之前的部分
+    if (colon >= 0) s = s.slice(0, colon);
+    s = s.replace(/[. ]+$/, '');           // Windows 会丢弃尾随的点与空格
+    return path.extname(s).toLowerCase();
+}
 
 // ---------------------------------------------------------------------- 写
 /**
@@ -125,13 +161,42 @@ function gbkDecode(buf) {
 
 /**
  * 解压 zip。
+ *
  * @param buf zip 内容
- * @param opts { maxTotal, maxEntry } 体积上限（防压缩炸弹）
- * @returns [{ name, data }]
+ * @param opts {
+ *   maxTotal,       解压后总大小上限（防压缩炸弹）
+ *   maxEntry,       单文件上限
+ *   allowScripts,   是否允许 .js/.mjs 等脚本落盘（默认 false）
+ *   blockExts,      额外要拦的扩展名集合（可选）
+ *   returnBlocked,  true 时返回 { files, blocked }，否则只返回数组（兼容旧调用）
+ * }
+ * @returns [{ name, data }] 或 { files, blocked }
+ *
+ * ── 为什么危险类型拦截放在这里（而不是各调用方自己写）──────────────────
+ *
+ * 这个函数是**服务端唯一的 zip 解压实现**（原先 serve.mjs 里还另有一份
+ * 几乎相同的 unzip，已合并过来）。危险扩展名拦截属于"解压这件事"的安全底线，
+ * 放在实现内部才能保证每个调用方都受保护 —— 之前 readZip 没有这层，
+ * 数据导入路径就成了绕过点（虽然导入的键名受白名单限制，风险低，但没必要留口子）。
+ *
+ * **默认拦脚本**是因为本函数的主要调用方是"导入用户备份"，而备份里不该有 .js。
+ * 但 mod（插件）安装必须允许脚本（mod 的本质就是 JS），所以给了 allowScripts 开关。
+ * 开了之后路径穿越/绝对路径/体积上限仍然全部拦截。
  */
 export function readZip(buf, opts = {}) {
     const maxTotal = opts.maxTotal ?? 512 * 1024 * 1024;
     const maxEntry = opts.maxEntry ?? 256 * 1024 * 1024;
+    const allowScripts = opts.allowScripts === true;
+    const returnBlocked = opts.returnBlocked === true;
+    const blockExts = opts.blockExts || BLOCKED_EXT;
+
+    // 允许脚本时，从黑名单里去掉脚本类扩展名（其余照旧）
+    const SCRIPT_EXTS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts']);
+    const isBlocked = (name) => {
+        const ext = effectiveExt(path.posix.basename(name));
+        if (allowScripts && SCRIPT_EXTS.has(ext)) return false;
+        return blockExts.has(ext);
+    };
 
     if (!Buffer.isBuffer(buf) || buf.length < 22) throw new Error('不是有效的 zip 文件');
     if (buf.readUInt32LE(0) !== 0x04034b50) throw new Error('不是有效的 zip 文件');
@@ -192,12 +257,16 @@ export function readZip(buf, opts = {}) {
     if (!entries.length) throw new Error('zip 内没有文件');
 
     const files = [];
+    const blocked = [];
     let total = 0;
     for (const e of entries) {
         if (e.name.endsWith('/') || e.name.endsWith('\\')) continue;
         const name = e.name.replace(/\\/g, '/');
         // 路径穿越防护：备份文件也可能被人为改坏
         if (name.startsWith('/') || /^[A-Za-z]:/.test(name) || name.split('/').includes('..')) continue;
+        // 危险类型拦截（.html/.js/.svg/.exe…）。用 effectiveExt 而非 extname ——
+        // 后者会被 x.html::$DATA 这类 Windows 写法绕过（落盘仍是 x.html）
+        if (isBlocked(name)) { blocked.push(name); continue; }
 
         if (e.localOff + 30 > buf.length || buf.readUInt32LE(e.localOff) !== 0x04034b50) continue;
         const lNameLen = buf.readUInt16LE(e.localOff + 26);
@@ -227,5 +296,7 @@ export function readZip(buf, opts = {}) {
         files.push({ name, data: content });
     }
     if (!files.length) throw new Error('zip 内没有可用文件');
-    return files;
+    // 两种返回形态：老调用方（数据导入）拿数组，需要知道"哪些被拦了"的调用方
+    // （模型上传、mod 安装）拿 { files, blocked }
+    return returnBlocked ? { files, blocked } : files;
 }
