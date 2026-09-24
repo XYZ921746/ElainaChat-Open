@@ -122,6 +122,18 @@ console.log('=== 1. 关键实现存在且语义正确 ===');
     ok(/ElainaMods/.test(data) && /collectPromptHints/.test(data),
         '★ 宿主在构造提示词时消费 mod 注入的 system 片段');
 
+    // ---- 上传安装（应用内安装插件）----
+    // 原先只能"把 zip 拷进 web/mods/ 目录"，手机/平板用户碰不到文件系统
+    // （APK 更没有服务端），所以补了应用内上传这条路。
+    ok(/api\/plugins\/install/.test(serve), '服务端有 POST /api/plugins/install（上传安装）');
+    ok(/installFromBuffer/.test(mods), 'mods.mjs 提供 installFromBuffer（从内存 zip 安装）');
+    ok(/writePluginFiles/.test(mods),
+        '★ 两条安装路径（丢文件进目录 / 上传）共用同一段安全逻辑');
+    // 非法名不能被"静默净化"后照装 —— 实测踩过：先净化再校验会让 ../../hack 变成 hack 并安装成功
+    ok(/插件名不能包含路径成分/.test(serve), '★ 含路径成分的插件名被明确拒绝（不静默改名）');
+    ok(/id="modsInstallBtn"/.test(html), '设置里有「上传安装」按钮');
+    ok(/id="modsFileInput"/.test(html), '有隐藏的 file input');
+
     // ---- 设置 → 插件分栏 ----
     ok(/data-settings-tab="tab-mods"/.test(html), '设置里有「插件」Tab');
     ok(/id="tab-mods"/.test(html), '有 #tab-mods 面板');

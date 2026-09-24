@@ -56,6 +56,45 @@ async function init() {
         if (hint) { hint.textContent = '扫描中…'; hint.className = 'text-[11px] text-indigo-400'; }
         void refreshModsList();
     });
+    // 插件：上传安装。
+    //
+    // 为什么要有这条路：原先只能"把 zip 拷进 web/mods/ 目录"，电脑上可行，
+    // 但手机/平板用户碰不到文件系统（APK 更是连服务端都没有）。所以补一个
+    // 应用内上传入口 —— 与"丢文件进目录"等价，只是换了个方式把 zip 交给服务端。
+    //
+    // 传输方式：请求体直接是 zip 的原始字节（不是 multipart）。这样服务端
+    // 不用写 multipart 解析、也不引依赖；前端用 fetch 把 File 当 body 发即可。
+    document.getElementById('modsInstallBtn')?.addEventListener('click', () => {
+        document.getElementById('modsFileInput')?.click();
+    });
+    document.getElementById('modsFileInput')?.addEventListener('change', async (e) => {
+        const file = e.target.files && e.target.files[0];
+        const hint = document.getElementById('modsHint');
+        if (!file) return;
+        const setHint = (text, cls) => {
+            if (hint) { hint.textContent = text; hint.className = 'text-[11px] ' + (cls || 'text-indigo-500'); }
+        };
+        setHint('上传中…（' + Math.round(file.size / 1024) + ' KB）', 'text-indigo-500');
+        try {
+            const res = await fetch('/api/plugins/install?name=' + encodeURIComponent(file.name), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/zip' },
+                body: file,
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data || !data.ok) {
+                setHint('安装失败：' + ((data && data.message) || ('HTTP ' + res.status)), 'text-red-500');
+            } else {
+                setHint('✅ ' + (data.message || '已安装') + '（到上面打开开关即可启用）', 'text-emerald-600');
+                void refreshModsList();
+            }
+        } catch (err) {
+            setHint('安装失败：' + String((err && err.message) || err), 'text-red-500');
+        } finally {
+            // 清空 input，否则同一个文件再选一次不会触发 change
+            e.target.value = '';
+        }
+    });
     // 外观主题：深色开关（模板卡片的事件由 theme.js 自己绑）
     document.getElementById('themeDarkToggle')?.addEventListener('change', (e) => {
         if (window.ElainaTheme) window.ElainaTheme.setDark(e.target.checked);

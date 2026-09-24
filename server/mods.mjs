@@ -84,9 +84,28 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
      *   · 危险的本机可执行类型跳过
      *   · 总解压体积封顶
      */
-    async function extractPluginZip(zipPath, id) {
+    /**
+     * 从**内存里的 zip** 安装插件（供「应用内上传」用）。
+     *
+     * 与 extractPluginZip 的区别只在于数据来源：那个从磁盘文件读，这个直接收
+     * Buffer。安全逻辑**完全一致**（路径穿越 / 绝对路径 / 危险类型 / 体积上限），
+     * 因为两者最终都走同一段解压循环 —— 这是刻意的：安全规则只该有一份。
+     *
+     * @param {Buffer} buf       zip 内容
+     * @param {string} id        插件 id（来自 zip 文件名，会做白名单校验）
+     * @returns {Promise<{id, written, skipped}>}
+     */
+    async function installFromBuffer(buf, id) {
         if (!MOD_ID_RE.test(id)) throw new Error('插件名不合法：' + id);
-        const buf = await readFile(zipPath);
+        if (!Buffer.isBuffer(buf) || buf.length < 22) throw new Error('不是有效的 zip 文件');
+        return writePluginFiles(buf, id);
+    }
+
+    /**
+     * 解压并落盘（extractPluginZip 与 installFromBuffer 的公共实现）。
+     * 把这段单独抽出来，是为了让"从文件装"和"从上传装"走**同一条安全路径**。
+     */
+    async function writePluginFiles(buf, id) {
         // ★ allowScripts: true —— mod 的本质就是 JS。
         //   默认的黑名单会把 .js/.mjs 拦掉（那是为 Live2D 模型设计的：模型不该带脚本），
         //   用它解 mod 包会得到"只有 manifest.json、插件跑不起来"的怪现象。
@@ -137,6 +156,13 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         }
         if (skipped.length) log('插件 ' + id + ' 跳过 ' + skipped.length + ' 个不安全/不允许的条目');
         return { id, written, skipped: skipped.length };
+    }
+
+    /** 从磁盘上的 zip 文件安装（扫描目录时自动调用） */
+    async function extractPluginZip(zipPath, id) {
+        if (!MOD_ID_RE.test(id)) throw new Error('插件名不合法：' + id);
+        const buf = await readFile(zipPath);
+        return writePluginFiles(buf, id);
     }
 
     /**
@@ -238,5 +264,5 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         return true;
     }
 
-    return { scanAndSync, uninstall, extractPluginZip, MOD_ID_RE };
+    return { scanAndSync, uninstall, extractPluginZip, installFromBuffer, MOD_ID_RE };
 }

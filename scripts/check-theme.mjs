@@ -67,6 +67,18 @@ console.log('\n=== 3. 覆盖权重（踩过的坑）===');
 {
     const css = readFileSync(path.join(WEB, 'css', 'themes.css'), 'utf8');
 
+    // ★★ 最关键的一条：必须覆盖 --pixso-* 变量
+    //
+    // 第一版只覆盖了 --color-* 与 text-indigo-*，结果切主题只有聊天区变色 ——
+    // 侧栏/外框/按钮/强调色全不动，视觉上"割裂"。根因是这套界面的真实配色
+    // 来自另一组 --pixso-* 变量（橄榄绿/深棕方案），被引用 224 次。
+    const pixsoCount = (css.match(/--pixso-/g) || []).length;
+    ok(pixsoCount >= 40, '★ 覆盖 --pixso-* 变量（配色割裂的根因，实得 ' + pixsoCount + ' 处）');
+    for (const v of ['--pixso-canvas', '--pixso-brown', '--pixso-green', '--pixso-orange',
+        '--pixso-cream', '--pixso-line', '--pixso-panel-soft']) {
+        ok(css.includes(v + ':'), '★ 覆盖 ' + v);
+    }
+
     // ★ 必须用 html[data-theme-template] body/ID 形式提升权重
     ok(/html\[data-theme-template\]\s+body\s+\.text-indigo-950/.test(css),
         '★ 用 html[attr] body .类 的形式（类级选择器压不住项目里已有的 ID 级规则）');
@@ -84,14 +96,32 @@ console.log('\n=== 3. 覆盖权重（踩过的坑）===');
     ok(/html\[data-theme="dark"\]\s+body\s+\.text-indigo-950/.test(css),
         '★ 深色模式的规则同样提权');
 
-    // !important 必须普遍使用（Tailwind 运行时注入，同权重下它后加载胜出）
+    // !important 仍需用于**类级**覆盖（Tailwind 运行时注入，同权重下它后加载胜出）。
+    // 但注意：重写后主要靠覆盖 --pixso-* 变量生效，类级覆盖只是补充，
+    // 所以这个数字**不该设得太高** —— 设高了会逼着以后往变量能解决的地方硬加 !important。
+    // 阈值取 20：够挡住"忘了加 !important 导致压不住 Tailwind"的回归，又不误导实现方式。
     const importantCount = (css.match(/!important/g) || []).length;
-    ok(importantCount >= 30, '★ 覆盖规则普遍使用 !important（实得 ' + importantCount + ' 处）');
+    ok(importantCount >= 20, '★ 类级覆盖使用了 !important（实得 ' + importantCount + ' 处）');
 
     // 深色与模板正交
     ok(/html\[data-theme="dark"\]/.test(css), '有 html[data-theme="dark"] 规则');
     ok(/html\[data-theme-template="ios"\]/.test(css) && /html\[data-theme-template="sakura"\]/.test(css),
         '四套液态玻璃模板都有变量定义');
+}
+
+console.log('\n=== 3.5 主题设置独立成「外观」分栏 ===');
+{
+    const html = readFileSync(path.join(WEB, 'index.html'), 'utf8');
+    // 上游顶部导航里就有「外观」一项；埋在「高级」里要翻两层才找到
+    ok(/data-settings-tab="tab-appearance">外观</.test(html), '★ 有独立的「外观」Tab');
+    ok(/id="tab-appearance"/.test(html), '有 #tab-appearance 面板');
+    ok(/id="tab-appearance" class="settings-tab-panel active-panel"/.test(html),
+        '★ 外观是默认激活分栏（打开设置直接看到主题）');
+    const advIdx = html.indexOf('id="tab-advanced"');
+    const themeIdx = html.indexOf('themeSettingsSection');
+    ok(themeIdx > 0 && themeIdx < advIdx, '★ 主题设置已从「高级」移到「外观」');
+    ok(/id="themePickerBox"/.test(html) && /id="themeDarkToggle"/.test(html),
+        '外观分栏里有模板选择器与深色开关');
 }
 
 console.log('\n=== 4. 同步（APK 端要用）===');

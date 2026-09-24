@@ -2445,6 +2445,57 @@ const requestHandler = async (request, response) => {
                 return jsonResponse(response, 400, { ok: false, message: String((err && err.message) || err) });
             }
         }
+        // 上传安装插件：POST /api/plugins/install?name=xxx
+        //
+        // 为什么需要这个接口：原先只能"把 zip 拷进 mods/ 目录"再让服务端扫描。
+        // 那条路在电脑上可行，但**手机/平板用户根本碰不到文件系统**（尤其 APK，
+        // 连服务端都没有）。所以补一个应用内上传的入口。
+        //
+        // 请求体就是 zip 原始字节（不是 multipart）—— 前端用 fetch 直接把
+        // File 对象当 body 发，省掉解析 multipart 的一整套代码，也不引入依赖。
+        // 插件名从 query 取（zip 文件名），与"丢文件进目录"那条路命名规则一致。
+        if (pathname === '/api/plugins/install' && request.method === 'POST') {
+            if (!isLocalRequest(request)) {
+                return jsonResponse(response, 403, { ok: false, message: '只有本机可以安装插件' });
+            }
+            const rawName = String(url.searchParams.get('name') || '').trim();
+            if (!rawName) {
+                return jsonResponse(response, 400, { ok: false, message: '缺少插件名（请把 zip 文件名作为 name 参数）' });
+            }
+            // ★ 先拒绝"名字里带路径成分"的请求，**再**净化。
+            //
+            //   顺序很重要：如果先净化（`replace(/^.*[\\/]/, '')`）再校验，
+            //   `../../hack.zip` 会被静默改成 `hack` 并安装成功 —— 用户意图被曲解，
+            //   而且掩盖了一次路径穿越尝试（实测踩到：非法名返回了 HTTP 200）。
+            //   这里明确报错，让调用方知道名字不合法。
+            if (/[\\/]/.test(rawName) || rawName.includes('..')) {
+                return jsonResponse(response, 400, { ok: false, message: '插件名不能包含路径成分（/ \\ ..）' });
+            }
+            const id = rawName.replace(/\.zip$/i, '');
+            if (!id) {
+                return jsonResponse(response, 400, { ok: false, message: '缺少插件名（请把 zip 文件名作为 name 参数）' });
+            }
+            let buf;
+            try {
+                buf = await readRawBody(request, MAX_UPLOAD);
+            } catch (err) {
+                return jsonResponse(response, 413, { ok: false, message: '上传失败或文件过大：' + String((err && err.message) || err) });
+            }
+            if (!buf || buf.length < 22) {
+                return jsonResponse(response, 400, { ok: false, message: '文件为空或不是有效的 zip' });
+            }
+            try {
+                const r = await modManager.installFromBuffer(buf, id);
+                await modManager.scanAndSync();
+                console.log(`[Mod] 已通过上传安装插件：${id}（${r.written} 个文件${r.skipped ? '，跳过 ' + r.skipped + ' 个' : ''}）`);
+                return jsonResponse(response, 200, {
+                    ok: true, id: r.id, files: r.written, skipped: r.skipped,
+                    message: '已安装 ' + r.id + '（' + r.written + ' 个文件）',
+                });
+            } catch (err) {
+                return jsonResponse(response, 400, { ok: false, message: String((err && err.message) || err) });
+            }
+        }
 
         // API：AI Agent 文件操作（权限模式：app=仅应用文件夹；computer=允许操作电脑）
         const isLocal = isLocalRequest(request);
