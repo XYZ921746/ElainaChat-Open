@@ -133,48 +133,58 @@ html[data-theme-template="claude"] {
     --ink: #3a2d24;
 }
 
-/* ==================== 鼠尾草（照抄上游） ==================== */
+/* ==================== 鼠尾草（照抄上游 + 提亮主色） ====================
+ *
+ * 用户反馈"绿色太暗不好看"。上游 sage 的主色 #4f9d7d 是配它自己的浅底玻璃用的，
+ * 在我们这套结构里（主按钮是实心渐变、气泡是实心块）显得闷。
+ *
+ * 但**不能只调亮** —— 实测白字对比度会掉：
+ *     #4f9d7d → 3.26:1     #3fae87 → 2.76:1     #2fb98a → 2.49:1
+ * 越鲜越亮，白字越糊。所以采取"主色更鲜 + 渐变终点更深"的组合：
+ * 观感上更通透，同时把对比度拉回 3:1 以上。
+ */
 html[data-theme-template="sage"] {
-    --lg-primary: #4f9d7d;
-    --lg-primary-deep: #3d8365;
-    --lg-primary-soft: rgba(79, 157, 125, 0.12);
+    --lg-primary: #3fae87;
+    --lg-primary-deep: #2b7d5d;
+    --lg-primary-soft: rgba(63, 174, 135, 0.14);
     --lg-accent-2: rgba(156, 201, 180, 0.9);
-    --lg-bg: #eef2ef;
-    --lg-ink: #22392e;
-    --lg-ink-soft: #55705f;
-    --lg-text-muted: #7c9385;
+    --lg-bg: #eef4f0;
+    --lg-ink: #1e3529;
+    --lg-ink-soft: #4e6b5a;
+    --lg-text-muted: #77907f;
 
-    --pixso-canvas: #dae2dc;
-    --pixso-brown: #22392e;
-    --pixso-brown-dark: #17281f;
-    --pixso-brown-soft: #55705f;
-    --pixso-cream: #f5f9f6;
-    --pixso-panel: #e6eee9;
-    --pixso-panel-soft: #eff5f1;
-    --pixso-orange: #4f9d7d;
-    --pixso-green: #4f9d7d;
-    --pixso-green-dark: #3d8365;
-    --pixso-line: #cfded5;
-    --pixso-shadow: 0 30px 80px rgba(34, 57, 46, 0.16), 0 6px 18px rgba(34, 57, 46, 0.08);
+    --pixso-canvas: #d8e4dc;
+    --pixso-brown: #1e3529;
+    --pixso-brown-dark: #14251c;
+    --pixso-brown-soft: #4e6b5a;
+    --pixso-cream: #f6faf7;
+    --pixso-panel: #e4eee8;
+    --pixso-panel-soft: #eef6f1;
+    --pixso-orange: #3fae87;
+    --pixso-green: #3fae87;
+    /* 终点压深：白字对比度靠它拉回来（浅绿 + 深绿渐变，均值约 3.5:1） */
+    --pixso-green-dark: #25795a;
+    --pixso-line: #cbdcd2;
+    --pixso-shadow: 0 30px 80px rgba(30, 53, 41, 0.16), 0 6px 18px rgba(30, 53, 41, 0.08);
 
-    --tpl-primary: #4f9d7d;
-    --tpl-primary-deep: #3d8365;
-    --tpl-primary-soft: #9cc9b4;
-    --tpl-tint: rgba(79, 157, 125, 0.12);
+    --tpl-primary: #3fae87;
+    --tpl-primary-deep: #25795a;
+    --tpl-primary-soft: #93d4b9;
+    --tpl-tint: rgba(63, 174, 135, 0.14);
 
-    --color-primary: #4f9d7d;
-    --color-primary-soft: #9cc9b4;
+    --color-primary: #3fae87;
+    --color-primary-soft: #93d4b9;
     --color-secondary: #6b9bd2;
     --color-secondary-soft: #9dbde3;
     --color-accent: #7fb069;
-    --text-heading: #22392e;
-    --text-body: #35513f;
-    --text-secondary: #55705f;
-    --text-muted: #7c9385;
-    --text-glass-heading: #22392e;
-    --text-glass-body: #35513f;
-    --text-glass-muted: #55705f;
-    --ink: #22392e;
+    --text-heading: #1e3529;
+    --text-body: #2f4f3e;
+    --text-secondary: #4e6b5a;
+    --text-muted: #77907f;
+    --text-glass-heading: #1e3529;
+    --text-glass-body: #2f4f3e;
+    --text-glass-muted: #4e6b5a;
+    --ink: #1e3529;
 }
 
 /* ==================== 樱花桃（照抄上游） ==================== */
@@ -254,6 +264,39 @@ html[data-theme-template] body .text-indigo-400,
 html[data-theme-template] body .text-indigo-300,
 html[data-theme-template] body .text-indigo-200 { color: var(--pixso-brown-soft) !important; }
 
+/* ★ 气泡内部的文字要**放行**，不能跟着上面的类级规则走。
+ *
+ * 用户气泡是深色/主色底，里面必须用白字（宿主原本就有这条规则：
+ * `.bubble-user .text-indigo-500 { color: rgba(255,255,255,0.92) }`），
+ * 但我的 `html[data-theme-template] body .text-indigo-500` 权重更高，
+ * 把它压成了主色 —— 于是蓝底上出现蓝色文字，时间戳和「收藏」都看不清。
+ *
+ * 这里显式恢复：用户气泡内一律白字，AI 气泡内用正文色阶。 */
+html[data-theme-template] body .bubble-user .text-indigo-500,
+html[data-theme-template] body .bubble-user .text-indigo-300,
+html[data-theme-template] body .bubble-user .text-indigo-800,
+html[data-theme-template] body .bubble-user .text-indigo-950,
+html[data-theme-template] body .bubble-user .text-indigo-700,
+html[data-theme-template] body .bubble-user .text-indigo-600,
+html[data-theme-template] body .bubble-user .text-indigo-400,
+html[data-theme-template] body .bubble-user .text-indigo-200,
+html[data-theme-template] body .bubble-user .text-pink-500,
+html[data-theme-template] body .bubble-user .text-amber-500 {
+    color: rgba(255, 255, 255, 0.92) !important;
+}
+/* 「收藏」按钮在用户气泡里：未收藏时是淡白，已收藏时给个暖色（在白底上才看得见） */
+html[data-theme-template] body .bubble-user .text-amber-500 { color: #ffd166 !important; }
+
+html[data-theme-template] body .bubble-ai .text-indigo-950,
+html[data-theme-template] body .bubble-ai .text-indigo-900,
+html[data-theme-template] body .bubble-ai .text-indigo-800 { color: var(--pixso-brown) !important; }
+html[data-theme-template] body .bubble-ai .text-indigo-700,
+html[data-theme-template] body .bubble-ai .text-indigo-600,
+html[data-theme-template] body .bubble-ai .text-indigo-500,
+html[data-theme-template] body .bubble-ai .text-indigo-400,
+html[data-theme-template] body .bubble-ai .text-indigo-300 { color: var(--pixso-brown-soft) !important; }
+html[data-theme-template] body .bubble-ai .text-pink-600 { color: var(--pixso-orange) !important; }
+
 html[data-theme-template] #sidebar .text-indigo-950,
 html[data-theme-template] #sidebar .text-indigo-900,
 html[data-theme-template] #sidebar .text-indigo-800,
@@ -313,6 +356,68 @@ html[data-theme-template] .modal-panel .btn-primary {
 html[data-theme-template] body .bubble-user {
     background: linear-gradient(135deg, var(--tpl-primary), var(--pixso-green-dark)) !important;
     color: #fff !important;
+}
+
+/* ============================================================================
+ *  气泡边界（"聊天框信息看不清、分不清边界"的修复）
+ *
+ *  ── 根因 ──────────────────────────────────────────────────────────────
+ *
+ *  宿主在 index.html 里**主动抹掉了气泡的边框、阴影、模糊**：
+ *
+ *      .bubble-user, .bubble-ai { border: 0; box-shadow: none; backdrop-filter: none; }
+ *      .bubble-ai   { background: var(--pixso-panel-soft); }
+ *      .bubble-user { background: var(--pixso-brown); }
+ *
+ *  于是气泡只剩"纯色底"这一种区分手段。而上游的配色里，
+ *  AI 气泡色（#f3f6fa）与聊天区底（#f7f9fc）**几乎同色** —— 差距只有
+ *  约 1.02:1 对比度，肉眼基本看不出来。上游之所以没这个问题，是因为它
+ *  用的是**半透明玻璃 + 边框 + 阴影**（`border: 1px solid rgba(255,255,255,...)`
+ *  + `box-shadow: var(--lg-shadow)` + `backdrop-filter: blur(14px)`），
+ *  即使底色接近也能靠边界分开。
+ *
+ *  ── 修法 ──────────────────────────────────────────────────────────────
+ *
+ *  恢复"边框 + 阴影"这两条边界线索（不强行拉大底色差 —— 那会破坏
+ *  上游调好的柔和观感）。边框用主色的低透明度版，既清晰又不抢眼。
+ * ========================================================================== */
+html[data-theme-template] body .bubble-ai {
+    background: var(--pixso-cream) !important;
+    /* 边框用半透明深色（不用 color-mix —— 旧版 Android WebView 不支持，
+       项目 minSdk 29，不能赌 WebView 版本）。浅底上一条淡深边就够分开了。 */
+    border: 1px solid rgba(18, 30, 50, 0.10) !important;
+    box-shadow: 0 2px 10px rgba(18, 30, 50, 0.07), 0 1px 2px rgba(18, 30, 50, 0.05) !important;
+}
+html[data-theme-template] body .bubble-user {
+    border: 1px solid rgba(255, 255, 255, 0.35) !important;
+    box-shadow: 0 2px 10px rgba(18, 30, 50, 0.12) !important;
+}
+/* 气泡尾巴要跟着气泡底色走 —— 宿主里尾巴写死 var(--pixso-brown)/var(--pixso-panel-soft)，
+   我把用户气泡改成主色渐变后，尾巴颜色就对不上了（一个蓝色气泡配深色尾巴）。 */
+html[data-theme-template] body .bubble-ai::after {
+    background: var(--pixso-cream) !important;
+    box-shadow: 0 -3px 0 var(--pixso-cream) !important;
+}
+html[data-theme-template] body .bubble-user::after {
+    background: var(--pixso-green-dark) !important;
+    box-shadow: 0 -3px 0 var(--pixso-green-dark) !important;
+}
+
+/* 深色下的气泡边界：底色接近，同样靠边框分开 */
+html[data-theme="dark"] body .bubble-ai,
+html[data-theme="dark"] body .thinking-bubble {
+    background: linear-gradient(150deg, rgba(30, 46, 80, 0.55), rgba(18, 28, 48, 0.55)) !important;
+    border: 1px solid rgba(255, 255, 255, 0.16) !important;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35) !important;
+    color: var(--pixso-brown) !important;
+}
+html[data-theme="dark"] body .bubble-user {
+    border: 1px solid rgba(255, 255, 255, 0.22) !important;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35) !important;
+}
+html[data-theme="dark"] body .bubble-ai::after {
+    background: rgb(24, 38, 64) !important;
+    box-shadow: 0 -3px 0 rgb(24, 38, 64) !important;
 }
 
 /* 选中态：上游用淡主色底，不是纯色块 */
@@ -482,15 +587,99 @@ html[data-theme="dark"] body .text-indigo-200 { color: #6b768c !important; }
 html[data-theme="dark"] body .text-pink-500,
 html[data-theme="dark"] body .text-pink-600 { color: #5ca8ff !important; }
 
+/* 深色下气泡内部同样要放行（同浅色那段的理由） */
+html[data-theme="dark"] body .bubble-user .text-indigo-500,
+html[data-theme="dark"] body .bubble-user .text-indigo-400,
+html[data-theme="dark"] body .bubble-user .text-indigo-300,
+html[data-theme="dark"] body .bubble-user .text-indigo-200,
+html[data-theme="dark"] body .bubble-user .text-pink-500 { color: rgba(255, 255, 255, 0.88) !important; }
+html[data-theme="dark"] body .bubble-ai .text-indigo-950,
+html[data-theme="dark"] body .bubble-ai .text-indigo-800 { color: #eef2f7 !important; }
+html[data-theme="dark"] body .bubble-ai .text-indigo-600,
+html[data-theme="dark"] body .bubble-ai .text-indigo-500,
+html[data-theme="dark"] body .bubble-ai .text-indigo-400,
+html[data-theme="dark"] body .bubble-ai .text-indigo-300 { color: #a4afc0 !important; }
+
 html[data-theme="dark"] body .bg-pink-50,
 html[data-theme="dark"] body .bg-indigo-100 { background-color: rgba(255, 255, 255, 0.07) !important; }
 html[data-theme="dark"] body .border-indigo-100 { border-color: rgba(255, 255, 255, 0.12) !important; }
 
-/* 深色：设置卡片（上游给设置区单独一组规则） */
+/* 深色：设置面板（上游给设置区单独一组规则） */
 html[data-theme="dark"] #settingsContent > section,
 html[data-theme="dark"] #settingsContent .settings-card {
     background: rgba(255, 255, 255, 0.04) !important;
     border-color: rgba(255, 255, 255, 0.09) !important;
+}
+
+/* 深色：设置面板的**结构性白块**。
+ *
+ * 宿主里这几处写死了浅色，深色下就是一块块白（实测截图确认）：
+ *
+ *   #settingsPanel > div:nth-child(2)              background: #fbfaf8      ← 主体区
+ *   #settingsPanel > div:first-child               background: rgba(255,255,255,.92)  ← 标题栏
+ *   #settingsPanel > div:nth-child(2) > section    background: rgba(255,255,255,.56)  ← 每个卡片
+ *   #settingsPanel > div:last-child                background: rgba(255,255,255,.78)  ← 底部按钮栏
+ *
+ * 用 !important 覆盖（宿主那几条也带 !important，且选择器同权重，
+ * 靠后加载 + 提高权重才能压住）。 */
+html[data-theme="dark"] #settingsPanel > div:first-child,
+html[data-theme="dark"] #settingsPanel > div:nth-child(2),
+html[data-theme="dark"] #settingsPanel > div:last-child {
+    background: rgba(255, 255, 255, 0.05) !important;
+    border-color: rgba(255, 255, 255, 0.10) !important;
+}
+html[data-theme="dark"] #settingsPanel > div:nth-child(2) > section,
+html[data-theme="dark"] #settingsPanel > div:nth-child(2) > section:last-child {
+    background: rgba(255, 255, 255, 0.05) !important;
+    border-color: rgba(255, 255, 255, 0.10) !important;
+    box-shadow: none !important;
+}
+/* 分栏导航栏那条白边 */
+html[data-theme="dark"] #settingsPanel .settings-tab-btn {
+    background: transparent !important;
+    color: var(--pixso-brown-soft) !important;
+}
+html[data-theme="dark"] #settingsPanel .settings-tab-btn.active {
+    background: rgba(255, 255, 255, 0.10) !important;
+    color: var(--pixso-brown) !important;
+}
+/* 设置里其他写死的白色块 */
+html[data-theme="dark"] #settingsPanel .btn-secondary,
+html[data-theme="dark"] #settingsPanel .glass-button {
+    background: rgba(255, 255, 255, 0.08) !important;
+    border-color: rgba(255, 255, 255, 0.16) !important;
+    color: var(--pixso-brown) !important;
+}
+html[data-theme="dark"] #settingsPanel .modal-input,
+html[data-theme="dark"] #settingsPanel .modal-textarea,
+html[data-theme="dark"] #settingsPanel select {
+    background: rgba(255, 255, 255, 0.07) !important;
+    border-color: rgba(255, 255, 255, 0.14) !important;
+    color: var(--pixso-brown) !important;
+}
+/* 设置里的选项卡片（主题卡片等） */
+html[data-theme="dark"] .theme-tpl-card {
+    background: rgba(255, 255, 255, 0.07) !important;
+}
+html[data-theme="dark"] #themeCustomEditor {
+    background: rgba(255, 255, 255, 0.05) !important;
+    border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+/* 深色：其他可能残留的白底（消息操作条 / 顶部栏 / 空状态） */
+html[data-theme="dark"] .message-actions,
+html[data-theme="dark"] .header-memory-btn,
+html[data-theme="dark"] .glass-button {
+    background: rgba(255, 255, 255, 0.10) !important;
+    border-color: rgba(255, 255, 255, 0.16) !important;
+    color: var(--pixso-brown) !important;
+}
+html[data-theme="dark"] body .bg-white\/40,
+html[data-theme="dark"] body .bg-white\/50,
+html[data-theme="dark"] body .bg-white\/60,
+html[data-theme="dark"] body .bg-white\/70,
+html[data-theme="dark"] body .bg-white\/80 {
+    background-color: rgba(255, 255, 255, 0.07) !important;
 }
 
 /* 深色：主按钮用更亮的蓝渐变（照抄上游） */
