@@ -105,6 +105,29 @@ async function collectModFiles(dir, prefix = '') {
     }
     return out;
 }
+// 主题样式表（web/css/ 下）—— 与 js/ 同理自动发现：
+// 多主题的覆盖层就在这里，漏同步会让 APK 里主题切换无效（但页面不报错，
+// 表现为"点了没反应"，很难联想到是同步遗漏）。
+async function collectCssFiles(dir, prefix = '') {
+    const out = [];
+    let entries = [];
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
+    for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue;
+        const rel = prefix ? prefix + '/' + entry.name : entry.name;
+        if (entry.isDirectory()) {
+            out.push(...await collectCssFiles(path.join(dir, entry.name), rel));
+        } else if (entry.isFile() && entry.name.endsWith('.css')) {
+            out.push(rel);
+        }
+    }
+    return out;
+}
+const cssFiles = (await collectCssFiles(path.join(sourceRoot, 'css'))).sort();
+for (const rel of cssFiles) {
+    filesToCopy.push(['css/' + rel, 'css/' + rel]);
+}
+
 const modFiles = (await collectModFiles(path.join(sourceRoot, 'mods'))).sort();
 for (const rel of modFiles) {
     filesToCopy.push(['mods/' + rel, 'mods/' + rel]);
@@ -119,6 +142,7 @@ for (const [src, dest] of filesToCopy) {
 console.log(`Synced ${filesToCopy.length} files (customized Web UI incl. Live2D) into the Android project.`);
 if (jsFiles.length) console.log(`  frontend scripts: ${jsFiles.map((f) => 'js/' + f).join(', ')}`);
 if (modFiles.length) console.log(`  mods: ${modFiles.length} files`);
+if (cssFiles.length) console.log(`  css: ${cssFiles.map((f) => 'css/' + f).join(', ')}`);
 
 // ==================== 内置 Live2D 模型 ====================
 // 仓库里 web/live2d/models/ 下的模型随 APK 分发：复制进安卓工程的 www/live2d/models/，

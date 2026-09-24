@@ -1,0 +1,338 @@
+/* ============================================================================
+ * 多主题覆盖层
+ *
+ * 加载于 index.html 的样式之后、且所有规则都在
+ * `html[data-theme-template="..."]` 之下 —— 不设该属性时**一条都不生效**，
+ * 所以默认（粉紫）外观与改动前逐像素一致。
+ *
+ * ── 为什么必须用 !important ──────────────────────────────────────────────
+ *
+ * Tailwind 是**运行时 JIT**：它扫 DOM 生成样式并在运行时注入 <style>，
+ * 注入位置晚于本文件。同权重下后注入的胜出，所以这里的覆盖规则
+ * 一律加 !important 才能稳定压住它（靠选择器权重不够）。
+ *
+ * ── 覆盖策略 ─────────────────────────────────────────────────────────────
+ *
+ * 我们的界面里颜色有两类来源，都要管：
+ *   ① CSS 变量（294 处引用）→ 覆盖变量值即可
+ *   ② 硬编码 Tailwind 颜色类（408 处，indigo 占 229）→ 只能逐类覆盖
+ *
+ * 后者是主要工作量：按使用频次从高到低覆盖（text-indigo-500 用了 73 次、
+ * text-indigo-300 64 次……）。低频的装饰色（fuchsia/teal/emerald 渐变）
+ * 保留原样 —— 它们是点缀，改了反而失去层次。
+ *
+ * ── 语义映射 ─────────────────────────────────────────────────────────────
+ *
+ * 每套模板定义 5 个色阶，其余类按"深浅"映射到它们：
+ *   --tpl-primary     主色（强调、按钮、选中态）
+ *   --tpl-primary-deep  更深（正文标题）
+ *   --tpl-primary-soft  更浅（次要文字、图标）
+ *   --tpl-tint        极浅（背景块、边框）
+ *   --tpl-canvas      页面底色
+ * ========================================================================== */
+
+/* ==================== iOS 蓝（液态玻璃主视觉） ==================== */
+html[data-theme-template="ios"] {
+    --tpl-primary: #007aff;
+    --tpl-primary-deep: #004a99;
+    --tpl-primary-soft: #4d9fff;
+    --tpl-tint: #eaf2ff;
+    --tpl-canvas: #f2f5f9;
+
+    /* 覆盖宿主变量（管用了变量的那 294 处） */
+    --color-primary: #007aff;
+    --color-primary-soft: #4d9fff;
+    --color-secondary: #5ac8fa;
+    --color-secondary-soft: #8ed9fb;
+    --color-accent: #34aadc;
+    --text-heading: #0b1f33;
+    --text-body: #1c3b57;
+    --text-secondary: #4a6b8a;
+    --text-muted: #7b95ad;
+    --text-glass-heading: #0b1f33;
+    --text-glass-body: #1c3b57;
+    --text-glass-muted: #4a6b8a;
+    --ink: #0b1f33;
+}
+
+/* ==================== 陶土橙 ==================== */
+html[data-theme-template="claude"] {
+    --tpl-primary: #d97757;
+    --tpl-primary-deep: #8f4429;
+    --tpl-primary-soft: #e39b81;
+    --tpl-tint: #faf0eb;
+    --tpl-canvas: #f7f4f1;
+
+    --color-primary: #d97757;
+    --color-primary-soft: #e39b81;
+    --color-secondary: #c9a227;
+    --color-secondary-soft: #dcc06a;
+    --color-accent: #b8763f;
+    --text-heading: #3d2a20;
+    --text-body: #5a4033;
+    --text-secondary: #86665a;
+    --text-muted: #a58d80;
+    --text-glass-heading: #3d2a20;
+    --text-glass-body: #5a4033;
+    --text-glass-muted: #86665a;
+    --ink: #3d2a20;
+}
+
+/* ==================== 鼠尾草 ==================== */
+html[data-theme-template="sage"] {
+    --tpl-primary: #4f9d7d;
+    --tpl-primary-deep: #2c6249;
+    --tpl-primary-soft: #7fbda3;
+    --tpl-tint: #eaf3ee;
+    --tpl-canvas: #f1f5f2;
+
+    --color-primary: #4f9d7d;
+    --color-primary-soft: #7fbda3;
+    --color-secondary: #6b9bd2;
+    --color-secondary-soft: #9dbde3;
+    --color-accent: #7fb069;
+    --text-heading: #1d3329;
+    --text-body: #2f4d3f;
+    --text-secondary: #587a6a;
+    --text-muted: #8aa79a;
+    --text-glass-heading: #1d3329;
+    --text-glass-body: #2f4d3f;
+    --text-glass-muted: #587a6a;
+    --ink: #1d3329;
+}
+
+/* ==================== 樱花桃 ==================== */
+html[data-theme-template="sakura"] {
+    --tpl-primary: #d97b93;
+    --tpl-primary-deep: #8f4358;
+    --tpl-primary-soft: #e8a4b5;
+    --tpl-tint: #fdf0f3;
+    --tpl-canvas: #f9f3f5;
+
+    --color-primary: #d97b93;
+    --color-primary-soft: #e8a4b5;
+    --color-secondary: #b98fc9;
+    --color-secondary-soft: #d0b3da;
+    --color-accent: #e89aa8;
+    --text-heading: #3d2530;
+    --text-body: #5a3a47;
+    --text-secondary: #8a6070;
+    --text-muted: #ab8b98;
+    --text-glass-heading: #3d2530;
+    --text-glass-body: #5a3a47;
+    --text-glass-muted: #8a6070;
+    --ink: #3d2530;
+}
+
+/* ============================================================================
+ *  硬编码颜色类的覆盖
+ *
+ *  ⚠️ 权重必须够高 —— 这是踩过的坑：
+ *
+ *  项目里**已经有一层**用 ID 选择器覆盖 indigo 类的规则（pixso 主题那块：
+ *  `#sidebar .text-indigo-950`、`.modal-panel .text-indigo-800` …，都带 !important）。
+ *  我最初写的 `html[data-theme-template] .text-indigo-950` 权重只有
+ *  (0,2,1) + 属性选择器 = 类级，**压不住 ID 级** —— 实测 sidebar 里的标题
+ *  仍是 pixso 的棕色 rgb(76,49,35)，而不是新主题色。
+ *
+ *  所以这里统一用 `html[data-theme-template] body ...` 的形式：
+ *  属性选择器(1) + 类(1) + body(1) + 目标类(1) → 与 ID 规则同级或更高，
+ *  再靠 !important + 后加载胜出。
+ *
+ *  另外注意：**颜色渐变不在 body 上**。实测 body.backgroundImage 是 none，
+ *  真正的渐变在 #mainContent（径向渐变）与 .aurora-orb 上，所以那两处单独覆盖。
+ * ========================================================================== */
+
+/* ---- indigo 文字（合计 229 次，是最主要的色调来源）---- */
+html[data-theme-template] body .text-indigo-950,
+html[data-theme-template] body .text-indigo-900,
+html[data-theme-template] body .text-indigo-800,
+html[data-theme-template] body .text-indigo-700 { color: var(--tpl-primary-deep) !important; }
+html[data-theme-template] body .text-indigo-600,
+html[data-theme-template] body .text-indigo-500 { color: var(--tpl-primary) !important; }
+html[data-theme-template] body .text-indigo-400,
+html[data-theme-template] body .text-indigo-300,
+html[data-theme-template] body .text-indigo-200 { color: var(--tpl-primary-soft) !important; }
+
+/* 侧边栏与弹窗面板里那几条 ID 级规则要单独压（它们的选择器是 #sidebar / .modal-panel 开头） */
+html[data-theme-template] #sidebar .text-indigo-950,
+html[data-theme-template] #sidebar .text-indigo-900,
+html[data-theme-template] #sidebar .text-indigo-800,
+html[data-theme-template] #sidebar .text-indigo-700,
+html[data-theme-template] #sidebar .text-indigo-600,
+html[data-theme-template] #sidebar .text-indigo-500,
+html[data-theme-template] #sidebar .text-indigo-400,
+html[data-theme-template] #sidebar .text-indigo-300,
+html[data-theme-template] #sidebarBrand .text-indigo-950,
+html[data-theme-template] #sidebarBrand .text-indigo-400,
+html[data-theme-template] .modal-panel .text-indigo-950,
+html[data-theme-template] .modal-panel .text-indigo-900,
+html[data-theme-template] .modal-panel .text-indigo-800,
+html[data-theme-template] .modal-panel .text-indigo-700,
+html[data-theme-template] .modal-panel .text-indigo-600,
+html[data-theme-template] .modal-panel .text-indigo-500,
+html[data-theme-template] .modal-panel .text-indigo-400,
+html[data-theme-template] .modal-panel .text-indigo-300,
+html[data-theme-template] .bubble-ai .text-indigo-950,
+html[data-theme-template] .bubble-ai .text-indigo-800 { color: var(--tpl-primary-deep) !important; }
+
+html[data-theme-template] #sidebar .text-indigo-500,
+html[data-theme-template] #sidebar .text-indigo-400,
+html[data-theme-template] .modal-panel .text-indigo-500,
+html[data-theme-template] .modal-panel .text-indigo-400,
+html[data-theme-template] .modal-panel .text-indigo-300 { color: var(--tpl-primary) !important; }
+
+/* ---- pink / fuchsia / violet（原主题的强调色，映射到新主色）---- */
+html[data-theme-template] body .text-pink-500,
+html[data-theme-template] body .text-pink-600,
+html[data-theme-template] body .text-pink-800,
+html[data-theme-template] body .text-fuchsia-500,
+html[data-theme-template] body .text-violet-500,
+html[data-theme-template] body .text-violet-400 { color: var(--tpl-primary) !important; }
+
+/* ---- 背景块与边框 ---- */
+html[data-theme-template] body .bg-pink-50,
+html[data-theme-template] body .bg-indigo-100 { background-color: var(--tpl-tint) !important; }
+html[data-theme-template] body .border-indigo-100 { border-color: var(--tpl-tint) !important; }
+html[data-theme-template] body .accent-pink-500 { accent-color: var(--tpl-primary) !important; }
+
+/* ---- 页面底色：真正的渐变在 #mainContent（径向）而不是 body ---- */
+html[data-theme-template] #mainContent {
+    background-image: radial-gradient(at 12% 18%, var(--tpl-canvas) 0%, var(--tpl-tint) 55%, var(--tpl-canvas) 100%) !important;
+}
+html[data-theme-template] body { background: var(--tpl-canvas) !important; }
+
+/* ---- 光斑（原主题的粉紫装饰球）---- */
+html[data-theme-template] .orb-1 { background: radial-gradient(circle, var(--tpl-primary-soft), transparent 70%) !important; }
+html[data-theme-template] .orb-2 { background: radial-gradient(circle, var(--tpl-primary), transparent 70%) !important; }
+html[data-theme-template] .orb-3 { background: radial-gradient(circle, var(--tpl-primary-soft), transparent 70%) !important; }
+
+/* ---- 主按钮：原来是粉紫渐变 ---- */
+html[data-theme-template] body .btn-primary {
+    color: var(--tpl-primary) !important;
+    border-color: var(--tpl-tint) !important;
+}
+html[data-theme-template] body .btn-primary:hover {
+    background: var(--tpl-tint) !important;
+}
+
+/* ---- 用户气泡（原来是粉紫渐变实底）---- */
+html[data-theme-template] body .bubble-user {
+    background: linear-gradient(135deg, var(--tpl-primary), var(--tpl-primary-soft)) !important;
+    color: #fff !important;
+}
+
+/* ---- 选中态 ---- */
+html[data-theme-template] body .sidebar-item-active {
+    background: var(--tpl-tint) !important;
+}
+
+/* ---- 输入框聚焦 ---- */
+html[data-theme-template] body .modal-input:focus,
+html[data-theme-template] body .modal-textarea:focus {
+    border-color: var(--tpl-primary-soft) !important;
+}
+
+/* ---- 滑杆（进度条）---- */
+html[data-theme-template] body .custom-slider::-webkit-slider-thumb {
+    background: var(--tpl-primary) !important;
+}
+
+/* ============================================================================
+ *  深色模式（与模板正交：可叠在任意模板上）
+ *
+ *  只做"整体压暗 + 提亮文字"，不逐元素精修 —— 逐元素精修需要
+ *  给 408 处硬编码类各写一条深色规则，性价比极低且容易漏。
+ * ========================================================================== */
+html[data-theme="dark"] {
+    --tpl-canvas: #14161a;
+    --tpl-tint: #1e2228;
+
+    --color-neutral-50: #1a1d22;
+    --color-neutral-100: #22262d;
+    --text-heading: #eef1f5;
+    --text-body: #d6dae0;
+    --text-secondary: #a8b0ba;
+    --text-muted: #868e99;
+    --text-glass-heading: #eef1f5;
+    --text-glass-body: #d6dae0;
+    --text-glass-muted: #a8b0ba;
+    --ink: #eef1f5;
+}
+
+html[data-theme="dark"] body {
+    background: #14161a !important;
+    color: var(--text-body) !important;
+}
+html[data-theme="dark"] #mainContent {
+    background-image: radial-gradient(at 12% 18%, #14161a 0%, #1a1e24 55%, #14161a 100%) !important;
+}
+
+/* 深色下把"浅底深字"整体反过来。权重同样要压过 pixso 那层 ID 规则 */
+html[data-theme="dark"] body .glass-panel,
+html[data-theme="dark"] body .liquid-glass,
+html[data-theme="dark"] body .modal-panel,
+html[data-theme="dark"] body .modal-overlay,
+html[data-theme="dark"] body .composer-more-menu,
+html[data-theme="dark"] body .conversation-context-menu {
+    background: rgba(30, 34, 40, .78) !important;
+    border-color: rgba(255, 255, 255, .10) !important;
+}
+
+html[data-theme="dark"] body .text-indigo-950,
+html[data-theme="dark"] body .text-indigo-900,
+html[data-theme="dark"] body .text-indigo-800,
+html[data-theme="dark"] #sidebar .text-indigo-950,
+html[data-theme="dark"] #sidebar .text-indigo-900,
+html[data-theme="dark"] #sidebar .text-indigo-800,
+html[data-theme="dark"] #sidebarBrand .text-indigo-950,
+html[data-theme="dark"] .modal-panel .text-indigo-950,
+html[data-theme="dark"] .modal-panel .text-indigo-900,
+html[data-theme="dark"] .modal-panel .text-indigo-800,
+html[data-theme="dark"] .bubble-ai .text-indigo-950 { color: #e6e9ee !important; }
+
+html[data-theme="dark"] body .text-indigo-700,
+html[data-theme="dark"] body .text-indigo-600,
+html[data-theme="dark"] #sidebar .text-indigo-700,
+html[data-theme="dark"] .modal-panel .text-indigo-700 { color: #c8cdd6 !important; }
+
+html[data-theme="dark"] body .text-indigo-500,
+html[data-theme="dark"] #sidebar .text-indigo-500,
+html[data-theme="dark"] .modal-panel .text-indigo-500 { color: #a8b0ba !important; }
+
+html[data-theme="dark"] body .text-indigo-400,
+html[data-theme="dark"] body .text-indigo-300,
+html[data-theme="dark"] body .text-indigo-200,
+html[data-theme="dark"] #sidebar .text-indigo-400,
+html[data-theme="dark"] .modal-panel .text-indigo-400,
+html[data-theme="dark"] .modal-panel .text-indigo-300 { color: #868e99 !important; }
+
+html[data-theme="dark"] body .bg-pink-50,
+html[data-theme="dark"] body .bg-indigo-100 { background-color: rgba(255, 255, 255, .07) !important; }
+html[data-theme="dark"] body .border-indigo-100 { border-color: rgba(255, 255, 255, .12) !important; }
+
+html[data-theme="dark"] body .modal-input,
+html[data-theme="dark"] body .modal-textarea {
+    background: rgba(255, 255, 255, .07) !important;
+    color: #e6e9ee !important;
+    border-color: rgba(255, 255, 255, .14) !important;
+}
+
+html[data-theme="dark"] body .message-item-ai .bubble-ai,
+html[data-theme="dark"] body .thinking-bubble {
+    background: rgba(255, 255, 255, .07) !important;
+    color: #e6e9ee !important;
+}
+
+/* 深色下的光斑要收敛，否则刺眼 */
+html[data-theme="dark"] .aurora-orb { opacity: .28 !important; }
+
+/* ============================================================================
+ *  主题选择器（设置 → 高级 里的卡片）
+ * ========================================================================== */
+.theme-tpl-card { transition: border-color .15s ease, transform .15s ease; }
+.theme-tpl-card:hover { transform: translateY(-2px); }
+.theme-tpl-card.is-active { box-shadow: 0 0 0 2px rgba(255, 255, 255, .6) inset; }
+
+/* 设置面板里的深色开关行 */
+#themePickerBox { display: flex; gap: 8px; flex-wrap: wrap; }

@@ -56,6 +56,15 @@ async function init() {
         if (hint) { hint.textContent = '扫描中…'; hint.className = 'text-[11px] text-indigo-400'; }
         void refreshModsList();
     });
+    // 外观主题：深色开关（模板卡片的事件由 theme.js 自己绑）
+    document.getElementById('themeDarkToggle')?.addEventListener('change', (e) => {
+        if (window.ElainaTheme) window.ElainaTheme.setDark(e.target.checked);
+    });
+    // 设置面板打开时同步一次状态（用户可能在别处改过主题）
+    if (window.ElainaTheme) {
+        const darkToggle = document.getElementById('themeDarkToggle');
+        if (darkToggle) darkToggle.checked = window.ElainaTheme.isDark();
+    }
     document.getElementById('authChangeBtn')?.addEventListener('click', changeAccessPassword);
     document.getElementById('authLogoutBtn')?.addEventListener('click', logoutAccess);
     // 日志设置：改完立即生效（服务端运行时热更新），不需要点「保存设置」

@@ -737,6 +737,13 @@ function openSettings() {
     // 每次打开设置都刷新插件列表：用户可能在服务运行期间往 web/mods/ 丢了新 zip，
     // 刷新一次就能看到（而不是要求他重启服务）
     void refreshModsList();
+    // 外观主题：同步选择器状态（模板卡片 + 深色开关）
+    if (window.ElainaTheme) {
+        window.ElainaTheme.renderPicker();
+        window.ElainaTheme.markPicker();
+        const darkToggle = document.getElementById('themeDarkToggle');
+        if (darkToggle) darkToggle.checked = window.ElainaTheme.isDark();
+    }
     elements.settingsOverlay.classList.remove('hidden');
     elements.settingsOverlay.classList.add('flex');
     setRailActive('settings');
