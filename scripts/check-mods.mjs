@@ -133,6 +133,15 @@ console.log('=== 1. 关键实现存在且语义正确 ===');
     ok(/插件名不能包含路径成分/.test(serve), '★ 含路径成分的插件名被明确拒绝（不静默改名）');
     ok(/id="modsInstallBtn"/.test(html), '设置里有「上传安装」按钮');
     ok(/id="modsFileInput"/.test(html), '有隐藏的 file input');
+    // ---- 应用内删除按钮 ----
+    // 服务端早有 DELETE /api/plugins/:id，但界面一直没暴露 —— 用户装了插件
+    // 就没法在应用里卸掉（只能去删目录，而删目录又会被 zip 装回来）。
+    const settingsSrc = readFileSync(path.join(ROOT, 'web', 'js', 'app-06-settings.js'), 'utf8');
+    const modsLoader = readFileSync(path.join(ROOT, 'web', 'js', 'mods.js'), 'utf8');
+    ok(/mod-del-btn/.test(settingsSrc), '★ 设置里渲染「删除」按钮');
+    ok(/method: 'DELETE'/.test(settingsSrc), '★ 删除走 DELETE /api/plugins/:id');
+    ok(/showCustomConfirm[\s\S]{0,400}删除插件/.test(settingsSrc), '★ 删除前二次确认（防误删）');
+    ok(/forget: forgetMod/.test(modsLoader), '★ ElainaMods 导出 forget（清启用状态，避免重装自动启用）');
 
     // ---- 设置 → 插件分栏 ----
     ok(/data-settings-tab="tab-mods"/.test(html), '设置里有「插件」Tab');

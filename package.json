@@ -7,6 +7,7 @@
     "check": "node --experimental-vm-modules scripts/check-inline-scripts.mjs && node scripts/check-dom-refs.mjs && node scripts/check-store-layout.mjs && node scripts/check-data-api.mjs && node scripts/check-export-download.mjs && node scripts/check-live2d-assets.mjs && node scripts/check-bundled-models.mjs && node scripts/check-native-response.mjs && node scripts/check-live2d-native-list.mjs && node scripts/check-chat-message-shape.mjs && node scripts/check-model-list.mjs && node scripts/check-chat-providers.mjs && node scripts/check-chat-backup.mjs && node scripts/check-anthropic-request.mjs && node scripts/check-agent-paths.mjs && node scripts/check-agent-phone.mjs && node scripts/check-agent-overlay.mjs && node scripts/check-chat-stop-and-edge-tts.mjs && node scripts/check-edge-tts.mjs && node scripts/check-agent-once-policy.mjs && node scripts/check-agent-continue.mjs && node scripts/check-log-format.mjs && node scripts/check-security-hardening.mjs && node scripts/check-mods.mjs && node scripts/check-message-render.mjs && node scripts/check-theme.mjs && node scripts/check-zip-merge.mjs",
     "sync:web": "node scripts/sync-web.mjs",
     "serve:web": "node web/serve.mjs",
+    "pack:assets": "node scripts/pack-assets.mjs",
     "test": "npm run check && npm run sync:web && npm --prefix ../android-app test",
     "build:apk": "npm run check && npm run sync:web && npm --prefix ../android-app run build:debug"
   }

@@ -791,10 +791,10 @@ async function refreshModsList() {
 
     // 以服务端清单为准，用加载器状态补充
     const stateOf = new Map(fromLoader.map((m) => [m.id, m]));
-    const merged = fromServer.map((m) => Object.assign({}, m, stateOf.get(m.id) || {}));
+    const merged = fromServer.map((m) => Object.assign({}, m, stateOf.get(m.id) || {}, { _fromServer: true }));
     // 服务端没有但加载器有的（APK 端 / 手工放目录）也要显示
     for (const m of fromLoader) {
-        if (!merged.some((x) => x.id === m.id)) merged.push(m);
+        if (!merged.some((x) => x.id === m.id)) merged.push(Object.assign({}, m, { _fromServer: false }));
     }
 
     const globalToggle = document.getElementById('modsGlobalToggle');
@@ -828,17 +828,44 @@ async function refreshModsList() {
         } else if (m.state === 'ready') {
             badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-600 ml-1">已加载</span>';
         }
+        // 缺失依赖：必须显眼提示。
+        // 典型场景：只装了 galgame 没装 elaina-avatar（两者现在分开发布），
+        // 表现是"Galgame 能打开但没有立绘"——不提示的话完全无从排查。
+        const missing = Array.isArray(m.missingDeps) ? m.missingDeps : [];
+        if (missing.length) {
+            badge += '<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 ml-1" title="'
+                + escapeHtml('缺少依赖：' + missing.join('、') + '。请先安装这些插件，否则功能不完整。')
+                + '">缺依赖：' + escapeHtml(missing.join('、')) + '</span>';
+        }
         // hidden 的 mod（如公共依赖）不显示开关 —— 它不提供界面，关掉只会让别的 mod 坏掉
         const toggle = m.hidden
             ? '<span class="text-[10px] text-indigo-300 flex-none">公共依赖</span>'
             : '<input type="checkbox" class="accent-pink-500 flex-none mod-toggle" data-mod-id="' + id + '"'
                 + (m.enabled ? ' checked' : '') + '>';
-        return '<label class="flex items-start gap-2 py-2 px-3 rounded-xl bg-white/50 cursor-pointer">'
+
+        // 删除按钮：调服务端的 DELETE /api/plugins/:id（会删目录 + 安装包）。
+        //
+        // 为什么必须连安装包一起删（服务端已处理）：zip 是"待安装"的源，
+        // 只删目录的话下次扫描又装回来 —— 用户会以为"删了还在"。
+        //
+        // 为什么 APK 端要隐藏：那边没有服务端进程，/api/plugins 根本不存在，
+        // 按钮点了只会报错。检测方式与 refreshModsList 一致（看服务端清单是否可用）。
+        const canDelete = m._fromServer === true;
+        const delBtn = canDelete
+            ? '<button type="button" class="mod-del-btn flex-none text-[10px] px-2 py-1 rounded-lg '
+                + 'bg-red-50 text-red-500 hover:bg-red-100 transition-colors" '
+                + 'data-mod-id="' + id + '" data-mod-name="' + name + '" title="删除这个插件（含安装包）">删除</button>'
+            : '';
+
+        return '<div class="flex items-start gap-2 py-2 px-3 rounded-xl bg-white/50">'
+            + '<label class="flex items-start gap-2 min-w-0 flex-1 cursor-pointer">'
             + toggle
             + '<span class="min-w-0">'
               + '<span class="text-xs font-semibold text-indigo-800">' + name + '</span>' + ver + badge
               + (desc ? '<span class="block text-[11px] text-indigo-400 leading-relaxed mt-0.5">' + desc + '</span>' : '')
-            + '</span></label>';
+            + '</span></label>'
+            + delBtn
+            + '</div>';
     }).join('');
 
     // 开关事件：走 mod 系统的 setEnabled（会持久化 + 通知 mod 自己）
@@ -854,6 +881,54 @@ async function refreshModsList() {
                 hint.className = 'text-[11px] text-indigo-500';
             }
             void refreshModsList();
+        });
+    });
+
+    // 删除事件：调服务端 DELETE /api/plugins/:id（删目录 + 安装包），带二次确认
+    box.querySelectorAll('.mod-del-btn').forEach((el) => {
+        el.addEventListener('click', async (ev) => {
+            // 阻止冒泡：整行外层是可点的（label），不阻止会顺带切换开关
+            ev.preventDefault();
+            ev.stopPropagation();
+            const id = el.getAttribute('data-mod-id');
+            const name = el.getAttribute('data-mod-name') || id;
+            const okToGo = await showCustomConfirm(
+                '删除插件「' + name + '」？\n\n'
+                + '会把插件目录和安装包一起删掉（下次打开设置不会再出现）。\n'
+                + '要重新安装，需要再上传一次 zip。',
+                '删除插件');
+            if (!okToGo) return;
+
+            el.disabled = true;
+            if (hint) { hint.textContent = '正在删除 ' + name + '…'; hint.className = 'text-[11px] text-indigo-500'; }
+            try {
+                const res = await fetch('/api/plugins/' + encodeURIComponent(id), { method: 'DELETE' });
+                const data = await res.json().catch(() => null);
+                if (!res.ok || !data || data.ok === false) {
+                    if (hint) {
+                        hint.textContent = '删除失败：' + ((data && data.message) || ('HTTP ' + res.status));
+                        hint.className = 'text-[11px] text-red-500';
+                    }
+                } else {
+                    // 同时清掉前端记录的启用状态 —— 插件都删了，那个键留着没意义；
+                    // 而且重装时若读到旧状态会"自动启用"，与"默认关闭"的约定不符。
+                    if (window.ElainaMods && typeof window.ElainaMods.forget === 'function') {
+                        window.ElainaMods.forget(id);
+                    }
+                    if (hint) {
+                        hint.textContent = '已删除 ' + name + '（刷新页面后彻底生效）';
+                        hint.className = 'text-[11px] text-emerald-600';
+                    }
+                    void refreshModsList();
+                }
+            } catch (err) {
+                if (hint) {
+                    hint.textContent = '删除失败：' + String((err && err.message) || err);
+                    hint.className = 'text-[11px] text-red-500';
+                }
+            } finally {
+                el.disabled = false;
+            }
         });
     });
 }

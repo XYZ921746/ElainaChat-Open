@@ -68,6 +68,22 @@
         try { localStorage.setItem(MOD_ENABLED_KEY_PREFIX + id, on ? '1' : '0'); } catch (e) { /* 忽略 */ }
     }
 
+    /**
+     * 忘掉某个插件的启用状态（删插件时调用）。
+     *
+     * 为什么删了还要清这个键：留着它没意义（插件都没了），更要紧的是
+     * **重装同一个插件时会读到旧状态** —— 若上次是"已启用"，重装后会直接
+     * 自动启用，而插件的约定是"默认关闭、用户手动开"。那会让新装的插件
+     * 在用户不知情时改动界面。
+     */
+    function forgetMod(id) {
+        try {
+            localStorage.removeItem(MOD_ENABLED_KEY_PREFIX + id);
+            registry.delete(id);
+            loadedScripts.forEach((v, k) => { if (k.includes('/' + id + '/')) loadedScripts.delete(k); });
+        } catch (e) { /* 忽略 */ }
+    }
+
     // ========================================================================
     //  宿主 API：插件只能通过它访问宿主能力
     // ========================================================================
@@ -329,10 +345,42 @@
     /** 插件脚本通过它注册初始化函数（在脚本执行时调用） */
     const pendingRegistrations = new Map();
 
+    /**
+     * 找出每个插件**缺失的依赖**。
+     *
+     * 为什么要单独做这件事：`sortByDependency` 里对找不到的依赖是
+     * `if (d) visit(...)` —— **静默跳过**。这在单仓库时代问题不大（一起发布），
+     * 但 mod 资源一旦拆到独立仓库分发，用户只装 galgame 不装 elaina-avatar
+     * 就会变成常态。那时的表现是"Galgame 打开了但没有立绘"，
+     * 且控制台一声不响 —— 属于最难排查的那类问题。
+     *
+     * 所以这里显式算出缺失项，交给调用方报错/提示。
+     *
+     * @returns {Map<string, string[]>} 插件 id → 缺失的依赖 id 列表
+     */
+    function findMissingDeps(manifests) {
+        const ids = new Set(manifests.map((m) => m.id));
+        const missing = new Map();
+        for (const m of manifests) {
+            const deps = Array.isArray(m.after) ? m.after : [];
+            const lack = deps.filter((d) => !ids.has(d));
+            if (lack.length) missing.set(m.id, lack);
+        }
+        return missing;
+    }
+
     /** 加载全部插件 */
     async function loadAll() {
         const manifests = await discover();
         if (!manifests.length) return [];
+
+        // ★ 先查缺失依赖：明确报错，不要静默跳过
+        const missing = findMissingDeps(manifests);
+        for (const [id, lack] of missing) {
+            const msg = '[Mod:' + id + '] 缺少依赖：' + lack.join('、')
+                + '（该插件声明了 after，但依赖未安装 —— 功能可能不完整，请先安装依赖）';
+            console.error(msg);
+        }
 
         let ordered;
         try {
@@ -346,7 +394,10 @@
         const results = [];
         // 顺序加载（不是并发）：插件之间可能有依赖，且顺序加载让失败定位更容易
         for (const m of ordered) {
-            results.push(await loadOne(m));
+            const entry = await loadOne(m);
+            // 把缺失依赖记到条目上，供设置界面显示
+            if (missing.has(m.id)) entry.missingDeps = missing.get(m.id);
+            results.push(entry);
         }
         return results;
     }
@@ -432,9 +483,14 @@
                 state: e.state,
                 error: e.error,
                 enabled: isModEnabled(e.manifest.id, e.manifest),
+                // 缺失的依赖（manifest.after 里声明了但没装）——
+                // 设置界面据此提示，避免"装了 galgame 但立绘不显示"这种无声故障
+                missingDeps: e.missingDeps || [],
             }));
         },
         setEnabled,
+        /** 删插件时调用：清掉启用状态与已加载记录（避免重装后被自动启用） */
+        forget: forgetMod,
         isEnabled: (id) => {
             const e = registry.get(id);
             return e ? isModEnabled(id, e.manifest) : false;

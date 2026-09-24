@@ -188,6 +188,16 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         }
 
         // 解压待安装的 zip。id = zip 文件名去掉扩展名。
+        //
+        // ★ 装成功后**删掉 zip**（一次性安装包）。
+        //
+        // 为什么必须删：zip 是"待安装"的源，只要它还在目录里，**每次扫描都会
+        // 重新解压安装**。于是用户手动删掉插件目录后，下一次扫描（打开设置就会触发）
+        // 又把它装回来 —— 表现就是"我明明卸载了，插件列表里还在"。
+        // 点「卸载」按钮那条路是对的（它会删 zip），但用户直接删目录时就没辙了。
+        //
+        // 删掉之后语义就清楚了：目录存在 = 已安装；要重装就再放一次 zip。
+        // 这也让"删目录"变成真正有效的卸载方式。
         const installResults = [];
         for (const z of zips) {
             const id = z.replace(/\.zip$/i, '');
@@ -199,10 +209,14 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
                 const r = await extractPluginZip(path.join(modsDir, z), id);
                 installResults.push({ zip: z, ok: true, id: r.id, files: r.written });
                 if (!installed.some((i) => i.id === id)) installed.push({ id, dir: path.join(modsDir, id) });
-                log('已安装插件：' + id + '（' + r.written + ' 个文件）');
+                // 装好即清理安装包（见上面的说明）
+                await rm(path.join(modsDir, z), { force: true }).catch(() => {});
+                log('已安装插件：' + id + '（' + r.written + ' 个文件，安装包已清理）');
             } catch (err) {
                 installResults.push({ zip: z, ok: false, error: String((err && err.message) || err) });
                 log('插件安装失败：' + z + ' —— ' + installResults[installResults.length - 1].error);
+                // 失败的 zip **保留** —— 用户要能看到它、修好再重试。
+                // 删掉的话"装失败"就变成"文件凭空消失"，更难排查。
             }
         }
 

@@ -35,6 +35,73 @@ node web/serve.mjs
 
 ---
 
+## 扩展包（Mod / 插件）
+
+程序本体只有文字聊天。**Galgame 界面、桌宠、Live2D 模型都是扩展包**，按需安装。
+
+### 包含哪些
+
+| 扩展包 | 内容 | 大小 | 说明 |
+| --- | --- | --- | --- |
+| `elaina-avatar` | 9 张立绘 + 情绪识别 | 10.2 MB | **公共依赖**，被下面两个共用。装完不显示界面，也不用开 |
+| `galgame` | 31 张场景背景 + 全屏剧情界面 | 7.2 MB | 打字机对话框、粒子特效，与主界面共用同一份对话数据 |
+| `pet` | 桌宠悬浮层（代码） | 0.01 MB | 立绘复用 `elaina-avatar`，回复时自动切表情 |
+| `live2d-deepseek` | Live2D 模型 `deepseek` | 3.1 MB | 视频通话用 |
+| `live2d-伊蕾娜·默认` | Live2D 模型 `伊蕾娜·默认` | 2.1 MB | 视频通话用 |
+
+> **`galgame` 和 `pet` 依赖 `elaina-avatar`**。只装前者不装它，界面能打开但**没有立绘** ——
+> 程序会在设置里标出「缺依赖」并写进控制台日志，不会静默失败。
+
+### 怎么安装
+
+**方式一：应用内上传（推荐，手机也能用）**
+
+1. 到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest) 下载需要的 `.zip`（**不要解压**）
+2. 打开程序 → **设置 → 插件 → 上传安装** → 选中那个 zip
+3. 安装完在列表里**打开对应的开关**
+
+**方式二：丢进目录（电脑版）**
+
+把 zip 直接放进 `web/mods/` 目录，然后在 **设置 → 插件** 点「重新扫描」。
+服务端会在下次扫描时自动解压 —— 不用解压、不用重启。
+
+**Live2D 模型**走的是另一条路（它们是模型不是插件）：
+设置 → **Live2D** → 上传模型 → 选那个 zip。或把解压后的模型**目录**放进 `web/live2d/models/`。
+
+### 装完在哪用
+
+| 扩展包 | 开启位置 | 使用位置 |
+| --- | --- | --- |
+| `galgame` | 设置 → 插件 → 打开开关 | 主界面出现全屏剧情模式入口 |
+| `pet` | 设置 → 插件 → 打开开关 | 桌面上出现悬浮角色 |
+| Live2D 模型 | 设置 → Live2D → 选模型 | 点「视频通话」时使用 |
+
+> **所有插件默认关闭**，装完要手动开。这是刻意的 —— 插件会改动界面，
+> 不该在你不知情时生效。
+
+### 为什么扩展包不放在仓库里
+
+这些包合计 **22.6 MB，其中 87% 是图片**（PNG / JPG / moc3）。
+Git 对二进制**无法有效增量压缩** —— 改一张立绘，历史里就多存一整份，
+clone 会越来越慢。所以：
+
+* **仓库只放插件源码**（`manifest.json` / `index.js` / `style.css`，共约 60 KB）——
+  它们要跟主程序接口对齐、要跑测试，属于开发的一部分
+* **资源走 Releases**，用 `node scripts/pack-assets.mjs` 打包后上传
+
+自己改完插件后重新打包：
+
+```bash
+npm run pack:assets               # 打包全部（输出到 dist/assets/）
+npm run pack:assets galgame       # 只打某一个
+node scripts/pack-assets.mjs --list   # 先看看会打什么
+```
+
+打包格式有约定（写进脚本注释了）：插件 zip 的**根目录直接是文件**，
+模型 zip 的**根目录必须是模型名那一层** —— 因为模型是按目录名识别的。
+
+---
+
 ## 和原版比，多了什么
 
 | 能力 | 原版 | 本改版 |
@@ -50,6 +117,9 @@ node web/serve.mjs
 | 图片理解 | 直接交给主模型 | 可配置**视觉模型先转述成文字**，再交给主模型按角色回答 |
 | 访问控制 | 无 | 局域网访问密码 + CSRF 防护 + Host 白名单（防 DNS rebinding） |
 | 问题排查 | 无 | 请求日志 + 浏览器报错转发到启动窗口；**日志按 AstrBot 格式落盘**（五级 `DBUG/INFO/WARN/ERRO/CRIT`，级别可在设置里调），完整记录对话内容与上游报错原因 |
+| 界面外观 | 固定一套配色 | **6 套主题**（粉紫 / iOS 蓝 / 陶土橙 / 鼠尾草 / 樱花桃 / **自定义 DIY**）+ 深色模式（含「跟随系统」） |
+| 扩展性 | 无 | **动态插件系统**：Galgame 界面、桌宠、Live2D 模型都是可装可卸的扩展包，坏插件不会拖垮主程序 |
+| 消息渲染 | 纯文本 | **Markdown + LaTeX**（表格、代码块、公式） |
 | 设置界面 | 单页 | 拆成 6 个分栏（角色 / 对话 / 语音 / 视觉 / Live2D / 高级） |
 | 手机能力 | 无 | **AI 手机操作**：点击 / 滑动 / 输入 / 读控件树 / 截图，四种实现方式（无障碍 / Shizuku / Root / 模块），运行时可停止、敏感操作分级授权 |
 | 对话接口 | 浏览器直连，撞 CORS 就报 `Failed to fetch` | **本地中转**：同源转发绕开 CORS，自建中转站 / 内测网关也能连；报错给出具体原因而非"请求失败" |
@@ -705,6 +775,10 @@ Windows 下也可以直接双击 `启动.bat`。
 
 启动后访问 `http://127.0.0.1:4173`，首次打开时填写所选 API 格式的 Key。
 
+> **clone 下来是"纯净版"**：只有文字聊天。Galgame 界面、桌宠、Live2D 模型都是
+> 扩展包，需要到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest)
+> 单独下载安装 —— 见上方「[扩展包](#扩展包mod--插件)」章节。
+
 手机 / 平板访问 `http://<本机局域网IP>:4173`（需要访问密码，会自动升级到 HTTPS）。可用 `HOST` / `PORT` / `HTTPS_PORT` 环境变量覆盖。
 
 ```bash
@@ -731,13 +805,17 @@ ElainaChat-Open/
 │  ├─ live2d-video.js            # Live2D 视频通话模块
 │  ├─ diag-*.html                # 三个诊断页
 │  ├─ vendor/                    # tailwind / pixi6 / cubism core / live2d 库
-│  └─ live2d/models/             # 模型目录（仅内置模型入库）
+│  ├─ mods/                      # 插件：**只入库源码**（manifest/index.js/style.css）
+│  │  └─ */img/                  #   图片资源不入库，走 Releases（见「扩展包」章节）
+│  └─ live2d/models/             # Live2D 模型：**不入库**，走 Releases
 ├─ server/                       # 后端模块（在 web/ 之外，静态服务够不到）
 │  ├─ store.mjs                  #   数据存储层：分类落盘 / 迁移 / zip 导出导入
+│  ├─ mods.mjs                   #   插件系统：扫描 / 解压安装 / 清单生成 / 卸载
 │  └─ zip.mjs                    #   零依赖 zip 读写（Node 内置 zlib）
 ├─ scripts/                      # 检查脚本 + 构建工具（不参与运行）
 │  ├─ sync-web.mjs               #   把 web/ 同步到安卓工程（自动扫描 web/js/）
-│  └─ check-*.mjs                #   23 个回归检查，npm run check 全跑一遍
+│  ├─ pack-assets.mjs            #   打包插件与模型为 zip（供上传 Releases）
+│  └─ check-*.mjs                #   27 个回归检查，npm run check 全跑一遍
 ├─ android-app/                  # 安卓打包工程（本仓库已排除，见 .gitignore）
 ├─ poc/sandbox/                   # Windows 沙箱可行性验证（不参与运行）
 ├─ 开发文档.md                    # 完整改造记录 / 踩坑 / 验证数据
@@ -913,9 +991,17 @@ npm run build:apk   # cap sync（www/ → assets/public）+ gradlew → app-debu
 
 本项目代码采用 MIT License，基于 [shuixinggangzheng/ElainaChat-Open](https://github.com/shuixinggangzheng/ElainaChat-Open) 二次开发，保留原作者版权声明。
 
-### 关于内置的 Live2D 模型
+### 关于 Live2D 模型与扩展包素材
 
-仓库内的 `web/live2d/models/伊蕾娜·默认/` 与 `web/live2d/models/deepseek/` 是为了让程序 clone 下来即可运行而附带的模型。**模型著作权属于各自的原作者，不在本项目 MIT 许可范围内**，本项目仅作展示与个人使用之用途附带分发。若计划商用或再分发，请自行联系模型作者取得授权；原作者如有异议会立即移除。
+> **本仓库不再包含任何 Live2D 模型与插件图片素材。** 它们通过 Releases 单独分发
+> （见上方「扩展包」章节）。本仓库只包含插件源码。
+
+Releases 里分发的 `伊蕾娜·默认` / `deepseek` 等 Live2D 模型，是为了让程序装上即可用
+而附带打包的。**模型著作权属于各自的原作者，不在本项目 MIT 许可范围内**，
+本项目仅作展示与个人使用之用途附带分发。若计划商用或再分发，请自行联系模型作者
+取得授权；原作者如有异议会立即移除。
+
+同理，扩展包里的立绘与场景图素材，权利也属于各自原作者。
 
 Live2D 运行库（Cubism SDK）的使用另受 Live2D Inc. 的条款约束。
 
