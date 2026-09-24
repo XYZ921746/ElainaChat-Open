@@ -12,8 +12,13 @@
 
 ## 下载
 
-**安卓版**：到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest) 下载 `ElainaChat-Open-v1.1.0-open-debug.apk`，
+**安卓版**：到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest) 下载
+`ElainaChat-Open-v1.2.0-open-lite-debug.apk`（**10.8 MB**），
 在手机上允许「安装未知来源应用」后安装。
+
+> **这个 APK 是"纯净版"** —— 只含程序本体，**不含 Galgame 界面、桌宠与 Live2D 模型**。
+> 那些按需下载安装，见下方「[扩展包](#扩展包mod--插件)」。
+> 这样做的好处是安装包小（10.8 MB，含资源时是 33.6 MB），且不必为你用不到的资源买单。
 
 **电脑版**：克隆本仓库，双击 `启动.bat` 即可（**零依赖、零构建**，只需已安装 Node.js ≥ 20）。
 
@@ -41,16 +46,22 @@ node web/serve.mjs
 
 ### 包含哪些
 
+都在同一个 [Releases 页面](https://github.com/XYZ921746/ElainaChat-Open/releases/latest)，
+**每个包一个直链，按需下载**（不用下整个大包再解压）：
+
 | 扩展包 | 内容 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| `elaina-avatar` | 9 张立绘 + 情绪识别 | 10.2 MB | **公共依赖**，被下面两个共用。装完不显示界面，也不用开 |
-| `galgame` | 31 张场景背景 + 全屏剧情界面 | 7.2 MB | 打字机对话框、粒子特效，与主界面共用同一份对话数据 |
+| `elaina-avatar` | 9 张立绘 + 情绪识别 | 10.15 MB | **公共依赖**，被下面两个共用。装完不显示界面，也不用开 |
+| `galgame` | 31 张场景背景 + 全屏剧情界面 | 7.24 MB | 打字机对话框、粒子特效，与主界面共用同一份对话数据 |
 | `pet` | 桌宠悬浮层（代码） | 0.01 MB | 立绘复用 `elaina-avatar`，回复时自动切表情 |
-| `live2d-deepseek` | Live2D 模型 `deepseek` | 3.1 MB | 视频通话用 |
-| `live2d-伊蕾娜·默认` | Live2D 模型 `伊蕾娜·默认` | 2.1 MB | 视频通话用 |
+| `live2d-deepseek` | Live2D 模型 `deepseek` | 3.08 MB | 视频通话用 |
+| `live2d-elaina-default` | Live2D 模型 `伊蕾娜·默认` | 2.14 MB | 视频通话用 |
 
 > **`galgame` 和 `pet` 依赖 `elaina-avatar`**。只装前者不装它，界面能打开但**没有立绘** ——
 > 程序会在设置里标出「缺依赖」并写进控制台日志，不会静默失败。
+>
+> 模型包的文件名是 ASCII（`live2d-elaina-default.zip`），但**装好后在程序里显示为原名**
+> `伊蕾娜·默认` —— 名字在 zip 内部保留着，外壳文件名只是为了下载链接可靠。
 
 ### 怎么安装
 
@@ -58,12 +69,15 @@ node web/serve.mjs
 
 1. 到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest) 下载需要的 `.zip`（**不要解压**）
 2. 打开程序 → **设置 → 插件 → 上传安装** → 选中那个 zip
-3. 安装完在列表里**打开对应的开关**
+3. 安装完在列表里**打开对应的开关**（插件默认关闭）
 
 **方式二：丢进目录（电脑版）**
 
 把 zip 直接放进 `web/mods/` 目录，然后在 **设置 → 插件** 点「重新扫描」。
 服务端会在下次扫描时自动解压 —— 不用解压、不用重启。
+
+> 安装包在装好后会被**自动清理**（它是一次性安装包）。所以「删掉插件目录」
+> 就是有效的卸载方式，不会被重新装回来。应用内也有「删除」按钮。
 
 **Live2D 模型**走的是另一条路（它们是模型不是插件）：
 设置 → **Live2D** → 上传模型 → 选那个 zip。或把解压后的模型**目录**放进 `web/live2d/models/`。

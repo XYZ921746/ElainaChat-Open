@@ -109,12 +109,35 @@ function extractFn(src, name) {
 }
 
 // 真实的打包清单（从安卓工程读，那是要打进 APK 的那份）
+//
+// ★ 清单**可能不存在** —— `npm run sync:web:lite` 是"纯净版 APK"模式：
+//   模型不打包进 APK，改走扩展包（Releases 分发，用户在设置里上传）。
+//   那种情况下清单本来就不该有，所以这里不能直接 fail。
+//
+//   但要区分两种"没有清单"：
+//     · 刻意的纯净版（正常）→ 跳过模型相关断言，仍跑代码逻辑测试
+//     · 忘了同步 / 同步坏了（异常）→ 应该 fail
+//   判据：lite 模式下 www/live2d/models 整个目录都不存在；
+//   而"忘了同步"时目录在、只是文件不齐。
 const MANIFEST = path.join(ROOT, '..', 'android-app', 'www', 'live2d', 'models', 'manifest.json');
-ok(existsSync(MANIFEST), '安卓工程里有打包清单 manifest.json');
+const MODELS_DIR = path.join(ROOT, '..', 'android-app', 'www', 'live2d', 'models');
+const liteMode = !existsSync(MODELS_DIR);   // 目录都没有 = 刻意纯净版
+
+if (liteMode) {
+    console.log('  [纯净版模式] 安卓工程未打包 Live2D 模型（--lite），跳过模型打包相关断言');
+    console.log('                 模型走扩展包分发，用户在「设置 → Live2D → 上传模型」安装');
+    ok(true, '纯净版：模型不内嵌（这是 --lite 的预期行为）');
+    // 顺带确认：纯净版下确实一个模型文件都没有（不是"目录在但空了"）
+    ok(!existsSync(MANIFEST), '纯净版：不含打包清单');
+} else {
+    ok(existsSync(MANIFEST), '安卓工程里有打包清单 manifest.json');
+}
 const manifestText = existsSync(MANIFEST) ? readFileSync(MANIFEST, 'utf8') : '{"models":[]}';
 const manifestObj = JSON.parse(manifestText);
-ok(Array.isArray(manifestObj.models) && manifestObj.models.length > 0,
-    '清单里有模型', String((manifestObj.models || []).length));
+if (!liteMode) {
+    ok(Array.isArray(manifestObj.models) && manifestObj.models.length > 0,
+        '清单里有模型', String((manifestObj.models || []).length));
+}
 
 // 假文件系统：数据目录**完全为空**（模拟播种失败）
 function makeEmptyFs() {
@@ -169,19 +192,31 @@ const result = await vm.runInContext(
     sandbox);
 const models = (result && result.models) || [];
 console.log('  数据目录为空时，列表返回 ' + models.length + ' 个: ' + JSON.stringify(models.map((m) => m.name)));
-ok(models.length === manifestObj.models.length,
-    '数据目录为空时仍列出全部内置模型（这就是修复本身）',
-    '期望 ' + manifestObj.models.length + '，实际 ' + models.length);
-ok(models.every((m) => m.bundled === true), '这些模型都带 bundled 标记（资源会从 assets 取）');
-ok(models.every((m) => m.modelJson), '每个都有 modelJson');
-{
-    const withExp = models.filter((m) => m.exps.length > 0).length;
-    ok(withExp > 0, '至少有模型带了表情（' + withExp + ' 个）');
+if (liteMode) {
+    // 纯净版：清单为空，所以"合并内置模型"这条路径没有输入 —— 断言会退化成
+    // 0 === 0（恒真，没有检验力）。所以这里明确说明跳过，而不是假装测过了。
+    console.log('  [纯净版模式] 无内置模型可合并，跳过"合并内置模型"相关断言');
+    console.log('                 这段逻辑本身仍被第 2 节（源码层）覆盖着');
+    ok(models.length === 0, '纯净版：数据目录为空 + 无内置模型 → 列表为空（符合预期）');
+} else {
+    ok(models.length === manifestObj.models.length,
+        '数据目录为空时仍列出全部内置模型（这就是修复本身）',
+        '期望 ' + manifestObj.models.length + '，实际 ' + models.length);
+    ok(models.every((m) => m.bundled === true), '这些模型都带 bundled 标记（资源会从 assets 取）');
+    ok(models.every((m) => m.modelJson), '每个都有 modelJson');
+    {
+        const withExp = models.filter((m) => m.exps.length > 0).length;
+        ok(withExp > 0, '至少有模型带了表情（' + withExp + ' 个）');
+    }
 }
 
 // ============================================================ 5. 播种成功时不会重复
 console.log('\n=== 5. 播种成功时不重复（同名去重）===');
-{
+if (liteMode || !manifestObj.models.length) {
+    // 纯净版没有内置模型，这段"同名去重"也就没有输入 —— 明确跳过
+    console.log('  [纯净版模式] 无内置模型，跳过"播种去重"断言');
+    ok(true, '纯净版：无需播种内置模型');
+} else {
     const fsMock2 = makeEmptyFs();
     // 模拟"播种成功"：数据目录里有同名模型（含它自己的 model3.json）。
     // readdir 必须**按路径**返回不同内容 —— 否则递归收集时会把顶层目录项

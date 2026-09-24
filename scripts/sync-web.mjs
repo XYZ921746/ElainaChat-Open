@@ -2,6 +2,31 @@ import { copyFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// ==================== 打包模式开关 ====================
+//
+// 三种模式（越往下越"轻"）：
+//
+//   默认            全部打包（程序 + mod 代码 + mod 图片 + Live2D 模型）
+//   --no-models     跳过 Live2D 模型（模型走扩展包）
+//   --lite          跳过模型**与 mod 图片**，只留程序本体 + 插件代码
+//
+// 为什么需要 `--lite`：手机端与电脑端口径要一致 —— mod 与 live2d 都当扩展包
+// 按需下载安装。mod 图片 17.5MB + 模型 6.7MB 是 APK 体积的大头，
+// 把它们移出去后 APK 只剩程序本体。
+//
+// 环境变量 `SKIP_LIVE2D_MODELS=1` 等价于 `--no-models`（CI 里方便）。
+//
+// ⚠️ 必须定义在**使用之前**（下面 collectModFiles 调用时会读 `lite`）——
+//    之前放在文件后半段，导致 `lite is not defined`。
+//
+// ⚠️ 跳过时还要**清掉安卓工程里已有的资源**，否则上一次带资源的同步残留
+//    会继续被打进 APK —— 那样"跳过"就名不副实了。
+
+const lite = process.argv.includes('--lite');
+const skipModels = lite
+    || process.argv.includes('--no-models')
+    || String(process.env.SKIP_LIVE2D_MODELS || '') === '1';
+
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, '..');
 const sourceRoot = path.join(projectRoot, 'web');
@@ -89,7 +114,20 @@ for (const rel of jsFiles) {
 //
 // 自动发现：整棵 mods/ 目录都收（含图片、样式、清单），不写死 mod 名。
 // 与 js 的处理同理 —— 手写清单每加一个 mod 都要记得回来改，迟早会漏。
-async function collectModFiles(dir, prefix = '') {
+/**
+ * 收集要同步进 APK 的 mod 文件。
+ *
+ * `lite` 为 true 时**只同步源码**（manifest.json / index.js / style.css），
+ * 跳过 `img/` 等资源目录 —— 用于做"纯净版 APK"：程序本体 + 插件代码，
+ * 图片与模型都当扩展包按需下载。
+ *
+ * 为什么按目录名判断而不是按扩展名：mod 的资源可能不止图片（以后可能有音频、
+ * 字体），按 `img/` 目录排除更稳，也不会误伤将来别的资源目录 ——
+ * 需要时把目录名加进 LITE_SKIP_DIRS 即可。
+ */
+const LITE_SKIP_DIRS = new Set(['img', 'assets', 'audio', 'media', 'fonts']);
+
+async function collectModFiles(dir, prefix = '', lite = false) {
     const out = [];
     let entries = [];
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
@@ -98,9 +136,14 @@ async function collectModFiles(dir, prefix = '') {
         // 不同步 zip 安装包：那是"待安装"的源，APK 端没有解压能力，
         // 带上只是白占体积（解压好的目录才是真正要用的）
         if (entry.isFile() && /\.zip$/i.test(entry.name)) continue;
+        // 纯净版：跳过资源目录（图片/模型都在这里）
+        if (lite && entry.isDirectory() && LITE_SKIP_DIRS.has(entry.name)) continue;
+        // 纯净版：跳过模型文件（.moc3 / .model3.json 等）——
+        // 万一有 mod 把模型放在非资源目录下也别漏掉
+        if (lite && entry.isFile() && /\.(moc3|model3\.json|physics3\.json|cdi3\.json|pose3\.json)$/i.test(entry.name)) continue;
         const rel = prefix ? prefix + '/' + entry.name : entry.name;
         if (entry.isDirectory()) {
-            out.push(...await collectModFiles(path.join(dir, entry.name), rel));
+            out.push(...await collectModFiles(path.join(dir, entry.name), rel, lite));
         } else if (entry.isFile()) {
             out.push(rel);
         }
@@ -130,9 +173,31 @@ for (const rel of cssFiles) {
     filesToCopy.push(['css/' + rel, 'css/' + rel]);
 }
 
-const modFiles = (await collectModFiles(path.join(sourceRoot, 'mods'))).sort();
+const modFiles = (await collectModFiles(path.join(sourceRoot, 'mods'), '', lite)).sort();
 for (const rel of modFiles) {
     filesToCopy.push(['mods/' + rel, 'mods/' + rel]);
+}
+
+// `--lite` 时清掉安卓工程里残留的 mod 图片与模型 ——
+// 否则上一次带资源同步的文件会继续留在 www/ 里被打进 APK，
+// "跳过资源"就名不副实了。（只清资源目录，不动插件代码。）
+if (lite) {
+    let cleaned = 0;
+    try {
+        const modIds = (await readdir(path.join(sourceRoot, 'mods'), { withFileTypes: true }))
+            .filter((e) => e.isDirectory()).map((e) => e.name);
+        for (const id of modIds) {
+            for (const sub of LITE_SKIP_DIRS) {
+                const p = path.join(androidWebRoot, 'mods', id, sub);
+                // 用 stat 判断存在（rm 对不存在的路径用 force 也不报错，
+                // 但那样就数不出"清掉了几个"，日志会失去意义）
+                try { await stat(p); } catch { continue; }
+                await rm(p, { recursive: true, force: true });
+                cleaned++;
+            }
+        }
+    } catch { /* 没有 mods 目录就跳过 */ }
+    if (cleaned) console.log(`  已清空 ${cleaned} 个 mod 资源目录（避免上次残留被打进 APK）`);
 }
 
 await mkdir(path.join(androidWebRoot, 'vendor'), { recursive: true });
@@ -151,6 +216,8 @@ if (cssFiles.length) console.log(`  css: ${cssFiles.map((f) => 'css/' + f).join(
 // 并生成 manifest.json。APK 里没有服务端，模型没法从接口取，只能打包进去：
 // App 首次启动时按这份清单把模型"种"进应用数据目录（见 index.html 的 seedBundledLive2dModels），
 // 之后列表与加载逻辑跟用户自己上传的模型走同一条路径，不需要额外适配。
+//
+// `--lite` / `--no-models` 时跳过（开关定义在文件顶部，那里有完整说明）。
 
 /** 递归列出目录下所有文件（返回相对路径，正斜杠分隔） */
 async function walk(dir, prefix = '') {
@@ -164,15 +231,33 @@ async function walk(dir, prefix = '') {
     return out;
 }
 
-let modelDirs = [];
-try {
-    modelDirs = (await readdir(modelsSourceRoot, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .sort();
-} catch { /* 没有模型目录就跳过，不影响前端同步 */ }
+// 跳过打包模型的方式有两种，都支持：
+//   · 命令行参数 --lite / --no-models（推荐，一眼看得出这次同步不带资源）
+//   · 环境变量 SKIP_LIVE2D_MODELS=1（CI 里方便）
+//
+// `--lite` 是"纯净版"：**模型与 mod 图片都不进 APK**，只留程序本体 + 插件代码。
+// 手机端与电脑端口径一致 —— mod 与 live2d 都当扩展包按需下载安装。
+// （lite / skipModels 的定义在文件顶部，那里有完整说明）
 
-if (!modelDirs.length) {
+let modelDirs = [];
+if (skipModels) {
+    console.log(lite
+        ? '--lite 模式：Live2D 模型与 mod 图片都不打包（纯净版 APK）'
+        : '--no-models 模式：Live2D 模型不打包');
+} else {
+    try {
+        modelDirs = (await readdir(modelsSourceRoot, { withFileTypes: true }))
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name)
+            .sort();
+    } catch { /* 没有模型目录就跳过，不影响前端同步 */ }
+}
+
+if (skipModels) {
+    // 清掉安卓工程里残留的模型 + 清单，确保它们不会被打进 APK
+    await rm(modelsDestRoot, { recursive: true, force: true }).catch(() => {});
+    console.log('  已清空 ' + path.relative(androidWebRoot, modelsDestRoot) + '/（避免上次残留被打进去）');
+} else if (!modelDirs.length) {
     console.log('No Live2D model in web/live2d/models/ — nothing bundled.');
 } else {
     // 先算出这次要写进去的完整文件集，再决定删什么。

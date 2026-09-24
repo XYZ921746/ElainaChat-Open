@@ -111,8 +111,22 @@ async function packModel(name) {
     }
 
     const zip = createZip(entries);
-    // 文件名要安全：模型名可能含中文/空格/·，URL 里用得上，所以做一次替换
-    const safe = name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
+    // 文件名要安全：模型名可能含中文/空格/·。
+    //
+    // ★ 为什么把中文也换掉（而不只是替换非法字符）：
+    //   实测上传到 GitHub Releases 时，`live2d-伊蕾娜·默认.zip` 经 curl 传输后
+    //   变成了 `live2d-.zip` —— 中文在 Windows 命令行 → curl 的 → GitHub API
+    //   这条链路上丢了。下载链接也会带一长串 %XX，既不好看也容易出错。
+    //
+    //   所以产物名统一用**纯 ASCII**：非 ASCII 字符转成下划线。
+    //   模型在 zip **内部**仍保留原名（那是识别用的），只是外壳文件名变 ASCII。
+    //   例如 `伊蕾娜·默认` → `live2d-elaina-default.zip`（下面有映射表）。
+    const ASCII_ALIAS = {
+        '伊蕾娜·默认': 'elaina-default',
+        deepseek: 'deepseek',
+    };
+    const safe = ASCII_ALIAS[name]
+        || name.replace(/[^\x20-\x7E]/g, '_').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
     const outName = `live2d-${safe}.zip`;
     const outPath = path.join(OUT_DIR, outName);
     await writeFile(outPath, zip);

@@ -72,9 +72,23 @@ console.log('=== 1. 假 Response 必须同时有 json() 与 text() ===');
 console.log('\n=== 2. 行为层：设置面板那条路径（先 text() 再 parse）===');
 
 // 真实打包清单
+//
+// ★ 清单**可能不存在** —— `npm run sync:web:lite`（纯净版 APK）不打包模型，
+//   改走扩展包分发。那种情况下清单本来就不该有。
+//   判据：lite 模式下 www/live2d/models 整个目录都不存在。
 const MANIFEST = path.join(ROOT, '..', 'android-app', 'www', 'live2d', 'models', 'manifest.json');
-ok(existsSync(MANIFEST), '安卓工程里有 manifest.json');
-const manifestObj = JSON.parse(readFileSync(MANIFEST, 'utf8'));
+const MODELS_DIR = path.join(ROOT, '..', 'android-app', 'www', 'live2d', 'models');
+const liteMode = !existsSync(MODELS_DIR);
+
+if (liteMode) {
+    console.log('  [纯净版模式] 未打包 Live2D 模型，跳过"打包清单"相关断言');
+    console.log('                 模型走扩展包分发（Releases → 设置里上传安装）');
+    ok(!existsSync(MANIFEST), '纯净版：不含打包清单（符合预期）');
+}
+if (!liteMode) ok(existsSync(MANIFEST), '安卓工程里有 manifest.json');
+const manifestObj = existsSync(MANIFEST)
+    ? JSON.parse(readFileSync(MANIFEST, 'utf8'))
+    : { models: [] };
 
 // 空数据目录（模拟播种失败）—— 正是用户遇到的状态
 const fsMock = {
@@ -128,16 +142,28 @@ const settingPath = await vm.runInContext(`
 ok(settingPath.hasText, 'res.text() 可用（旧代码在这里抛 TypeError）');
 const models = (settingPath.parsed && settingPath.parsed.models) || [];
 console.log('  设置面板这条路径拿到 ' + models.length + ' 个模型: ' + JSON.stringify(models.map((m) => m.name)));
-ok(models.length === manifestObj.models.length,
-    '设置面板能列出全部内置模型（这就是用户报的那个问题）',
-    '期望 ' + manifestObj.models.length + '，实际 ' + models.length);
+if (liteMode) {
+    // 纯净版没有内置模型，断言会退化成 0 === 0（恒真、无检验力）——
+    // 明确跳过而不是假装测过。`res.text()` 那条关键断言上面已经跑过了。
+    console.log('  [纯净版模式] 无内置模型，跳过"列出全部内置模型"的计数断言');
+    console.log('                 但 res.text() 可用性已在上一条验证（那才是本文件要防的 bug）');
+} else {
+    ok(models.length === manifestObj.models.length,
+        '设置面板能列出全部内置模型（这就是用户报的那个问题）',
+        '期望 ' + manifestObj.models.length + '，实际 ' + models.length);
+}
 
 // ============================================================ 3. 视频通话那条路径也不能坏
 console.log('\n=== 3. 视频通话那条路径（只用 json()）仍然正常 ===');
 {
     const r = await vm.runInContext(`nativeLive2dFetch('/api/live2d/models', { method: 'GET' }).then(r => r.json())`, sandbox);
     const list = (r && r.models) || [];
-    ok(list.length === manifestObj.models.length, 'json() 路径同样返回全部模型', String(list.length));
+    if (liteMode) {
+        console.log('  [纯净版模式] 无内置模型，跳过计数断言（json() 路径本身可用）');
+        ok(Array.isArray(list), '纯净版：json() 路径仍返回数组（接口形状没坏）');
+    } else {
+        ok(list.length === manifestObj.models.length, 'json() 路径同样返回全部模型', String(list.length));
+    }
 }
 
 // ============================================================ 4. 错误响应也带 text()
