@@ -182,6 +182,58 @@ console.log('\n=== 8. 安全性没被破坏 ===');
     ok(/AGENT_RISK/.test(html), '风险分级表仍在使用');
 }
 
+// ============================================================ 9. 副屏监视窗
+console.log('\n=== 9. 副屏监视窗（模块后端的"看画面"） ===');
+{
+    // 用途：AI 用「模块」后端时跑在独立虚拟副屏上，物理主屏看不到 ——
+    // 这个窗口把副屏画面搬进应用，让用户知道 AI 在点什么。
+    ok(/id="screenWatchPanel"/.test(html), '有副屏监视窗 DOM');
+    ok(/id="screenWatchImg"/.test(html), '有画面元素');
+    ok(/id="screenWatchPowerBtn"/.test(html), '有副屏启停按钮');
+    ok(/function openScreenWatch\(/.test(html) && /function closeScreenWatch\(/.test(html),
+        '有打开/关闭函数');
+    ok(/SCREEN_WATCH_INTERVAL/.test(html), '有自动刷新间隔常量');
+
+    // 入口只在「模块」后端时出现 —— 无障碍/Shizuku 在物理屏上操作，用户本来就看得见
+    const renderFn = html.slice(html.indexOf('function render()'), html.indexOf('function beginBatch()'));
+    ok(/agentWatchBtn/.test(renderFn), '运行状态条里的「看画面」按钮由 render 控制');
+    ok(/__lastAgentBackend/.test(renderFn), '按**实际**用过的后端决定是否显示（"自动"模式下也要能判断）');
+    ok(/useModule/.test(renderFn), '只在模块后端时才显示');
+    ok(/running && useModule/.test(renderFn), '任务结束后按钮要收起来');
+
+    // 生命周期：定时器必须能被停掉，否则关掉窗口后还在每 1.5 秒打原生层
+    const closeFn = html.slice(html.indexOf('function closeScreenWatch()'), html.indexOf('// ==================== 日志设置'));
+    ok(/screenWatchStopAuto\(\)/.test(closeFn), '★ 关闭监视窗时停掉自动刷新（否则后台一直轮询原生层）');
+
+    // ★ 与设置面板的互斥：两者同为 z-index 100002 层，同时开着就由 DOM 顺序决定谁在上面。
+    //   CSS 注释一直声称"打开监视窗前会先关掉设置"，但实现漏了这一步（已修）。
+    const openFn = html.slice(html.indexOf('function openScreenWatch()'), html.indexOf('function closeScreenWatch()'));
+    // 断言"真的会执行"，不能只断言字符串出现过 —— `false && closeSettingsPanel()` 也能匹配到
+    // 名字，那种写法等于没关（变异测试抓到过这个假阳性）。
+    ok(/if \(typeof closeSettingsPanel === 'function'\) closeSettingsPanel\(\);/.test(openFn),
+        '★ 打开监视窗前先关掉设置面板（同为 100002 层，否则层叠顺序不确定）');
+
+    // 授权确认框必须盖得住监视窗 —— 否则 AI 的确认弹窗被画面挡住，用户点不到
+    ok(/#customModal \{ z-index: 100003 !important; \}/.test(html),
+        '确认框层级（100003）高于监视窗（100002）');
+    ok(/#screenWatchPanel \{ z-index: 100002 !important; \}/.test(html),
+        '监视窗层级显式声明为 100002');
+}
+
+// ============================================================ 10. 原生侧：副屏接口
+console.log('\n=== 10. 原生：副屏监视接口 ===');
+{
+    const plugin = readFileSync(PLUGIN_JAVA, 'utf8');
+    ok(/public void liveFrame\(PluginCall call\)/.test(plugin), '原生有 liveFrame 方法（取副屏当前帧）');
+    ok(/public void moduleDisplay\(PluginCall call\)/.test(plugin), '原生有 moduleDisplay 方法（副屏启停）');
+    ok(/imageBase64/.test(plugin), 'liveFrame 回传 base64 画面');
+    // 前端调用的方法名必须与原生一致 —— 拼错不会报错，只会静默失效
+    ok(/typeof plugin\.liveFrame !== 'function'/.test(html), '前端按 liveFrame 调用（方法名与原生一致）');
+    ok(/typeof plugin\.moduleDisplay !== 'function'/.test(html), '前端按 moduleDisplay 调用（方法名与原生一致）');
+    ok(/plugin\.liveFrame\(\)/.test(html), 'liveFrame 被真正调用（不只是存在性检查）');
+    ok(/plugin\.moduleDisplay\(\{\s*op:/.test(html), 'moduleDisplay 带上 op 参数（start / stop）');
+}
+
 console.log('\n' + '='.repeat(46));
 console.log(`  PASS ${pass}   FAIL ${fail}`);
 if (fail) console.log('  失败项：' + failures.join('、'));

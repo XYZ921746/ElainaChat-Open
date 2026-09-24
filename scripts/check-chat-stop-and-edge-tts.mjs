@@ -1,12 +1,12 @@
 // 回归检查：本轮三件用户反馈。
 //   1. 手机操作授权「每次运行只确认一次」并设为默认
-//   2. Edge TTS（免费 provider，wss 协议，含 Sec-MS-GEC token）
+//   2. Edge TTS（免费 provider）—— 页面侧只验证"两条代合成路径接好了"；
+//      协议实现（含 Sec-MS-GEC 对拍）在 server/edge-tts.mjs，由 check-edge-tts.mjs 覆盖
 //   3. 聊天发送按钮二态（AI 回复中变红色停止）+ 请求可中断
 //
 // 用法：node scripts/check-chat-stop-and-edge-tts.mjs
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -16,19 +16,6 @@ const providers = readFileSync(path.join(ROOT, 'web', 'js', 'chat-providers.js')
 let pass = 0, fail = 0;
 const failures = [];
 const ok = (c, l, d) => { if (c) { pass++; console.log('  PASS  ' + l); } else { fail++; failures.push(l); console.log('  FAIL  ' + l + (d ? '  -> ' + d : '')); } };
-
-function extractFn(src, name) {
-    let start = src.indexOf('function ' + name + '(');
-    if (start < 0) return null;
-    const a = src.slice(Math.max(0, start - 12), start).match(/async\s+$/);
-    if (a) start -= a[0].length;
-    let i = src.indexOf('{', src.indexOf('(', start));
-    let d = 0;
-    for (; i < src.length; i++) {
-        if (src[i] === '{') d++;
-        else if (src[i] === '}') { d--; if (d === 0) return src.slice(start, i + 1); }
-    }
-}
 
 // ============================================================ 1. 授权策略
 console.log('=== 1. 授权策略：once 默认 ===');
@@ -55,65 +42,40 @@ console.log('\n=== 2. Edge TTS ===');
     ok(/edgeTtsVoice: 'zh-CN-XiaoxiaoNeural'/.test(html), '默认音色');
     ok(/if \(provider === 'edge'\) return true;/.test(html), 'isTtsConfigured：edge 免配置直接可用');
     ok(/async function speakTextEdge\(/.test(html), '有 speakTextEdge 实现');
-    // 常量区 + 函数体一起切（speakTextEdge 引用了 EDGE_TTS_WSS/TOKEN 等常量）
-    const constStart = html.indexOf('const EDGE_TTS_WSS');
+    // speakTextEdge 现在只负责「按平台选一条路 + 拿回 MP3」，协议实现**不在页面里**：
+    //   · 安卓 → 原生插件 EdgeTtsPlugin（原生能自定义 WebSocket 头）
+    //   · 电脑 → 本机后端 POST /api/tts/edge（Node 同样能自定义头）
+    // 页面里原先那份浏览器直连实现（EDGE_TTS_WSS / Sec-MS-GEC / sha256Sync /
+    // speech.config / Path:audio 帧解析）已删除 —— 它必然失败，因为 JS 的
+    // `new WebSocket()` 不允许自定义请求头，微软端点会直接 403。
+    // 协议本身的验证（含 GEC 与参考实现逐字节对拍）在 check-edge-tts.mjs，
+    // 对象是真正在跑的那份实现 server/edge-tts.mjs。
     const fnStart = html.indexOf('async function speakTextEdge(');
     const fnEnd = html.indexOf('async function speakTextMinimax(');
-    const fn = constStart > 0 && fnEnd > fnStart ? html.slice(Math.min(constStart, fnStart), fnEnd) : '';
-    ok(fn.includes('speech.platform.bing.com'), '用微软朗读端点');
-    ok(fn.includes('Sec-MS-GEC'), '带 Sec-MS-GEC token（没有会 403）');
-    ok(fn.includes('Path:speech.config'), '先发 speech.config');
-    ok(fn.includes('Path:ssml'), '再发 ssml');
-    ok(/Path:audio/.test(fn), '解析二进制音频帧');
-    ok(/turn\.end/.test(fn), '识别合成结束');
+    const fn = fnStart > 0 && fnEnd > fnStart ? html.slice(fnStart, fnEnd) : '';
+    ok(fn.length > 0, '能切出 speakTextEdge 函数体');
+    ok(/Capacitor\?\.Plugins\?\.EdgeTts/.test(fn), '安卓走原生 EdgeTtsPlugin（原生能自定义 WebSocket 头）');
+    ok(fn.includes('/api/tts/edge'), '电脑版走本机后端 /api/tts/edge 代合成');
     ok(fn.includes('saveCachedTtsAudio'), '合成结果写缓存');
-    ok(/edgeTtsSecMsGec[\s\S]{0,600}BigInt/.test(html), 'GEC 时间计算用 BigInt（Number 会丢精度 → token 错 → 403）');
+    // 死代码必须真的清掉，别又长回来（浏览器里连不了微软端点）
+    ok(!/edgeTtsSecMsGec|EDGE_TTS_WSS|sha256Sync/.test(html),
+        '★ 页面里不再残留浏览器直连的 WebSocket 协议实现（那套必然 403）');
     // 分发
     ok(/provider === 'edge'\s*\?\s*speakTextEdge/.test(html), 'speakText 分发包含 edge');
 }
 
-// GEC 算法端到端：跑真实代码对拍 Python 版的已知值
-console.log('\n=== 3. Sec-MS-GEC 算法（端到端）===');
-{
-    // 常量按字面量匹配出三条 + 函数用配对提取（不能按固定长度切 —— 会切在函数中间）
-    function extractConst(src, name) {
-        const m = src.match(new RegExp('const ' + name + " = '([^']+)'"));
-        return m ? `const ${name} = '${m[1]}';` : '';
-    }
-    const code = [
-        extractConst(html, 'EDGE_TTS_WSS'),
-        extractConst(html, 'EDGE_TTS_TOKEN'),
-        extractConst(html, 'EDGE_TTS_CHROMIUM_FULL'),
-        extractFn(html, 'sha256Sync'),
-        extractFn(html, 'edgeSha256Hex'),
-        extractFn(html, 'edgeTtsSecMsGec'),
-        'globalThis.__gec = edgeTtsSecMsGec;',
-    ].filter(Boolean).join('\n');
-    const sandbox = { Math, Date, console, String, Number, Array, BigInt, globalThis: {} };
-    sandbox.globalThis = sandbox;
-    vm.createContext(sandbox);
-    vm.runInContext(code, sandbox);
-    // 用固定时间测：2026-01-01 00:00:00 UTC = 1767225600
-    const fixed = vm.runInContext(`
-        (function(){
-            const real = Date.now;
-            Date.now = () => 1767225600000;
-            try { return edgeTtsSecMsGec(); } finally { Date.now = real; }
-        })()
-    `, sandbox);
-    // Python 对拍：ticks = (1767225600 + 11644473600) // 300 * 300 * 10_000_000
-    //              sha256(f"{ticks}6A5AA1D4EAFF4E9FB37E23D68491D6F4").hex().upper()
-    const crypto = await import('node:crypto');
-    let ticks = BigInt(1767225600 + 11644473600);
-    ticks -= ticks % 300n;
-    ticks *= 10000000n;
-    const expected = crypto.createHash('sha256').update(ticks.toString() + '6A5AA1D4EAFF4E9FB37E23D68491D6F4').digest('hex').toUpperCase();
-    ok(fixed === expected, 'GEC 值与参考实现一致', `got ${fixed?.slice(0, 12)}… want ${expected.slice(0, 12)}…`);
-    ok(typeof fixed === 'string' && /^[0-9A-F]{64}$/.test(fixed), 'GEC 是 64 位大写 hex');
-}
+// 第 3 节（Sec-MS-GEC 算法端到端对拍）已移除。
+//
+// 它原来对拍的是 **index.html 里那份浏览器直连实现**的 edgeTtsSecMsGec / sha256Sync。
+// 那两个函数连同整段协议实现已被删除（浏览器 `new WebSocket()` 不允许自定义请求头，
+// 微软端点必然 403 —— 现在改由原生插件与本机后端代合成）。
+//
+// 这个算法本身仍然必须验证，但它现在住在 server/edge-tts.mjs，
+// 由 **scripts/check-edge-tts.mjs 第 4 节**做同样的逐字节对拍（对象是真正在跑的实现）。
+// 在这里再对拍一次已无对象可对，只会变成永远通过的空断言。
 
 // ============================================================ 4. 停止按钮 + 可中断
-console.log('\n=== 4. 聊天停止按钮 ===');
+console.log('\n=== 3. 聊天停止按钮 ===');
 {
     ok(/onclick="handleComposerButtonClick\(\)"/.test(html), '发送按钮走统一入口（不再直连 handleTextSubmit）');
     ok(/function handleComposerButtonClick\(\)/.test(html), '有统一入口函数');

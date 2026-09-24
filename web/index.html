@@ -1544,10 +1544,13 @@
            于是"谁在上面"变成由 DOM 顺序决定 —— 改一下 HTML 里元素的位置就可能把对话框
            埋到别的弹窗后面。这里用 ID 选择器（优先级高于类选择器）+ !important 显式分层：
              100001 普通弹窗（设置、分类管理、移动会话…）
-             100002 实现方式面板（从设置里打开，必须盖住设置）
-             100003 提示 / 确认对话框（要用户立刻做决定，永远在最上面） */
+             100002 实现方式面板 / 副屏监视窗（都从设置里打开，必须盖住设置；
+                    两者不会同时出现 —— 打开监视窗前会先关掉设置）
+             100003 提示 / 确认对话框（要用户立刻做决定，永远在最上面 ——
+                    包括盖住副屏监视窗，否则 AI 的授权确认会被画面挡住） */
         #backendPanel { z-index: 100002 !important; }
         #customModal { z-index: 100003 !important; }
+        #screenWatchPanel { z-index: 100002 !important; }
         .modal-overlay {
             background: rgba(50, 34, 26, 0.38);
             backdrop-filter: blur(4px);
@@ -3047,6 +3050,53 @@
 
     <input id="composerImageInput" type="file" accept="image/*" class="hidden" aria-hidden="true">
 
+    <!-- ==================== 副屏监视窗 ====================
+         用途：AI 用「模块」后端操作手机时，它在**独立虚拟副屏**上跑 ——
+         物理主屏看不到。这个窗口把副屏画面实时搬进应用，让你知道 AI 在点什么。
+
+         为什么不做成 iframe 套模块的 3070 网页面板：那样等于把浏览器塞进应用，
+         风格割裂、还多一层滚动与缩放问题。这里是应用自己的原生 UI，
+         只从模块取「画面 + 状态」两样数据。 -->
+    <div id="screenWatchPanel" class="hidden fixed inset-0 flex items-center justify-center modal-overlay">
+        <div class="modal-panel w-full max-w-md max-h-[92vh] flex flex-col overflow-hidden">
+            <div class="flex items-center gap-3 px-5 py-3.5 border-b border-white/60 flex-shrink-0">
+                <span class="w-2 h-2 rounded-full flex-none" id="screenWatchDot" style="background:#94a3b8"></span>
+                <div class="text-sm font-bold text-indigo-950">副屏监视</div>
+                <span id="screenWatchMeta" class="text-[11px] text-indigo-400 ml-1">检测中…</span>
+                <button id="closeScreenWatch" class="ml-auto p-1.5 rounded-lg hover:bg-white/60 transition-colors" type="button" title="关闭" aria-label="关闭">
+                    <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <div class="px-5 py-4 overflow-y-auto flex-1">
+                <!-- 画面区：按副屏比例显示，黑边留白而不是拉伸变形 -->
+                <div class="rounded-xl overflow-hidden bg-slate-900/95 flex items-center justify-center"
+                     style="min-height:220px;max-height:52vh">
+                    <img id="screenWatchImg" alt="副屏画面" class="hidden max-w-full max-h-[52vh] object-contain" style="image-rendering:auto">
+                    <div id="screenWatchEmpty" class="text-center px-6 py-10">
+                        <div class="text-[13px] text-slate-300 mb-1">副屏暂时没有画面</div>
+                        <div class="text-[11px] text-slate-400 leading-relaxed" id="screenWatchEmptyHint">
+                            副屏是空的（只有壁纸）。让 AI 先执行一次「手机打开 某应用」。
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 最近动作：让用户知道 AI 刚才干了什么 -->
+                <div class="mt-3">
+                    <div class="text-[11px] text-indigo-500 font-semibold mb-1">AI 最近的动作</div>
+                    <div id="screenWatchLog" class="text-[11px] text-indigo-600 leading-relaxed rounded-lg bg-white/60 px-3 py-2"
+                         style="max-height:96px;overflow-y:auto">（还没有动作）</div>
+                </div>
+            </div>
+
+            <div class="px-5 py-3 border-t border-white/60 flex items-center gap-2 flex-shrink-0">
+                <button id="screenWatchAutoBtn" class="btn-secondary text-xs" type="button">自动刷新：开</button>
+                <button id="screenWatchRefreshBtn" class="btn-secondary text-xs" type="button">立即刷新</button>
+                <button id="screenWatchPowerBtn" class="btn-secondary text-xs ml-auto" type="button">启动副屏</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 悬浮麦克风dock -->
     <div id="floatingMic" class="hidden fixed left-1/2 -translate-x-1/2 bottom-24 z-40">
         <div class="floating-mic-surface glass-panel flex items-center gap-3">
@@ -3214,7 +3264,7 @@
                                     <option value="en-US-AndrewMultilingualNeural">Andrew · 多语男声</option>
                                 </select>
                             </div>
-                            <p class="text-[11px] text-indigo-300 leading-relaxed">免费、无需 API Key，走的微软 Edge 浏览器同款朗读服务。它没有稳定性承诺（微软随时可能改动），<b>临时用没问题，长期建议用其他语音接口</b>。</p>
+                            <p class="text-[11px] text-indigo-300 leading-relaxed">免费、无需 API Key，走的微软 Edge 浏览器同款朗读服务。电脑版由本机服务代合成、安卓版走原生层（浏览器里连不了它 —— 微软要校验请求头，而网页 JS 改不了）。它没有稳定性承诺（微软随时可能改动），<b>临时用没问题，长期建议用其他语音接口</b>。</p>
                         </div>
                         <div id="minimaxTtsFields" class="space-y-3">
                             <div>
@@ -3784,6 +3834,10 @@
         <span class="agent-run-dot"></span>
         <span id="agentRunText" style="flex:none;font-size:12px;color:rgba(255,255,255,.93);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">AI 正在操作</span>
         <span id="agentRunStep" style="flex:none;font-size:11px;color:rgba(255,255,255,.5);white-space:nowrap"></span>
+        <!-- 只在 AI 用「模块」后端跑任务时出现：看一眼副屏上到底在干什么 -->
+        <button id="agentWatchBtn" type="button" class="hidden"
+                style="margin-left:2px;flex:none;font-size:12px;font-weight:600;padding:5px 10px;border-radius:10px;
+                       background:rgba(255,255,255,.16);color:#fff;border:0;cursor:pointer">看画面</button>
         <button id="agentStopBtn" type="button"
                 style="margin-left:2px;flex:none;font-size:12px;font-weight:600;padding:5px 12px;border-radius:10px;
                        background:rgba(244,63,94,.94);color:#fff;border:0;cursor:pointer">停止</button>
@@ -6945,6 +6999,17 @@ ${lines.join('\n')}
                 if (s) s.textContent = running ? ('第 ' + step + ' 步' + (currentAction ? ' · ' + currentAction : '')) : '';
                 const btn = stopBtnEl();
                 if (btn) { btn.disabled = stopRequested; btn.textContent = stopRequested ? '停止中' : '停止'; }
+                // 「看画面」只在**任务进行中且用模块后端**时出现 ——
+                // 模块的价值就是独立副屏，只有那条路才有"画面"可看；
+                // 无障碍/Shizuku 是在物理屏上操作，用户本来就看得见。
+                const watch = document.getElementById('agentWatchBtn');
+                if (watch) {
+                    // lastUsedBackendId 定义在 IIFE 外（手机操作执行层里），用 window 桥接读
+                    const used = String(window.__lastAgentBackend || '');
+                    const useModule = (typeof currentBackendId === 'function' && currentBackendId() === 'module')
+                        || used === 'module';
+                    watch.classList.toggle('hidden', !(running && useModule));
+                }
             }
 
             /** 每条 AI 回复的处理入口调用一次：开启新批次，解除上一批留下的停止状态 */
@@ -7118,6 +7183,10 @@ ${lines.join('\n')}
                 render();
                 // 同步到系统悬浮窗：用户切到别的 App 时，这里是他唯一能看到进度的位置
                 updateOverlayStep();
+                // 记进副屏监视窗的「最近动作」（setStep 在 IIFE 里，用 window 上的钩子跨作用域）
+                if (typeof window.__screenWatchNote === 'function') {
+                    window.__screenWatchNote(action);
+                }
             }
 
             // ==================== 系统悬浮窗的生命周期 ====================
@@ -7233,6 +7302,9 @@ ${lines.join('\n')}
 
         let phoneOpsInFlight = 0;
         let phoneRunEndTimer = null;
+        // 最近一次手机操作**实际**用的后端（原生在结果里回报）。
+        // 运行状态条的「看画面」按钮靠它判断该不该出现 —— 只有模块后端有副屏画面。
+        let lastUsedBackendId = '';
         // 悬浮窗权限提示：用户明确点过「这次不用」就别每次都拦（那会变成新的打扰）
         let overlayPromptDeclined = false;
 
@@ -7275,6 +7347,14 @@ ${lines.join('\n')}
                 backend: currentBackendId()
             });
             let text = (res && (res.text || res.message)) || (parsed.action + ' 完成');
+            // 记下**实际**用的后端（原生会回报 res.backend）。
+            // 用途：只有模块后端才有"副屏画面"可看 —— 运行状态条上的「看画面」按钮
+            // 据此显示/隐藏。不记这个的话，用户选的是"自动"，就无从判断走没走模块。
+            if (res && res.backend) {
+                lastUsedBackendId = String(res.backend);
+                // render() 在 agentRuntime 的 IIFE 里，读不到这个变量 —— 桥到 window
+                window.__lastAgentBackend = lastUsedBackendId;
+            }
             // 截图：原生把图片以 base64 带回来。交给已配置的视觉模型看一眼，
             // 把「屏幕上是什么」变成文字回灌给主模型 —— 与「图片理解」复用同一条链路。
             if (res && res.imageBase64 && parsed.action === '手机截图') {
@@ -8112,7 +8192,7 @@ ${lines.join('\n')}
                 //   · 渲染后更新状态与滚动。
                 removeThinkingMessage();
                 if (state.currentConversationId === conv.id && !state.notesMode && !state.diaryMode
-                    && !document.getElementById(`msg-${aiMessage.id}`)) {
+                    && !document.getElementById(`msg-${safeAttrId(aiMessage.id)}`)) {
                     renderMessage(aiMessage);
                 }
                 state.voiceState = 'idle';
@@ -8458,7 +8538,7 @@ ${lines.join('\n')}
             const msg = conv.messages.find(m => String(m.id) === String(messageId));
             if (!msg) return;
             toggleMessageFavorite(msg);
-            const msgEl = document.getElementById(`msg-${messageId}`);
+            const msgEl = document.getElementById(`msg-${safeAttrId(messageId)}`);
             if (msgEl) {
                 const fresh = renderMessage(msg);
                 msgEl.replaceWith(fresh);
@@ -8510,7 +8590,7 @@ ${lines.join('\n')}
                     </div>
                     <p class="note-card-text line-clamp-3">${escapeHtml(fav.text)}</p>
                     <div class="flex items-center gap-1 mt-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button onclick="event.stopPropagation(); removeFavoriteWithConfirm('${fav.id}')" class="note-remove-btn ml-auto p-1.5" title="取消收藏">
+                        <button onclick="event.stopPropagation(); removeFavoriteWithConfirm('${safeAttrId(fav.id)}')" class="note-remove-btn ml-auto p-1.5" title="取消收藏">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                         </button>
                     </div>
@@ -8582,7 +8662,7 @@ ${lines.join('\n')}
             switchConversation(fav.conversationId);
 
             setTimeout(() => {
-                const msgEl = document.getElementById(`msg-${fav.messageId}`);
+                const msgEl = document.getElementById(`msg-${safeAttrId(fav.messageId)}`);
                 if (msgEl) {
                     msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     msgEl.classList.add('highlight-pulse');
@@ -9236,17 +9316,17 @@ ${lines.join('\n')}
                     </div>
                 </div>
                 <div class="conversation-inline-actions flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button onclick="event.stopPropagation(); toggleStar('${conv.id}')" class="conversation-favorite-btn p-1 hover:bg-white/70 rounded-lg" title="${conv.isStarred ? '取消收藏' : '收藏'}" aria-label="${conv.isStarred ? '取消收藏' : '收藏'}">
+                    <button onclick="event.stopPropagation(); toggleStar('${safeAttrId(conv.id)}')" class="conversation-favorite-btn p-1 hover:bg-white/70 rounded-lg" title="${conv.isStarred ? '取消收藏' : '收藏'}" aria-label="${conv.isStarred ? '取消收藏' : '收藏'}">
                         <svg class="w-3.5 h-3.5 ${conv.isStarred ? 'text-amber-500 fill-current' : 'text-indigo-300'}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"/></svg>
                     </button>
                     <div class="conversation-secondary-actions flex items-center gap-0.5">
-                        <button onclick="event.stopPropagation(); togglePin('${conv.id}')" class="p-1 hover:bg-white/70 rounded-lg" title="${conv.isPinned ? '取消置顶' : '置顶'}">
+                        <button onclick="event.stopPropagation(); togglePin('${safeAttrId(conv.id)}')" class="p-1 hover:bg-white/70 rounded-lg" title="${conv.isPinned ? '取消置顶' : '置顶'}">
                             <svg class="w-3.5 h-3.5 ${conv.isPinned ? 'text-pink-500' : 'text-indigo-300'}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"/></svg>
                         </button>
-                        <button onclick="event.stopPropagation(); renameConversation('${conv.id}')" class="p-1 hover:bg-white/70 rounded-lg" title="重命名">
+                        <button onclick="event.stopPropagation(); renameConversation('${safeAttrId(conv.id)}')" class="p-1 hover:bg-white/70 rounded-lg" title="重命名">
                             <svg class="w-3.5 h-3.5 text-indigo-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
                         </button>
-                        <button onclick="event.stopPropagation(); deleteConversation('${conv.id}')" class="p-1 hover:bg-white/70 rounded-lg" title="删除">
+                        <button onclick="event.stopPropagation(); deleteConversation('${safeAttrId(conv.id)}')" class="p-1 hover:bg-white/70 rounded-lg" title="删除">
                             <svg class="w-3.5 h-3.5 text-red-300 hover:text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                         </button>
                     </div>
@@ -9317,10 +9397,10 @@ ${lines.join('\n')}
                     <span class="text-[10px] text-indigo-300 ml-auto">${count}</span>
                     ${cat.isUnfiled ? '' : `
                     <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button onclick="event.stopPropagation(); renameCategoryPrompt('${cat.id}')" class="p-0.5 hover:bg-white/70 rounded" title="重命名">
+                        <button onclick="event.stopPropagation(); renameCategoryPrompt('${safeAttrId(cat.id)}')" class="p-0.5 hover:bg-white/70 rounded" title="重命名">
                             <svg class="w-3 h-3 text-indigo-300" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
                         </button>
-                        <button onclick="event.stopPropagation(); deleteCategory('${cat.id}')" class="p-0.5 hover:bg-white/70 rounded" title="删除">
+                        <button onclick="event.stopPropagation(); deleteCategory('${safeAttrId(cat.id)}')" class="p-0.5 hover:bg-white/70 rounded" title="删除">
                             <svg class="w-3 h-3 text-red-300 hover:text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                         </button>
                     </div>`}
@@ -9414,7 +9494,7 @@ ${lines.join('\n')}
                         const checked = catSelected.has(conv.id);
                         row.className = `flex items-center gap-2 px-3 py-1.5 rounded-lg cursor-pointer transition-colors text-xs ${checked ? 'bg-pink-50' : 'hover:bg-white/50'}`;
                         row.innerHTML = `
-                            <input type="checkbox" class="accent-pink-500 cat-checkbox" data-conv-id="${conv.id}" ${checked ? 'checked' : ''}>
+                            <input type="checkbox" class="accent-pink-500 cat-checkbox" data-conv-id="${safeAttrId(conv.id)}" ${checked ? 'checked' : ''}>
                             <span class="truncate text-indigo-800">${escapeHtml(conv.title)}</span>
                             <span class="ml-auto text-[10px] text-indigo-300">${new Date(conv.updatedAt).toLocaleDateString()}</span>
                         `;
@@ -9619,7 +9699,7 @@ ${lines.join('\n')}
         }
 
         function updateVoicePlayerButton(messageId, status) {
-            const button = document.getElementById(`voice-player-${messageId}`);
+            const button = document.getElementById(`voice-player-${safeAttrId(messageId)}`);
             if (!button) return;
             const isPlaying = status === 'playing';
             const isPaused = status === 'paused';
@@ -9754,7 +9834,7 @@ ${lines.join('\n')}
 
         function renderMessage(message) {
             const div = document.createElement('div');
-            div.id = `msg-${message.id}`;
+            div.id = `msg-${safeAttrId(message.id)}`;
             div.className = `message-item ${message.role === 'user' ? 'message-item-user' : 'message-item-ai'} animate-fade-in-up`;
 
             if (message.role === 'user') {
@@ -9765,7 +9845,7 @@ ${lines.join('\n')}
                             <div class="bubble-user rounded-2xl p-4">
                                 <div class="flex items-center gap-2 mb-2">
                                     <span class="text-xs font-medium text-indigo-500">You</span>
-                                    <span class="text-xs text-indigo-300">${message.timestamp}</span>
+                                    <span class="text-xs text-indigo-300">${escapeHtml(message.timestamp)}</span>
                                     <button onclick="event.stopPropagation(); handleMessageFavoriteClick('${safeAttrId(message.id)}')"
                                             class="message-action-btn ml-auto p-1.5 rounded-lg hover:bg-white/60 transition-all flex items-center gap-1 ${isMessageFavorited(state.currentConversationId, message.id) ? 'text-amber-500' : 'text-indigo-300 hover:text-amber-500'}">
                                         <svg class="w-3.5 h-3.5" fill="${isMessageFavorited(state.currentConversationId, message.id) ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
@@ -9786,7 +9866,7 @@ ${lines.join('\n')}
                 const voiceDurationSeconds = estimateVoiceDurationSeconds(message.voiceJp || message.text);
                 const voiceCard = `
                                 <div class="ai-voice-card">
-                                    <button id="voice-player-${message.id}" onclick="event.stopPropagation(); replayAIMessage('${safeAttrId(message.id)}')" class="ai-voice-player" type="button" aria-label="播放伊蕾娜的语音">
+                                    <button id="voice-player-${safeAttrId(message.id)}" onclick="event.stopPropagation(); replayAIMessage('${safeAttrId(message.id)}')" class="ai-voice-player" type="button" aria-label="播放伊蕾娜的语音">
                                         <span class="voice-play-box" aria-hidden="true">
                                             <svg class="voice-icon-play" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4L13 8 4 2.8z"/></svg>
                                             <svg class="voice-icon-pause" viewBox="0 0 16 16" fill="currentColor"><path d="M4 3h3v10H4zM9 3h3v10H9z"/></svg>
@@ -9801,7 +9881,7 @@ ${lines.join('\n')}
                             <div class="bubble-ai rounded-2xl p-4">
                                 <div class="flex items-center gap-2 mb-2">
                                     <span class="ai-speaker-name">${escapeHtml(name)}</span>
-                                    <span class="text-xs text-indigo-300">${message.timestamp}</span>
+                                    <span class="text-xs text-indigo-300">${escapeHtml(message.timestamp)}</span>
                                     <button onclick="event.stopPropagation(); handleMessageFavoriteClick('${safeAttrId(message.id)}')"
                                             class="message-action-btn ml-auto p-1.5 rounded-lg hover:bg-white/60 transition-all flex items-center gap-1 ${faved ? 'text-amber-500' : 'text-indigo-300 hover:text-amber-500'}">
                                         <svg class="w-3.5 h-3.5" fill="${faved ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
@@ -11124,7 +11204,7 @@ ${lines.join('\n')}
                     renderFolderList();
                     updateCurrentConversationTitle();
                     removeThinkingMessage();
-                    if (state.currentConversationId === conversation.id && !state.notesMode && !state.diaryMode && !document.getElementById(`msg-${aiMessage.id}`)) {
+                    if (state.currentConversationId === conversation.id && !state.notesMode && !state.diaryMode && !document.getElementById(`msg-${safeAttrId(aiMessage.id)}`)) {
                         renderMessage(aiMessage);
                     }
                     state.voiceState = 'idle';
@@ -11541,118 +11621,19 @@ ${lines.join('\n')}
         }
 
         // ==================== Edge TTS（免费，微软朗读服务） ====================
-        // 协议来源：github.com/rany2/edge-tts（MIT）—— 这里是独立实现，不是复制代码。
         //
-        // 要点（都被 403 坑过的人总结的）：
-        //   · URL 必须带 Sec-MS-GEC（sha256(Windows 文件时间取整到 5 分钟) + token，大写 hex）
-        //     与 Sec-MS-GEC-Version，否则 403
-        //   · 先发 Path:speech.config 文本帧，再发 Path:ssml 文本帧
-        //   · 二进制帧前 2 字节（大端）是 header 长度，Path:audio 的 payload 是 MP3
-        //   · Path:turn.end 表示合成结束
-        const EDGE_TTS_WSS = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1';
-        const EDGE_TTS_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-        const EDGE_TTS_CHROMIUM_FULL = '143.0.3650.75';
-
-        function edgeTtsSecMsGec() {
-            // Windows 文件时间：Unix 秒 + 11644473600，取整到 5 分钟，转 100ns ticks
-            let ticks = Math.floor(Date.now() / 1000) + 11644473600;
-            ticks -= ticks % 300;
-            ticks = ticks * 10000000;   // 秒 → 100 纳秒（Number 精度足够：~1.3e17 < 2^53? 不，2^53≈9e15）
-            // ↑ 1.3e17 超出 Number 安全整数！改用 BigInt
-            let t = BigInt(Math.floor(Date.now() / 1000) + 11644473600);
-            t -= t % 300n;
-            t *= 10000000n;
-            const str = t.toString() + EDGE_TTS_TOKEN;
-            return edgeSha256Hex(str).toUpperCase();
-        }
-
-        function edgeSha256Hex(str) {
-            // 同步 sha256 —— crypto.subtle 是异步的，而 URL 是同步拼的；这里用小实现
-            // （只在本函数内部用，不做通用密码学用途）
-            return sha256Sync(str);
-        }
-
-        function sha256Sync(ascii) {
-            // 紧凑的 SHA-256 实现（公共领域算法，JS 标准写法）
-            function rightRotate(value, amount) {
-                return (value >>> amount) | (value << (32 - amount));
-            }
-            const mathPow = Math.pow;
-            const maxWord = mathPow(2, 32);
-            let result = '';
-            const words = [];
-            const asciiBitLength = ascii.length * 8;
-            const hash = sha256Sync.h = sha256Sync.h || [];
-            const k = sha256Sync.k = sha256Sync.k || [];
-            let primeCounter = k.length;
-            const isComposite = {};
-            for (let candidate = 2; primeCounter < 64; candidate++) {
-                if (!isComposite[candidate]) {
-                    for (let i = 0; i < 313; i += candidate) isComposite[i] = candidate;
-                    hash[primeCounter] = (mathPow(candidate, 0.5) * maxWord) | 0;
-                    k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
-                }
-            }
-            ascii += '\x80';
-            while (ascii.length % 64 - 56) ascii += '\x00';
-            for (let i = 0; i < ascii.length; i++) {
-                const j = ascii.charCodeAt(i);
-                if (j >> 8) return '';   // 只支持 ASCII（我们输入是数字+大写字母，够用）
-                words[i >> 2] |= j << ((3 - i) % 4) * 8;
-            }
-            words[words.length] = ((asciiBitLength / maxWord) | 0);
-            words[words.length] = (asciiBitLength);
-            for (let j = 0; j < words.length;) {
-                const w = words.slice(j, j += 16);
-                const oldHash = hash.slice(0, 8);
-                for (let i = 0; i < 64; i++) {
-                    const w15 = w[i - 15], w2 = w[i - 2];
-                    const a = hash[0], e = hash[4];
-                    const temp1 = hash[7]
-                        + (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25))
-                        + ((e & hash[5]) ^ ((~e) & hash[6]))
-                        + k[i]
-                        + (w[i] = (i < 16) ? w[i] : (
-                            w[i - 16]
-                            + (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3))
-                            + w[i - 7]
-                            + (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))
-                        )) | 0;
-                    const temp2 = (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22))
-                        + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
-                    hash.unshift((temp1 + temp2) | 0);
-                    hash.pop();
-                    hash[4] = (hash[4] + temp1) | 0;
-                }
-                for (let i = 0; i < 8; i++) hash[i] = (hash[i] + oldHash[i]) | 0;
-            }
-            for (let i = 0; i < 8; i++) {
-                for (let j = 3; j + 1; j--) {
-                    const b = (hash[i] >> (j * 8)) & 255;
-                    result += ((b < 16) ? 0 : '') + b.toString(16);
-                }
-            }
-            return result;
-        }
-
-        function edgeTtsDateStr() {
-            // Javascript 风格的 UTC 日期串（服务端不校验时区名，照抄 edge-tts 的格式）
-            const d = new Date();
-            const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-            const p = (n) => String(n).padStart(2, '0');
-            return `${days[d.getUTCDay()]} ${months[d.getUTCMonth()]} ${p(d.getUTCDate())} ${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT+0000 (Coordinated Universal Time)`;
-        }
-
-        function edgeTtsConnectId() {
-            // UUID v4 无连字符
-            const b = new Uint8Array(16);
-            crypto.getRandomValues(b);
-            b[6] = (b[6] & 0x0f) | 0x40;
-            b[8] = (b[8] & 0x3f) | 0x80;
-            const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
-            return h;   // edge-tts 也是直接用 hex，不带连字符
-        }
+        // 这里**不再有** WebSocket 协议实现。原先页面里有一份浏览器直连版
+        // （Sec-MS-GEC token + 手写 SHA-256 + speech.config / ssml / audio 帧解析），
+        // 但它必然失败：微软端点校验浏览器指纹，而 JS 的 `new WebSocket()`
+        // **不允许自定义任何请求头** —— 实测直接 403。
+        //
+        // 现在两条路都不在页面里拼协议：
+        //   · 安卓 App：走原生插件 EdgeTtsPlugin（原生能自定义头）
+        //   · 电脑版：走本机后端 POST /api/tts/edge（Node 同样能自定义头）
+        // 协议细节分别在 android-app 的 EdgeTtsPlugin/MiniWebSocket 与
+        // server/edge-tts.mjs，由 check-edge-tts.mjs 覆盖。
+        //
+        // 下面这个函数只负责「按平台选一条路 + 拿回 MP3 字节」，不再自己拼协议。
 
         async function speakTextEdge(text, onStart, options = {}) {
             const { cacheKey = '', onEnd = null } = options;
@@ -11680,88 +11661,54 @@ ${lines.join('\n')}
             const volPct = Math.round(((Number(state.settings.ttsVolume) || 1) - 1) * 100);
             const volume = (volPct >= 0 ? '+' : '') + volPct + '%';
 
+            // ★ 两条路，按平台自动选：
+            //
+            //   · 安卓 App：走原生插件 EdgeTtsPlugin（原生能自定义 WebSocket 请求头）
+            //   · 电脑版：走本机后端的 /api/tts/edge（Node 同样能自定义头）
+            //
+            // 为什么都不能在浏览器里直接连：微软端点校验 User-Agent 等浏览器指纹，
+            // 而 JS 的 `new WebSocket()` **不允许自定义任何请求头** —— 实测直接 403。
+            // 这不是"电脑用不了"，是"浏览器里的 JS 用不了"。
+            const nativePlugin = window.Capacitor?.Plugins?.EdgeTts;
+            const useNative = Boolean(nativePlugin && typeof nativePlugin.synthesize === 'function');
+
             session.abortController = new AbortController();
-            const ws = new WebSocket(
-                `${EDGE_TTS_WSS}?TrustedClientToken=${EDGE_TTS_TOKEN}`
-                + `&Sec-MS-GEC=${edgeTtsSecMsGec()}`
-                + `&Sec-MS-GEC-Version=1-${EDGE_TTS_CHROMIUM_FULL}`
-                + `&ConnectionId=${edgeTtsConnectId()}`
-            );
-            ws.binaryType = 'arraybuffer';
-
-            const mp3Chunks = [];
-            let turnEnded = false;
-            let audioStarted = false;
-            const done = new Promise((resolve, reject) => {
-                ws.onopen = () => {
-                    // ① speech.config
-                    ws.send(
-                        `X-Timestamp:${edgeTtsDateStr()}\r\n`
-                        + 'Content-Type:application/json; charset=utf-8\r\n'
-                        + 'Path:speech.config\r\n\r\n'
-                        + '{"context":{"synthesis":{"audio":{"metadataoptions":{'
-                        + '"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"'
-                        + '},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n'
-                    );
-                    // ② ssml
-                    const escaped = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                    const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>`
-                        + `<voice name='${voice}'>`
-                        + `<prosody pitch='+0Hz' rate='${rate}' volume='${volume}'>${escaped}</prosody>`
-                        + `</voice></speak>`;
-                    ws.send(
-                        `X-RequestId:${edgeTtsConnectId()}\r\n`
-                        + 'Content-Type:application/ssml+xml\r\n'
-                        + `X-Timestamp:${edgeTtsDateStr()}Z\r\n`
-                        + 'Path:ssml\r\n\r\n'
-                        + ssml
-                    );
-                };
-                ws.onmessage = (ev) => {
-                    if (typeof ev.data === 'string') {
-                        // 文本帧：找 Path
-                        const m = ev.data.match(/\r\n\r\n/);
-                        const head = m ? ev.data.slice(0, m.index) : ev.data;
-                        const path = (head.match(/^Path:(.+)$/m) || [])[1] || '';
-                        if (path === 'turn.end') { turnEnded = true; ws.close(); }
-                        return;
-                    }
-                    // 二进制帧：前 2 字节大端 = header 长度
-                    const buf = new Uint8Array(ev.data);
-                    if (buf.length < 2) return;
-                    const headerLen = (buf[0] << 8) | buf[1];
-                    if (headerLen > buf.length) return;
-                    const header = new TextDecoder().decode(buf.subarray(2, headerLen + 2));
-                    if (!/^Path:audio$/m.test(header)) return;
-                    const audio = buf.subarray(headerLen + 2);
-                    if (audio.length > 0) {
-                        if (!audioStarted) {
-                            audioStarted = true;
-                            if (onStart) try { onStart(); } catch (e) { /* 忽略 */ }
-                        }
-                        mp3Chunks.push(audio);
-                    }
-                };
-                ws.onerror = () => reject(new ClientApiError('TTS_FAILED', 'Edge TTS 连接失败（微软服务不可达或协议变动）'));
-                ws.onclose = () => resolve(turnEnded);
-            });
-
-            // 停止 → 关连接
-            const origAbort = session.abortController.abort.bind(session.abortController);
-            session.abortController.abort = () => {
-                try { ws.close(); } catch (e) { /* 忽略 */ }
-                origAbort();
-            };
-
             try {
-                const ok = await done;
-                if (!ok || !mp3Chunks.length) {
-                    throw new ClientApiError('TTS_FAILED', 'Edge TTS 没有返回音频（微软可能改了协议或暂时限流）');
+                let arrayBuf;
+                if (useNative) {
+                    const res = await nativePlugin.synthesize({ text, voice, rate, volume, timeoutMs: 30000 });
+                    ensureVoiceSessionActive(session);
+                    if (!res || !res.ok || !res.audioBase64) {
+                        throw new ClientApiError('TTS_FAILED', 'Edge TTS 没有返回音频。');
+                    }
+                    const raw = atob(res.audioBase64);
+                    const bytes = new Uint8Array(raw.length);
+                    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+                    arrayBuf = bytes.buffer;
+                } else {
+                    // 电脑版：请本机后端代合成（同源请求，不走中转）
+                    const ratePct = Math.round(((Number(state.settings.ttsSpeed) || 1) - 1) * 100);
+                    const resp = await fetch('/api/tts/edge', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text, voice, ratePct }),
+                        signal: session.abortController.signal,
+                    });
+                    if (!resp.ok) {
+                        let detail = '';
+                        try {
+                            const j = await resp.json();
+                            detail = String(j && j.message || '');
+                        } catch { /* 非 JSON 响应 */ }
+                        throw new ClientApiError('TTS_FAILED',
+                            'Edge TTS 失败（HTTP ' + resp.status + '）' + (detail ? '：' + detail : ''));
+                    }
+                    arrayBuf = await resp.arrayBuffer();
+                    ensureVoiceSessionActive(session);
+                    if (!arrayBuf || arrayBuf.byteLength < 200) {
+                        throw new ClientApiError('TTS_FAILED', 'Edge TTS 返回的音频为空。');
+                    }
                 }
-                // 拼好 MP3 后走通用播放器（与豆包同一条路，支持 Live2D 口型驱动的能量分析）
-                const mp3 = new Blob(mp3Chunks, { type: 'audio/mp3' });
-                const arrayBuf = await mp3.arrayBuffer();
-                ensureVoiceSessionActive(session);
                 if (cacheKey) {
                     await saveCachedTtsAudio(cacheKey, arrayBuf, 24000, 'mp3');
                     console.log('[TTS Cache] 首次 Edge 音频已写入 IndexedDB');
@@ -11771,6 +11718,13 @@ ${lines.join('\n')}
                 return { cached: false };
             } catch (err) {
                 if (isVoiceCancellation(err) || !isVoiceSessionActive(session)) return { cancelled: true };
+                // 把底层的连接失败翻译成用户看得懂的话
+                const msg = String(err?.message || err || '');
+                if (/握手失败|HTTP \d|services aren't available|ECONNREFUSED|ENOTFOUND/i.test(msg)) {
+                    throw new ClientApiError('TTS_FAILED',
+                        'Edge TTS 连接被拒绝：' + msg.slice(0, 200)
+                        + '\n（这是微软免费服务的限制，不稳定属正常。建议改用其它语音服务商。）');
+                }
                 throw err;
             }
         }
@@ -12364,6 +12318,129 @@ ${lines.join('\n')}
             } catch (e) {
                 showCustomAlert('打开系统设置失败：' + (e.message || e), '操作悬浮窗');
             }
+        }
+
+        // ==================== 副屏监视窗 ====================
+        //
+        // AI 用「模块」后端操作手机时，它在**独立虚拟副屏**上跑，物理主屏看不到。
+        // 这个窗口把副屏画面搬进应用，让用户知道 AI 正在点什么、界面变成了什么样。
+        //
+        // 不做成 iframe 套模块的 3070 网页面板：那等于把浏览器塞进应用，风格割裂、
+        // 还有滚动/缩放两套坐标系。这里只从模块取「画面 + 状态」，UI 完全是我们自己的。
+        const SCREEN_WATCH_INTERVAL = 1500;   // 自动刷新间隔（模块出帧约 18ms，1.5s 足够跟手）
+        let screenWatchTimer = null;
+        let screenWatchAuto = true;
+        let screenWatchBusy = false;
+        let screenWatchLogs = [];
+
+        function screenWatchEl(id) { return document.getElementById(id); }
+
+        // setStep 在 agentRuntime 的 IIFE 里够不到这个函数，挂到 window 供它回调
+        window.__screenWatchNote = (text) => screenWatchNote(text);
+
+        /** 记录一条"AI 最近动作"，显示在监视窗里 */
+        function screenWatchNote(text) {
+            const t = String(text || '').trim();
+            if (!t) return;
+            const stamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+            screenWatchLogs.push(stamp + '  ' + t);
+            if (screenWatchLogs.length > 40) screenWatchLogs = screenWatchLogs.slice(-40);
+            const box = screenWatchEl('screenWatchLog');
+            if (box) {
+                box.innerHTML = screenWatchLogs.slice(-12).map((line) =>
+                    '<div>' + line.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</div>').join('');
+                box.scrollTop = box.scrollHeight;
+            }
+        }
+
+        /** 拉一帧副屏画面 + 状态 */
+        async function screenWatchRefresh() {
+            if (screenWatchBusy) return;
+            const plugin = deviceBridge();
+            const img = screenWatchEl('screenWatchImg');
+            const empty = screenWatchEl('screenWatchEmpty');
+            const meta = screenWatchEl('screenWatchMeta');
+            const dot = screenWatchEl('screenWatchDot');
+            const powerBtn = screenWatchEl('screenWatchPowerBtn');
+            if (!plugin || typeof plugin.liveFrame !== 'function') {
+                if (meta) meta.textContent = '电脑版没有副屏';
+                return;
+            }
+            screenWatchBusy = true;
+            try {
+                const res = await plugin.liveFrame();
+                if (!res || !res.ok) {
+                    // 明确区分"没有画面"和"模块不可用" —— 前者要引导启动副屏，后者要引导刷模块
+                    if (res && res.reason === 'no-frame') {
+                        if (meta) meta.textContent = '副屏无画面';
+                        if (dot) dot.style.background = '#fbbf24';
+                        if (empty) empty.classList.remove('hidden');
+                        if (img) img.classList.add('hidden');
+                        const hint = screenWatchEl('screenWatchEmptyHint');
+                        if (hint) hint.textContent = '副屏是空的（只有壁纸）。让 AI 先执行一次「手机打开 某应用」。';
+                    } else {
+                        if (meta) meta.textContent = '模块不可用';
+                        if (dot) dot.style.background = '#f87171';
+                        if (empty) empty.classList.remove('hidden');
+                        if (img) img.classList.add('hidden');
+                        const hint = screenWatchEl('screenWatchEmptyHint');
+                        if (hint) hint.textContent = String(res && res.text || '没刷 KernelSU 模块，或 vd_server 没在跑。');
+                    }
+                    if (powerBtn) powerBtn.textContent = '启动副屏';
+                    return;
+                }
+                if (img && res.imageBase64) {
+                    img.src = 'data:' + (res.mime || 'image/jpeg') + ';base64,' + res.imageBase64;
+                    img.classList.remove('hidden');
+                    if (empty) empty.classList.add('hidden');
+                    // 模块的截图优先返回**缓存的帧**（换速度），刚启动应用时可能还是旧的黑帧。
+                    // 判断依据：JPEG 极小时基本就是纯色（黑屏副屏约 9KB，有内容时几十~几百KB）。
+                    // 这里不弹提示打断，只把状态文字改掉，1.5s 后的自动刷新通常会追上新画面。
+                    const tiny = (res.bytes || 0) < 20000;
+                    if (tiny && meta && String(res.status || '') === 'running') {
+                        meta.textContent = '运行中 · Display ' + res.displayId + ' · 画面更新中…';
+                    }
+                }
+                const running = String(res.status || '') === 'running';
+                if (dot) dot.style.background = running ? '#34d399' : '#fbbf24';
+                if (meta) {
+                    meta.textContent = running
+                        ? ('运行中 · Display ' + res.displayId + ' · ' + res.width + '×' + res.height)
+                        : '已休眠';
+                }
+                if (powerBtn) powerBtn.textContent = running ? '关闭副屏' : '启动副屏';
+            } catch (e) {
+                if (meta) meta.textContent = '读取失败';
+            } finally {
+                screenWatchBusy = false;
+            }
+        }
+
+        function screenWatchStartAuto() {
+            screenWatchStopAuto();
+            if (!screenWatchAuto) return;
+            screenWatchTimer = setInterval(() => { void screenWatchRefresh(); }, SCREEN_WATCH_INTERVAL);
+        }
+        function screenWatchStopAuto() {
+            if (screenWatchTimer) { clearInterval(screenWatchTimer); screenWatchTimer = null; }
+        }
+
+        function openScreenWatch() {
+            const panel = screenWatchEl('screenWatchPanel');
+            if (!panel) return;
+            // 监视窗与设置面板同为 100002 层（见 CSS 里的分层说明）。两者若同时开着，
+            // 谁在上面就由 DOM 顺序决定 —— 那正是注释里说要避免的事。
+            // 所以打开监视窗前先把设置关掉（注释声称如此，实现以前漏了这一步）。
+            if (typeof closeSettingsPanel === 'function') closeSettingsPanel();
+            panel.classList.remove('hidden');
+            panel.classList.add('flex');
+            void screenWatchRefresh();
+            screenWatchStartAuto();
+        }
+        function closeScreenWatch() {
+            const panel = screenWatchEl('screenWatchPanel');
+            if (panel) { panel.classList.add('hidden'); panel.classList.remove('flex'); }
+            screenWatchStopAuto();
         }
 
         // ==================== 日志设置（服务端） ====================
@@ -13092,6 +13169,39 @@ ${card.characterPrompt}
             // 操作悬浮窗：跳系统设置授权 / 重新检测
             document.getElementById('overlayEnableBtn')?.addEventListener('click', enableOverlay);
             document.getElementById('overlayCheckBtn')?.addEventListener('click', () => { void refreshOverlayStatus(); });
+            // 副屏监视窗：入口在**运行状态条**上（AI 跑任务时才出现），
+            // 不放在设置里 —— 那是"用的时候才需要"的东西，放设置里得先翻两层。
+            document.getElementById('agentWatchBtn')?.addEventListener('click', () => { openScreenWatch(); });
+            // 副屏监视窗
+            document.getElementById('closeScreenWatch')?.addEventListener('click', closeScreenWatch);
+            document.getElementById('screenWatchPanel')?.addEventListener('click', (e) => {
+                // 点遮罩关闭（点面板内部不关）
+                if (e.target && e.target.id === 'screenWatchPanel') closeScreenWatch();
+            });
+            document.getElementById('screenWatchRefreshBtn')?.addEventListener('click', () => { void screenWatchRefresh(); });
+            document.getElementById('screenWatchAutoBtn')?.addEventListener('click', (e) => {
+                screenWatchAuto = !screenWatchAuto;
+                e.currentTarget.textContent = '自动刷新：' + (screenWatchAuto ? '开' : '关');
+                if (screenWatchAuto) screenWatchStartAuto(); else screenWatchStopAuto();
+            });
+            document.getElementById('screenWatchPowerBtn')?.addEventListener('click', async (e) => {
+                const plugin = deviceBridge();
+                if (!plugin || typeof plugin.moduleDisplay !== 'function') return;
+                const btn = e.currentTarget;
+                const wasRunning = /关闭/.test(btn.textContent || '');
+                btn.disabled = true;
+                try {
+                    const res = await plugin.moduleDisplay({ op: wasRunning ? 'stop' : 'start' });
+                    screenWatchNote(wasRunning ? '已请求关闭副屏' : '已请求启动副屏');
+                    if (res && res.text) console.log('[ScreenWatch] ' + res.text);
+                } catch (err) {
+                    screenWatchNote('副屏开关失败：' + (err.message || err));
+                } finally {
+                    btn.disabled = false;
+                    // 副屏启停需要几秒，稍等再刷新
+                    setTimeout(() => { void screenWatchRefresh(); }, 2500);
+                }
+            });
             document.getElementById('dataImportBtn')?.addEventListener('click', () => {
                 // APK 优先让用户从**已经导出到文档目录的备份**里挑（纯 Filesystem，不依赖 WebView 的文件选择器）；
                 // 挑不到（没有备份 / 插件不可用）再退回系统文件选择器。

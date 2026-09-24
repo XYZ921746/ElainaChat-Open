@@ -13,7 +13,9 @@ import path from 'node:path';
 import { promisify, inspect } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
+import dns from 'node:dns';
 import { createStore } from '../server/store.mjs';
+import { synthesizeEdge, probeEdge } from '../server/edge-tts.mjs';
 
 const scryptAsync = promisify(scrypt);
 
@@ -51,6 +53,32 @@ const BLOCKED_EXT = new Set([
     '.svg', '.xml', '.xsl',
     '.exe', '.dll', '.com', '.scr', '.msi', '.bat', '.cmd', '.ps1', '.psm1', '.vbs', '.wsf', '.jar', '.sh',
 ]);
+
+/**
+ * 取「最终落盘名」的扩展名，用于 BLOCKED_EXT 判定。
+ *
+ * 为什么不能直接用 path.extname：Windows 上有三种写法，extname 看到的和真正落盘的
+ * **不是同一个名字**，于是黑名单被绕过（实测均可复现）：
+ *
+ *   x.html::$DATA   → extname 得到 ".html::$data"，但 NTFS 交换数据流语法下
+ *                     写它等于写默认流，**落盘就是 x.html**，静态服务照样当 HTML 执行
+ *   x.html.         → extname 得到 "."，Windows 会丢掉尾随点，落盘仍是 x.html
+ *   x.html␠        → extname 得到 ".html "，尾随空格同样被丢掉
+ *
+ * 所以先把这些"看不见的尾巴"剥干净，再取扩展名。
+ */
+function effectiveExt(name) {
+    let s = String(name == null ? '' : name);
+    const colon = s.indexOf(':');          // NTFS ADS：只保留流名之前的部分
+    if (colon >= 0) s = s.slice(0, colon);
+    s = s.replace(/[. ]+$/, '');           // Windows 会丢弃尾随的点与空格
+    return path.extname(s).toLowerCase();
+}
+
+/** 该路径是否是禁止在应用文件夹内写入的危险类型 */
+function isBlockedWritePath(target) {
+    return BLOCKED_EXT.has(effectiveExt(path.basename(String(target || ''))));
+}
 
 // ===== 日志系统 =====
 //
@@ -624,7 +652,7 @@ function unzip(buf) {
         if (e.name.endsWith('/') || e.name.endsWith('\\')) continue; // 目录项
         const name = e.name.replace(/\\/g, '/');
         if (isUnsafeEntryName(name)) continue;
-        if (BLOCKED_EXT.has(path.posix.extname(name).toLowerCase())) { blocked.push(name); continue; }
+        if (BLOCKED_EXT.has(effectiveExt(path.posix.basename(name)))) { blocked.push(name); continue; }
 
         if (e.localOff + 30 > buf.length || buf.readUInt32LE(e.localOff) !== 0x04034b50) continue;
         const lNameLen = buf.readUInt16LE(e.localOff + 26);
@@ -1104,6 +1132,15 @@ async function agentWrite(request, res, isLocal) {
         const permission = String(body.permission || 'app');
         const target = resolveAgentPath(body.path, permission, isLocal);
         if (!target) { return jsonResponse(res, 403, { ok: false, message: (permission === 'computer' && isLocal) ? '路径无效' : PERM_DENIED_MSG }); }
+        // 应用文件夹模式下禁写危险类型：这些文件一旦落进 web/，静态服务就会以同源身份
+        // 执行/渲染它们（.html 直接构成存储型 XSS）。computer 模式本来就允许操作电脑
+        // 任意路径（用户自担风险），不做这个限制。
+        //
+        // 判据走 isBlockedWritePath（剥掉 ADS / 尾随点 / 尾随空格后再取扩展名）——
+        // 直接 path.extname(target) 会被 `x.html::$DATA` 这类写法绕过，落盘仍是 x.html。
+        if (!(isLocal && permission === 'computer') && isBlockedWritePath(target)) {
+            return jsonResponse(res, 400, { ok: false, message: '应用文件夹内不允许写 .html/.js/.svg 等可执行类型的文件（防止同源代码注入）' });
+        }
         // 只在目录不存在时创建（Windows 对盘符根目录如 D:\ 执行 mkdir 会报 EPERM）
         const dir = path.dirname(target);
         try {
@@ -1187,10 +1224,49 @@ const HTTPS_PORT = Number(process.env.HTTPS_PORT || 4174);
 
 function isPrivateIPv4(ip) {
     const p = String(ip).split('.').map(Number);
-    if (p.length !== 4 || p.some((n) => !Number.isInteger(n))) return false;
+    if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
     return p[0] === 10
         || (p[0] === 172 && p[1] >= 16 && p[1] <= 31)
         || (p[0] === 192 && p[1] === 168);
+}
+
+/**
+ * 把 IPv4-mapped / IPv4-compatible 的 IPv6 地址还原成点分 IPv4。
+ *
+ * 为什么必须有这一步：只按字符串前缀判内网会漏掉 `::ffff:127.0.0.1` 这种写法 ——
+ * 它**连的就是 127.0.0.1**（实测 TCP 可连通），但字符串既不 startsWith('127.')
+ * 也不是 '::1'，`isPrivateIPv4` 又会因 split('.') 长度不是 4 而返回 false，
+ * 于是整个内网判定被绕过。`::ffff:7f00:1` 是同一地址的十六进制写法。
+ */
+function mappedIPv4(ip) {
+    const s = String(ip || '').toLowerCase().replace(/^\[|\]$/g, '');
+    if (!s.includes(':')) return null;
+    // 只处理 ::ffff:a.b.c.d 与 ::a.b.c.d 这两种带点的写法
+    const dotted = s.match(/(?:::ffff:|::)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+    if (dotted) return dotted[1];
+    // 纯十六进制写法：::ffff:7f00:1 → 7f00:1 → 127.0.0.1
+    const hex = s.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hex) {
+        const hi = parseInt(hex[1], 16), lo = parseInt(hex[2], 16);
+        return [hi >> 8, hi & 255, lo >> 8, lo & 255].join('.');
+    }
+    return null;
+}
+
+/** 该 IP 是否指向本机或内网（回环 / 私网 / 链路本地 / 唯一本地） */
+function isInternalAddress(ip) {
+    const raw = String(ip || '').toLowerCase().replace(/^\[|\]$/g, '');
+    const v4 = mappedIPv4(raw) || (/^\d+\.\d+\.\d+\.\d+$/.test(raw) ? raw : null);
+    if (v4) {
+        return v4.startsWith('127.')
+            || v4.startsWith('169.254.')     // 链路本地，含云元数据 169.254.169.254
+            || v4 === '0.0.0.0'
+            || isPrivateIPv4(v4);
+    }
+    // IPv6：回环、链路本地 fe80::/10、唯一本地 fc00::/7、以及 IPv4 兼容写法
+    return raw === '::1' || raw === '::'
+        || /^fe[89ab]/.test(raw)             // fe80::/10
+        || /^f[cd]/.test(raw);               // fc00::/7
 }
 
 function localIPv4List() {
@@ -1498,8 +1574,10 @@ function attachRequestLog(request, response) {
 
 // 302 跳转（可选带一条 Set-Cookie），用于 http → https 升级
 function redirect(res, location, setCookie) {
-    res.__logNote = '=> ' + location;
-    const headers = { Location: location, 'Cache-Control': 'no-store' };
+    // Location 里的请求路径是攻击者可控输入，过滤控制字符与引号，防止响应分割/注入
+    const safeLocation = String(location).replace(/[\r\n"'<>\\]/g, '');
+    res.__logNote = '=> ' + safeLocation;
+    const headers = { Location: safeLocation, 'Cache-Control': 'no-store' };
     if (setCookie) headers['Set-Cookie'] = setCookie;
     res.writeHead(302, headers);
     res.end();
@@ -1802,6 +1880,18 @@ async function handleRelay(request, response) {
         console.warn(`[relay] 拒绝非本机请求访问本机地址 ${target.host}（防 SSRF）`);
         return jsonResponse(response, 403, { ok: false, relayError: true, message: '本机地址只能由本机发起中转' });
     }
+    // 只拦字面回环主机名还不够：攻击者可以让自己的域名解析到 127.0.0.1（DNS rebinding），
+    // 或直接填局域网地址、或用 ::ffff:127.0.0.1 这类 IPv4-mapped IPv6 写法绕开前缀比较。
+    // 先解析成 IP 再判一遍 —— 解析不出来就放行（真连不上时 fetch 自己会报错）。
+    if (!isLocalRequest(request)) {
+        let targetIps = [];
+        try { targetIps = await dns.promises.lookup(target.hostname, { all: true }); } catch { /* DNS 失败交给 fetch 报错 */ }
+        const dangerous = targetIps.some(({ address }) => isInternalAddress(address));
+        if (dangerous) {
+            console.warn(`[relay] 拒绝非本机请求访问内网地址 ${target.host} -> ${targetIps.map(i => i.address).join(',')}（防 SSRF）`);
+            return jsonResponse(response, 403, { ok: false, relayError: true, message: '本机与内网地址只能由本机发起中转' });
+        }
+    }
 
     const method = String(payload?.method || 'GET').toUpperCase();
     if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
@@ -1851,7 +1941,9 @@ async function handleRelay(request, response) {
             headers,
             body: sendBody ? bodyValue : undefined,
             signal: controller.signal,
-            redirect: 'follow',
+            // 不跟随上游重定向：302 Location 是攻击者可控的，跟随它可以把"对公网 API 的请求"
+            // 重定向到本机/内网地址，绕过上面的 SSRF 校验。3xx 原样透传给前端自己处理。
+            redirect: 'manual',
         });
     } catch (err) {
         clearTimeout(timer);
@@ -2141,9 +2233,16 @@ const requestHandler = async (request, response) => {
             });
         }
 
-        // 登录页（无需鉴权）
+        // 登录页（无需鉴权）。同样加防嵌套头 —— 登录页能被 iframe 嵌套就等于给了
+        // 点击劫持一个落点（诱导用户在伪造页面上输入访问密码）。
         if (pathname === '/login') {
-            response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+            response.writeHead(200, {
+                'Content-Type': 'text/html; charset=utf-8',
+                'Cache-Control': 'no-store',
+                'X-Frame-Options': 'DENY',
+                'Referrer-Policy': 'no-referrer',
+                'X-Content-Type-Options': 'nosniff',
+            });
             return response.end(loginPageHtml());
         }
         // 登录
@@ -2334,6 +2433,50 @@ const requestHandler = async (request, response) => {
             });
         }
 
+        // ==================== Edge TTS（免费语音合成） ====================
+        //
+        // 为什么由服务端代合成：微软这个端点校验浏览器指纹（User-Agent 等），
+        // 缺了就 403；而浏览器的 `new WebSocket()` **不允许自定义请求头**，
+        // 网页里直接连必失败。Node 没这个限制 —— 所以电脑版走这里，
+        // 手机版走原生插件（android-app 的 EdgeTtsPlugin，同样原因）。
+        //
+        // 零依赖：server/edge-tts.mjs 里手写 WebSocket 握手与帧编解码。
+        if (pathname === '/api/tts/edge' && request.method === 'POST') {
+            let payload;
+            try {
+                payload = JSON.parse((await readRawBody(request, 64 * 1024)).toString('utf8'));
+            } catch {
+                return jsonResponse(response, 400, { ok: false, message: '请求体不是合法 JSON' });
+            }
+            const text = String(payload?.text || '').trim();
+            if (!text) return jsonResponse(response, 400, { ok: false, message: '缺少 text' });
+            if (text.length > 2000) return jsonResponse(response, 400, { ok: false, message: '文本过长（上限 2000 字）' });
+            const voice = String(payload?.voice || 'zh-CN-XiaoxiaoNeural').trim() || 'zh-CN-XiaoxiaoNeural';
+            const ratePct = Number.isFinite(Number(payload?.ratePct)) ? Number(payload.ratePct) : 0;
+            try {
+                const mp3 = await synthesizeEdge({ text, voice, ratePct, timeoutMs: 25000 });
+                if (!mp3 || !mp3.length) {
+                    return jsonResponse(response, 502, { ok: false, message: 'Edge TTS 没有返回音频（服务端可能改了协议或限流）' });
+                }
+                response.writeHead(200, {
+                    'Content-Type': 'audio/mpeg',
+                    'Content-Length': String(mp3.length),
+                    'Cache-Control': 'no-store',
+                });
+                response.end(mp3);
+                return;
+            } catch (error) {
+                const message = String(error && error.message || error);
+                console.warn('[EdgeTTS] 合成失败: ' + message);
+                return jsonResponse(response, 502, { ok: false, message });
+            }
+        }
+        // 自检：只做握手，用于设置页的"测试"按钮
+        if (pathname === '/api/tts/edge/probe' && request.method === 'POST') {
+            const result = await probeEdge({ timeoutMs: 12000 });
+            return jsonResponse(response, 200, result);
+        }
+
         // 鉴权状态（供设置页展示：是否本机管理员、是否仍是初始随机密码）
         // 注意：初始明文密码只回给本机管理员，局域网会话拿不到（避免"能登录的人就能拿到明文密码"）
         if (pathname === '/api/auth/status' && request.method === 'GET') {
@@ -2436,6 +2579,12 @@ const requestHandler = async (request, response) => {
             'Content-Type': ctype,
             'Cache-Control': 'no-store',
             'X-Content-Type-Options': 'nosniff',
+            // HTML 页面不许被第三方页面 iframe 嵌套（点击劫持），也不该把页面 URL
+            // 通过 Referer 泄给外链目标 —— 页面 URL 里会带着 ?stay=http 这类参数。
+            ...(ctype.startsWith('text/html') ? {
+                'X-Frame-Options': 'DENY',
+                'Referrer-Policy': 'no-referrer',
+            } : {}),
         });
         // 流式返回：pipe 不会转发错误，必须自己兜住，否则读取失败 / 客户端中途断开
         // 会变成未处理异常；同时保证客户端断开时释放文件句柄。
@@ -2573,12 +2722,18 @@ if (httpsServer && HTTPS_PORT !== port) {
                 || (String(socket.localAddress || '127.0.0.1') + ':' + HTTPS_PORT);
             let target = lineMatch ? lineMatch[1] : '/';
             if (!target.startsWith('/')) target = '/' + target;
+            // Host 与请求路径都是攻击者可控的输入（Host 头可随意伪造、路径可带脚本），
+            // 原样拼进 HTML 就是反射 XSS。这里按 HTML 属性值转义，Location 头另按 RFC 只留
+            // 合法字符 —— 双保险。
             const to = 'https://' + hostHeader + target;
+            const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            const toHeader = to.replace(/[\r\n"'<>\s]/g, '');
             const body = '<!doctype html><meta charset="utf-8"><title>跳转到 HTTPS</title>'
                 + '<p style="font:15px/1.7 system-ui,sans-serif;padding:40px">'
-                + '正在跳转到 <a href="' + to + '">' + to + '</a></p>';
+                + '正在跳转到 <a href="' + esc(to) + '">' + esc(to) + '</a></p>';
             socket.end('HTTP/1.1 302 Found\r\n'
-                + 'Location: ' + to + '\r\n'
+                + 'Location: ' + toHeader + '\r\n'
                 + 'Content-Type: text/html; charset=utf-8\r\n'
                 + 'Content-Length: ' + Buffer.byteLength(body) + '\r\n'
                 + 'Cache-Control: no-store\r\n'

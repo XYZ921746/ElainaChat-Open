@@ -173,7 +173,7 @@ ok(/removeThinkingMessage\(\)/.test(loopFn),
     '续跑渲染前移除"正在想"气泡（不移除会一直挂着，回复看起来没出现）');
 ok(/state\.currentConversationId === conv\.id && !state\.notesMode && !state\.diaryMode/.test(loopFn),
     '渲染前判当前会话与 notes/diary 模式（与 commitAiMessageOnce 一致）');
-ok(/!document\.getElementById\(`msg-\$\{aiMessage\.id\}`\)/.test(loopFn),
+ok(/!document\.getElementById\(`msg-\$\{safeAttrId\(aiMessage\.id\)\}`\)/.test(loopFn),
     '渲染前防重复插入同一节点（幂等）');
 ok(/state\.voiceState = 'idle'/.test(loopFn), '续跑后把语音状态复位');
 ok(/updateUI\(\)/.test(loopFn), '续跑后刷新 UI');
