@@ -122,6 +122,54 @@ console.log('\n=== 3.5 主题设置独立成「外观」分栏 ===');
     ok(themeIdx > 0 && themeIdx < advIdx, '★ 主题设置已从「高级」移到「外观」');
     ok(/id="themePickerBox"/.test(html) && /id="themeDarkToggle"/.test(html),
         '外观分栏里有模板选择器与深色开关');
+
+    // ★★ 结构完整性：各分栏不能互相嵌套
+    //
+    // 这条是补的回归。搬移主题块时插入的 HTML 少了一个 `>`（写成 `</div`），
+    // 浏览器把它当成"未闭合的 div 开始"，**后面 8 个分栏全被嵌进了 tab-appearance**。
+    // 而 CSS 是 `.settings-tab-panel{display:none}` + `.active-panel{display:block}`，
+    // 表现就是"除了外观，其他设置全都不见了"。
+    //
+    // 这里用 div 配对算出每个分栏的范围，检查有没有谁被包在别人里面。
+    const overlayStart = html.indexOf('id="settingsOverlay"');
+    if (overlayStart < 0) {
+        ok(false, '找不到 settingsOverlay');
+    } else {
+        let depth = 0, i = html.lastIndexOf('<div', overlayStart), overlayEnd = -1;
+        for (; i < html.length; i++) {
+            if (html.startsWith('<div', i)) { depth++; i += 3; }
+            else if (html.startsWith('</div>', i)) { depth--; i += 5; if (depth === 0) { overlayEnd = i; break; } }
+        }
+        const region = html.slice(overlayStart, overlayEnd > 0 ? overlayEnd : html.length);
+        const ids = [...region.matchAll(/id="(tab-\w+)" class="settings-tab-panel/g)].map((m) => m[1]);
+        ok(ids.length >= 9, `设置里有 ${ids.length} 个分栏（应 ≥9）`);
+
+        const ranges = [];
+        for (const id of ids) {
+            const s = region.indexOf(`id="${id}"`);
+            const divStart = region.lastIndexOf('<div', s);
+            let d = 0, j = divStart, e = -1;
+            for (; j < region.length; j++) {
+                if (region.startsWith('<div', j)) { d++; j += 3; }
+                else if (region.startsWith('</div>', j)) { d--; j += 5; if (d === 0) { e = j; break; } }
+            }
+            ranges.push({ id, s: divStart, e });
+        }
+        const nested = [];
+        for (const a of ranges) {
+            for (const b of ranges) {
+                if (a.id === b.id) continue;
+                if (a.s < b.s && b.e < a.e) nested.push(`${b.id} 嵌在 ${a.id} 里`);
+            }
+        }
+        ok(nested.length === 0,
+            '★ 各设置分栏互不嵌套（分栏被嵌套会导致"其他设置全消失"）',
+            nested.slice(0, 3).join('; '));
+
+        // 顺带查常见的标签残缺：`</div` 后面直接跟换行（少个 >）
+        const brokenTag = /<\/div\s*\n/.test(region) || /<\/section\s*\n/.test(region);
+        ok(!brokenTag, '★ 没有残缺的闭合标签（如 </div 少了 >）');
+    }
 }
 
 console.log('\n=== 4. 同步（APK 端要用）===');
