@@ -50,6 +50,12 @@ async function init() {
     });
     elements.saveSettings.addEventListener('click', saveSettings);
     document.getElementById('resetSettingsBtn')?.addEventListener('click', restoreDefaultSettings);
+    // 插件：重新扫描（把刚丢进 web/mods/ 的 zip 装上）+ 全局开关
+    document.getElementById('modsRefreshBtn')?.addEventListener('click', () => {
+        const hint = document.getElementById('modsHint');
+        if (hint) { hint.textContent = '扫描中…'; hint.className = 'text-[11px] text-indigo-400'; }
+        void refreshModsList();
+    });
     document.getElementById('authChangeBtn')?.addEventListener('click', changeAccessPassword);
     document.getElementById('authLogoutBtn')?.addEventListener('click', logoutAccess);
     // 日志设置：改完立即生效（服务端运行时热更新），不需要点「保存设置」

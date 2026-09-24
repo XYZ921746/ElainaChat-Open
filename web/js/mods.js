@@ -352,14 +352,54 @@
     }
 
     /** 运行时启用/停用（停用只隐藏，不卸载脚本 —— 卸载需要整页刷新） */
-    function setEnabled(id, on) {
+    /**
+     * 运行时启用 / 停用。
+     *
+     * ⚠️ 这里有个很容易漏的点：**mod 默认是关闭的，所以它的脚本从未被注入过**
+     * （loadAll 只加载"已启用"的 mod）。如果启用时只改状态和 localStorage，
+     * 用户会看到开关变成"已启用"、界面却没有任何反应 —— 而且刷新后才正常，
+     * 看起来像"开关坏了"。
+     *
+     * 所以启用时必须判断：脚本还没加载（api 为空且不在 pendingRegistrations 里）
+     * 就先走一遍加载流程。停用则只调 mod 自己的 setEnabled(false) 让它收起来
+     * —— 已注入的脚本没法"卸载"，但停用后它不显示、不注册提示词，效果等价。
+     */
+    async function setEnabled(id, on) {
         const entry = registry.get(id);
         if (!entry) return false;
         setModEnabled(id, on);
-        try {
-            if (typeof entry.api?.setEnabled === 'function') entry.api.setEnabled(on);
-        } catch (e) { /* 插件自己的开关失败不该影响宿主 */ }
-        entry.state = on ? 'ready' : 'disabled';
+
+        if (on) {
+            // 还没加载过 → 现场加载（这样开关是"立即生效"，不需要刷新页面）
+            //
+            // 判据用"入口脚本是否已注入"而不是 api 是否为空：
+            //   · 有些 mod 没有 register()，加载完 api 就是 null —— 用 api 判会误判成"没加载过"
+            //   · 重复启用时不该重复注入脚本（<script> 会被再插一遍，mod 的初始化会跑两次）
+            const entrySrc = entry.manifest.entry || 'index.js';
+            const src = entrySrc.startsWith('/') ? entrySrc : MOD_ROOT + id + '/' + entrySrc;
+            const neverLoaded = !loadedScripts.has(src);
+            if (neverLoaded) {
+                try {
+                    await loadOne(entry.manifest);
+                } catch (e) {
+                    // loadOne 内部已经做了失败隔离，这里兜住它自己抛出的意外
+                    const fresh = registry.get(id);
+                    if (fresh) { fresh.state = 'error'; fresh.error = String((e && e.message) || e); }
+                }
+            } else if (typeof entry.api?.setEnabled === 'function') {
+                try { entry.api.setEnabled(on); } catch (e) { /* mod 自己的开关失败不该影响宿主 */ }
+            }
+            // 注意：loadOne 会往 registry 里塞一个**新** entry 对象，
+            // 所以这里必须重新取一次，不能继续用上面那个旧引用（否则读到过期的 state）
+            const fresh = registry.get(id);
+            if (fresh && fresh.state !== 'error') fresh.state = 'ready';
+        } else {
+            try {
+                if (typeof entry.api?.setEnabled === 'function') entry.api.setEnabled(false);
+            } catch (e) { /* 忽略 */ }
+            entry.state = 'disabled';
+        }
+
         emit('mod-changed', { id, enabled: on });
         return true;
     }

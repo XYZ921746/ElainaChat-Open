@@ -21,7 +21,32 @@ const filesToCopy = [
     ['vendor/live2dcubismcore.min.js', 'vendor/live2dcubismcore.min.js'],
     ['vendor/pixi-6.min.js', 'vendor/pixi-6.min.js'],
     ['vendor/pixi-live2d-display-cubism4.min.js', 'vendor/pixi-live2d-display-cubism4.min.js'],
+    // Markdown + LaTeX 渲染（消息里的 **加粗**、列表、表格与 $公式$ 靠它们）
+    ['vendor/marked/marked.min.js', 'vendor/marked/marked.min.js'],
+    ['vendor/katex/katex.min.js', 'vendor/katex/katex.min.js'],
+    ['vendor/katex/katex.min.css', 'vendor/katex/katex.min.css'],
 ];
+
+// katex 字体：**必须一起同步**，否则公式会退化成方框/默认字体。
+// 单独列是因为它在子目录里，且是二进制字体文件。
+async function collectFontFiles(dir, prefix = '') {
+    const out = [];
+    let entries = [];
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
+    for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue;
+        const rel = prefix ? prefix + '/' + entry.name : entry.name;
+        if (entry.isDirectory()) {
+            out.push(...await collectFontFiles(path.join(dir, entry.name), rel));
+        } else if (entry.isFile() && /\.(woff2?|ttf)$/i.test(entry.name)) {
+            out.push(rel);
+        }
+    }
+    return out;
+}
+for (const rel of (await collectFontFiles(path.join(sourceRoot, 'vendor', 'katex', 'fonts'))).sort()) {
+    filesToCopy.push(['vendor/katex/fonts/' + rel, 'vendor/katex/fonts/' + rel]);
+}
 
 // web/js/ 下的前端脚本：**自动发现**，不写死清单。
 //
@@ -51,6 +76,40 @@ for (const rel of jsFiles) {
     filesToCopy.push(['js/' + rel, 'js/' + rel]);
 }
 
+// ==================== mod（插件）====================
+//
+// 为什么要打包进 APK：APK 里**没有服务端**，也就没有"扫描目录自动解压 zip"
+// 那条路（浏览器无法列目录，服务端才有这个能力）。所以安卓端的 mod 只能
+// 在构建时随 www 一起打进去，清单也随 www 一起带上。
+//
+// 用户仍可在安卓端启用/停用它们（设置 → 插件），只是不能像电脑版那样
+// 丢个 zip 进去就装 —— 那需要服务端。
+//
+// 自动发现：整棵 mods/ 目录都收（含图片、样式、清单），不写死 mod 名。
+// 与 js 的处理同理 —— 手写清单每加一个 mod 都要记得回来改，迟早会漏。
+async function collectModFiles(dir, prefix = '') {
+    const out = [];
+    let entries = [];
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
+    for (const entry of entries) {
+        if (entry.name.startsWith('.')) continue;
+        // 不同步 zip 安装包：那是"待安装"的源，APK 端没有解压能力，
+        // 带上只是白占体积（解压好的目录才是真正要用的）
+        if (entry.isFile() && /\.zip$/i.test(entry.name)) continue;
+        const rel = prefix ? prefix + '/' + entry.name : entry.name;
+        if (entry.isDirectory()) {
+            out.push(...await collectModFiles(path.join(dir, entry.name), rel));
+        } else if (entry.isFile()) {
+            out.push(rel);
+        }
+    }
+    return out;
+}
+const modFiles = (await collectModFiles(path.join(sourceRoot, 'mods'))).sort();
+for (const rel of modFiles) {
+    filesToCopy.push(['mods/' + rel, 'mods/' + rel]);
+}
+
 await mkdir(path.join(androidWebRoot, 'vendor'), { recursive: true });
 for (const [src, dest] of filesToCopy) {
     const destPath = path.join(androidWebRoot, dest);
@@ -59,6 +118,7 @@ for (const [src, dest] of filesToCopy) {
 }
 console.log(`Synced ${filesToCopy.length} files (customized Web UI incl. Live2D) into the Android project.`);
 if (jsFiles.length) console.log(`  frontend scripts: ${jsFiles.map((f) => 'js/' + f).join(', ')}`);
+if (modFiles.length) console.log(`  mods: ${modFiles.length} files`);
 
 // ==================== 内置 Live2D 模型 ====================
 // 仓库里 web/live2d/models/ 下的模型随 APK 分发：复制进安卓工程的 www/live2d/models/，

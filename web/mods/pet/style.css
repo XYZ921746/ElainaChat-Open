@@ -1,0 +1,36 @@
+/* ============================================================================
+ * 桌宠样式
+ *
+ * 大部分布局用内联样式写在 index.js 里（浮层结构简单，内联更直观且便于
+ * 单个 mod 自包含）。这里只放**必须用 CSS 定义**的部分：动画关键帧。
+ * ========================================================================== */
+
+/* 呼吸浮动：立绘轻微上下移动，让静态图看起来"活着"。
+   Galgame 的立绘也复用了同一个动画名（上游如此）—— 所以这个关键帧
+   实际上被两个 mod 共用。放在桌宠的样式里是因为桌宠是它的主要使用场景；
+   若将来两个 mod 都要独立可用，可以把这个动画上移到公共依赖插件里。 */
+@keyframes pet-breathe {
+    0%, 100% { transform: translateY(0) scale(1); }
+    50% { transform: translateY(-1.2%) scale(1.008); }
+}
+
+/* 表情切换的入场动画：轻微弹一下，让"换表情"这件事被看见 */
+#petAvatar.emo-swap {
+    animation: pet-emo-in .32s cubic-bezier(.3, 1.4, .5, 1) both,
+               pet-breathe 6.5s ease-in-out infinite;
+}
+@keyframes pet-emo-in {
+    from { opacity: .35; transform: translateY(6px) scale(.985); }
+    to { opacity: 1; transform: none; }
+}
+
+/* 气泡区滚动条收细（与主界面的 .scroll-soft 风格一致） */
+#petBubbles::-webkit-scrollbar { width: 4px; }
+#petBubbles::-webkit-scrollbar-track { background: transparent; }
+#petBubbles::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, .45); border-radius: 9999px; }
+
+/* 小屏适配：桌宠不能占满整个屏幕，否则挡住主界面 */
+@media (max-width: 560px) {
+    #petLayer { width: min(300px, 92vw) !important; }
+    #petLayer #petAvatar { max-height: 150px !important; }
+}

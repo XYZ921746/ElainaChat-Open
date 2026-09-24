@@ -734,9 +734,119 @@ function syncAgentSectionsByDevice() {
 function openSettings() {
     fillSettingsForm();
     void refreshAuthStatus();
+    // 每次打开设置都刷新插件列表：用户可能在服务运行期间往 web/mods/ 丢了新 zip，
+    // 刷新一次就能看到（而不是要求他重启服务）
+    void refreshModsList();
     elements.settingsOverlay.classList.remove('hidden');
     elements.settingsOverlay.classList.add('flex');
     setRailActive('settings');
+}
+
+// ==================== 插件（mod）设置栏 ====================
+
+/**
+ * 渲染「设置 → 插件」列表。
+ *
+ * 数据来源两条路，缺一不可：
+ *   ① 服务端 /api/plugins —— 会扫描 web/mods/ 并把新丢进去的 zip 解压安装，
+ *      然后返回清单。这是"装了哪些 mod"的权威来源。
+ *   ② 前端 window.ElainaMods.list() —— 加载器**实际加载**的结果（含每个 mod 的
+ *      运行状态：ready / disabled / error）。
+ *
+ * 为什么要合并两者：服务端知道"磁盘上有什么"，前端知道"跑起来没有"。
+ * 只看服务端会把加载失败的 mod 显示成正常；只看前端则看不到"刚丢进去还没加载"的 mod。
+ * 另外 APK 端没有服务端，此时只能靠前端那份（构建时打包进去的 mod）。
+ */
+async function refreshModsList() {
+    const box = document.getElementById('modsList');
+    if (!box) return;
+    const hint = document.getElementById('modsHint');
+
+    let fromServer = [];
+    try {
+        const res = await fetch('/api/plugins', { cache: 'no-store' });
+        if (res.ok) {
+            const data = await res.json();
+            fromServer = Array.isArray(data && data.plugins) ? data.plugins : [];
+            // 安装失败的 zip 要让用户看见原因，否则"我放进去了但没反应"无从排查
+            const bad = (data && data.installResults || []).filter((r) => !r.ok);
+            if (hint && bad.length) {
+                hint.textContent = '有 ' + bad.length + ' 个 zip 安装失败：' + bad.map((b) => b.zip + '（' + b.error + '）').join('；');
+                hint.className = 'text-[11px] text-red-500';
+            }
+        }
+    } catch (e) { /* APK 端没有这个接口，走前端那份 */ }
+
+    const fromLoader = (window.ElainaMods && typeof window.ElainaMods.list === 'function')
+        ? window.ElainaMods.list() : [];
+
+    // 以服务端清单为准，用加载器状态补充
+    const stateOf = new Map(fromLoader.map((m) => [m.id, m]));
+    const merged = fromServer.map((m) => Object.assign({}, m, stateOf.get(m.id) || {}));
+    // 服务端没有但加载器有的（APK 端 / 手工放目录）也要显示
+    for (const m of fromLoader) {
+        if (!merged.some((x) => x.id === m.id)) merged.push(m);
+    }
+
+    const globalToggle = document.getElementById('modsGlobalToggle');
+    if (globalToggle && window.ElainaMods) {
+        globalToggle.checked = window.ElainaMods.isGloballyEnabled();
+        globalToggle.onchange = () => {
+            window.ElainaMods.setGloballyEnabled(globalToggle.checked);
+            if (hint) {
+                hint.textContent = '已' + (globalToggle.checked ? '启用' : '关闭') + '插件系统，刷新页面后生效';
+                hint.className = 'text-[11px] text-indigo-500';
+            }
+        };
+    }
+
+    if (!merged.length) {
+        box.innerHTML = '<div class="text-[11px] text-indigo-400 py-3 text-center">'
+            + '没有发现插件。把 mod 的 zip 放进 <code class="px-1 rounded bg-white/60">web/mods/</code> 后点「重新扫描」。</div>';
+        return;
+    }
+
+    box.innerHTML = merged.map((m) => {
+        const id = escapeHtml(m.id);
+        const name = escapeHtml(m.name || m.id);
+        const desc = escapeHtml(m.description || '');
+        const ver = m.version ? '<span class="text-[10px] text-indigo-400 ml-1">v' + escapeHtml(m.version) + '</span>' : '';
+        // 状态标记：加载失败必须显眼，否则用户只会觉得"开了没反应"
+        let badge = '';
+        if (m.state === 'error') {
+            badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-600 ml-1" title="'
+                + escapeHtml(m.error || '') + '">加载失败</span>';
+        } else if (m.state === 'ready') {
+            badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-600 ml-1">已加载</span>';
+        }
+        // hidden 的 mod（如公共依赖）不显示开关 —— 它不提供界面，关掉只会让别的 mod 坏掉
+        const toggle = m.hidden
+            ? '<span class="text-[10px] text-indigo-300 flex-none">公共依赖</span>'
+            : '<input type="checkbox" class="accent-pink-500 flex-none mod-toggle" data-mod-id="' + id + '"'
+                + (m.enabled ? ' checked' : '') + '>';
+        return '<label class="flex items-start gap-2 py-2 px-3 rounded-xl bg-white/50 cursor-pointer">'
+            + toggle
+            + '<span class="min-w-0">'
+              + '<span class="text-xs font-semibold text-indigo-800">' + name + '</span>' + ver + badge
+              + (desc ? '<span class="block text-[11px] text-indigo-400 leading-relaxed mt-0.5">' + desc + '</span>' : '')
+            + '</span></label>';
+    }).join('');
+
+    // 开关事件：走 mod 系统的 setEnabled（会持久化 + 通知 mod 自己）
+    box.querySelectorAll('.mod-toggle').forEach((el) => {
+        el.addEventListener('change', async () => {
+            const id = el.getAttribute('data-mod-id');
+            // setEnabled 是 async 的：启用一个**尚未加载**的 mod 需要现场注入它的脚本
+            // （mod 默认关闭时脚本从未加载过）。必须 await 之后再刷新列表，
+            // 否则会读到旧的 state，把刚启用的 mod 显示成"未加载"。
+            if (window.ElainaMods) await window.ElainaMods.setEnabled(id, el.checked);
+            if (hint) {
+                hint.textContent = '已' + (el.checked ? '启用' : '停用') + ' ' + id + '（立即生效）';
+                hint.className = 'text-[11px] text-indigo-500';
+            }
+            void refreshModsList();
+        });
+    });
 }
 
 function closeSettingsPanel() {

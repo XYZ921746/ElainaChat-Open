@@ -108,6 +108,77 @@ console.log('=== 1. 关键实现存在且语义正确 ===');
     const iMods = html.indexOf('/js/mods.js');
     const iInit = html.indexOf('/js/app-07-init.js');
     ok(iMods > 0 && iInit > 0 && iMods < iInit, '★ mods.js 排在 app-07-init.js 之前（初始化要读清单）');
+
+    // ---- 宿主消费 mod 提示词（Galgame 场景指令送达模型的必经路径）----
+    const data = readFileSync(path.join(ROOT, 'web', 'js', 'app-02-data.js'), 'utf8');
+    ok(/ElainaMods/.test(data) && /collectPromptHints/.test(data),
+        '★ 宿主在构造提示词时消费 mod 注入的 system 片段');
+
+    // ---- 设置 → 插件分栏 ----
+    ok(/data-settings-tab="tab-mods"/.test(html), '设置里有「插件」Tab');
+    ok(/id="tab-mods"/.test(html), '有 #tab-mods 面板');
+    ok(/id="modsList"/.test(html), '有 mod 列表容器');
+    ok(/id="modsGlobalToggle"/.test(html), '有全局开关');
+    const settings = readFileSync(path.join(ROOT, 'web', 'js', 'app-06-settings.js'), 'utf8');
+    ok(/async function refreshModsList/.test(settings), '有 refreshModsList');
+    ok(/\/api\/plugins/.test(settings), '列表数据来自服务端 /api/plugins');
+    ok(/ElainaMods\.list\(\)/.test(settings), '同时合并前端加载状态（服务端只知道磁盘上有什么）');
+    ok(/加载失败/.test(settings), '★ 加载失败的 mod 有显眼标记（否则用户以为"开了没反应"）');
+    ok(/公共依赖/.test(settings), '★ hidden 的 mod 显示为「公共依赖」而非开关');
+}
+
+// ============================================================ 1.5 两个 mod 本体
+console.log('\n=== 1.5 Galgame 与桌宠（本体与共用层） ===');
+{
+    const galPath = path.join(ROOT, 'web', 'mods', 'galgame', 'index.js');
+    const petPath = path.join(ROOT, 'web', 'mods', 'pet', 'index.js');
+    ok(existsSync(galPath), 'galgame/index.js 存在');
+    ok(existsSync(petPath), 'pet/index.js 存在');
+    ok(existsSync(path.join(ROOT, 'web', 'mods', 'elaina-avatar', 'index.js')), 'elaina-avatar/index.js 存在');
+
+    if (existsSync(galPath) && existsSync(petPath)) {
+        const gal = readFileSync(galPath, 'utf8');
+        const pet = readFileSync(petPath, 'utf8');
+
+        ok(/ElainaMods\.register\(MOD_ID/.test(gal), 'galgame 用 register 注册（id 用 MOD_ID 常量）');
+        ok(/ElainaMods\.register\(MOD_ID/.test(pet), 'pet 用 register 注册（id 用 MOD_ID 常量）');
+        // 两个 mod 的 id 常量必须与目录名一致（对不上会导致加载器认不出）
+        ok(/const MOD_ID = 'galgame'/.test(gal), 'galgame 的 MOD_ID 与目录名一致');
+        ok(/const MOD_ID = 'pet'/.test(pet), 'pet 的 MOD_ID 与目录名一致');
+
+        // ★ 共用立绘与情绪：这是"消除上游 20MB 重复"的落点
+        ok(/ElainaAvatar/.test(gal) && !/img\/elaina\/p_/.test(gal),
+            '★ galgame 用公共 ElainaAvatar，不自己拼立绘路径');
+        ok(/ElainaAvatar/.test(pet) && !/img\/elaina\/p_/.test(pet),
+            '★ pet 用公共 ElainaAvatar，不自己拼立绘路径');
+
+        // ★ 不直接摸宿主全局
+        ok(!/\bstate\.conversations\b/.test(gal), '★ galgame 不直接读 state（走 host API）');
+        ok(!/\bstate\.conversations\b/.test(pet), '★ pet 不直接读 state（走 host API）');
+
+        // ★ 提示词注入走注册表（不往 window 挂变量）
+        ok(/setPromptHint/.test(gal), '★ galgame 用 host.setPromptHint');
+        // 只在**代码**里查这个符号 —— 注释里提到它是为了说明"不再用"，
+        // 直接对全文断言会误报（第一版就踩了这个）
+        const galCodeOnly = gal.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
+        ok(!/__galgameSceneHint/.test(galCodeOnly), '★ 代码里不再往 window 上挂提示词变量');
+
+        // ★ 双重开关已消除
+        ok(!/get\('enabled'/.test(gal), '★ galgame 不读自己的 enabled（避免双重开关）');
+        ok(!/get\('enabled'/.test(pet), '★ pet 不读自己的 enabled');
+        ok(/ElainaMods\.setEnabled\(MOD_ID, false\)/.test(gal), '★ galgame 退出时同步关 mod 开关');
+        ok(/ElainaMods\.setEnabled\(MOD_ID, false\)/.test(pet), '★ pet 收起时同步关 mod 开关');
+
+        // 资源
+        ok(existsSync(path.join(ROOT, 'web', 'mods', 'galgame', 'style.css')), 'galgame 有样式');
+        ok(existsSync(path.join(ROOT, 'web', 'mods', 'pet', 'style.css')), 'pet 有样式');
+
+        // ★ 立绘只有一套（消除重复的实证）
+        const imgDir = path.join(ROOT, 'web', 'mods', 'elaina-avatar', 'img');
+        let pngs = [];
+        try { pngs = readdirSync(imgDir).filter((f) => f.endsWith('.png')); } catch { /* 忽略 */ }
+        ok(pngs.length === 9, '公共立绘恰好 9 张（一套），实得 ' + pngs.length);
+    }
 }
 
 // ============================================================ 2. 端到端
