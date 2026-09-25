@@ -101,6 +101,8 @@ const AGENT_RISK = {
     '手机命令': 'dangerous',
     // 电脑命令：危险的那部分由**服务端**再判一次并强制授权（见 server/pc-command.mjs），
     // 这里标 sensitive 是让"安全命令"不打扰用户、危险命令走同一条授权 UI。
+    // 访问文件夹外：调用时一律带 forceAsk，所以这里的档位只是兜底（不会被豁免吞掉）。
+    '访问文件夹外': 'sensitive',
     // 为什么不在前端也标 dangerous：前端标了会把 `dir` 这种也变成每次必问，
     // 而真正的危险判定要穷举命令语义，只有服务端那份规则表是权威。
     '电脑命令': 'sensitive'
@@ -1157,6 +1159,32 @@ function confirmAgentWrite(path, permission) {
     return ok;
 }
 
+// 越界申请：限制模式（仅应用文件夹）下 AI 要碰 web/ 之外的位置时，
+// 由用户就**这一次**决定是否放行，而不是要求他去设置页把全局权限改成「允许操作电脑」。
+//
+// 为什么不做成"全局模式切换"：越界往往是**一次性**的（读一个下载目录里的文件）。
+// 让用户为了这一次去改全局设置，他改完多半忘了改回来 —— 结果是限制模式被永久关掉，
+// 比"就这一次放行"危险得多。所以这里只批这一次，且同一路径只问一次（同一轮内）。
+//
+// ★ 服务端仍会独立校验：只有本机（127.0.0.1）请求的 allowOutside 才被接受，
+//   局域网设备即使伪造 allowOutside=true 也会拿到 403（见 resolveAgentPathEx）。
+const agentEscalationApproved = new Set();
+async function confirmAgentEscalation(path) {
+    const target = String(path || '').trim();
+    if (!target) return false;
+    if (agentEscalationApproved.has(target)) return true;
+    const detail = 'AI 想访问应用文件夹之外的位置：\n\n' + target
+        + '\n\n只放行这一次（同一路径本轮不再重复询问）。\n'
+        + '如果你希望它长期能操作电脑，可在「设置 → 能力 → AI 操作电脑」切到「允许操作电脑」。';
+    let ok = false;
+    // 优先走统一的授权 UI（APK 上是系统悬浮窗，网页版回退到应用内弹窗）
+    try {
+        ok = await agentRuntime.requestApproval('访问文件夹外', detail, { forceAsk: true });
+    } catch { ok = false; }
+    if (ok) agentEscalationApproved.add(target);
+    return ok;
+}
+
 // 执行 Agent 文件操作并把结果回填对话（AI 能看到/用户能看到）
 async function doAgentFile(action, { path, content } = {}, permission) {
     // 过程记录：文件操作是用户最关心的"AI 到底动了什么"。
@@ -1187,19 +1215,31 @@ async function doAgentFile(action, { path, content } = {}, permission) {
             //
             // 真实故障：日志里能看到 `[Relay] [WARN] 目标地址无效：/api/agent/write`，
             // 而 ls / read 走的是同源 fetch 所以正常 —— 表现为"读取能用、写入不行"。
-            const res = await fetch('/api/agent/write', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ permission, path, content })
-            });
-            result = await res.json();
-            // 同源 fetch 不像 postJsonFromDevice 那样带 rawText，补一份便于错误提示
-            if (!result.rawText) result.rawText = JSON.stringify(result);
-            if (!('ok' in result)) result.ok = res.ok;
+            const send = async (allowOutside) => {
+                const res = await fetch('/api/agent/write', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ permission, path, content, allowOutside })
+                });
+                const r = await res.json();
+                // 同源 fetch 不像 postJsonFromDevice 那样带 rawText，补一份便于错误提示
+                if (!r.rawText) r.rawText = JSON.stringify(r);
+                if (!('ok' in r)) r.ok = res.ok;
+                return r;
+            };
+            result = await send(false);
+            if (result.needEscalation && await confirmAgentEscalation(path)) {
+                result = await send(true);
+            }
         } else {
-            const q = 'permission=' + encodeURIComponent(permission) + (path ? '&path=' + encodeURIComponent(path) : '');
-            const res = await fetch(`/api/agent/${action}?${q}`);
-            result = await res.json();
+            const buildQuery = (allowOutside) => 'permission=' + encodeURIComponent(permission)
+                + (path ? '&path=' + encodeURIComponent(path) : '')
+                + (allowOutside ? '&allowOutside=1' : '');
+            const send = async (allowOutside) => await (await fetch(`/api/agent/${action}?${buildQuery(allowOutside)}`)).json();
+            result = await send(false);
+            if (result.needEscalation && await confirmAgentEscalation(path)) {
+                result = await send(true);
+            }
         }
         // 错误信息：后端返回 payload.message / rawText（修复"未知错误"）
         const errMsg = (() => {

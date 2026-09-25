@@ -932,16 +932,66 @@ function isLocalRequest(request) {
 
 const PERM_DENIED_MSG = '限制模式：仅可操作应用文件夹（web/）。如需操作电脑其他路径，请在本机用 http://127.0.0.1:4173 打开（出于安全，局域网访问一律限制在应用文件夹内）。';
 
-function resolveAgentPath(rawPath, permission, isLocal) {
+/**
+ * 解析 Agent 路径，并区分"路径无效"与"越界"两种失败。
+ *
+ * 为什么要区分：越界是**可以申请的**（用户点一次「允许」即可），
+ * 而路径无效（空、别名解析不出来）申请也没用。旧实现两者都返回 null，
+ * 调用方只能笼统回一句"限制模式…请去改设置" —— 用户被迫去翻设置页，
+ * 而其实他只需要就这一次点个「允许」。
+ *
+ * @param {string} rawPath
+ * @param {string} permission 'app' | 'computer'
+ * @param {boolean} isLocal 只有本机才可能放开
+ * @param {boolean} allowOutside 用户已就本次操作批准越界（前端确认后回传）
+ * @returns {{ok:true, path:string} | {ok:false, reason:'invalid'|'outside'|'remote'}}
+ */
+function resolveAgentPathEx(rawPath, permission, isLocal, allowOutside = false) {
     const p = expandPathAliases(rawPath);
-    if (!p) return null;
-    // 只有本机请求才允许"允许操作电脑"；其余一律按 app 模式处理
-    const effective = (isLocal && permission === 'computer') ? 'computer' : 'app';
+    if (!p) return { ok: false, reason: 'invalid' };
     const resolved = path.resolve(p);
-    if (effective === 'app') {
-        if (resolved !== AGENT_APP_ROOT && !resolved.startsWith(AGENT_APP_ROOT + path.sep)) return null;
+
+    // 全权限：本机即可
+    if (isLocal && permission === 'computer') return { ok: true, path: resolved };
+
+    // 限制模式：应用文件夹内直接放行
+    if (resolved === AGENT_APP_ROOT || resolved.startsWith(AGENT_APP_ROOT + path.sep)) {
+        return { ok: true, path: resolved };
     }
-    return resolved;
+
+    // 越界。★ 只有**本机**请求才允许"申请越界" —— 局域网设备即使传
+    //   allowOutside 也必须被拒（否则等于把 computer 模式送给了整个局域网，
+    //   而 isLocal 检查的全部意义就在于此）。
+    if (!isLocal) return { ok: false, reason: 'remote' };
+    if (allowOutside === true) return { ok: true, path: resolved };
+    return { ok: false, reason: 'outside' };
+}
+
+/** 旧签名保留：只要最终路径，拿不到就是 null（供不关心失败原因的调用方用） */
+function resolveAgentPath(rawPath, permission, isLocal, allowOutside = false) {
+    const r = resolveAgentPathEx(rawPath, permission, isLocal, allowOutside);
+    return r.ok ? r.path : null;
+}
+
+/**
+ * 统一的「路径被拒」响应。
+ *
+ * 越界时回 403 + needEscalation，让前端弹一次「是否允许访问这个位置」；
+ * 而不是让用户自己去设置页切换全局模式 —— 那是一次性需求却要改全局配置，
+ * 用户改完往往忘了改回来，等于把限制模式永久关掉了。
+ */
+function denyPath(res, reason, isLocal) {
+    if (reason === 'outside') {
+        return jsonResponse(res, 403, {
+            ok: false,
+            needEscalation: true,
+            message: '这个位置在应用文件夹之外。需要你确认后才能访问。',
+        });
+    }
+    if (reason === 'remote') {
+        return jsonResponse(res, 403, { ok: false, message: PERM_DENIED_MSG });
+    }
+    return jsonResponse(res, 403, { ok: false, message: '路径无效' });
 }
 
 /**
@@ -969,12 +1019,15 @@ async function listAgentEntries(target) {
 async function agentLs(params, res, isLocal) {
     try {
         const permission = String(params.get('permission') || 'app');
-        const target = resolveAgentPath(params.get('path') || AGENT_APP_ROOT, permission, isLocal);
-        if (!target) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, message: (permission === 'computer' && isLocal) ? '路径无效' : PERM_DENIED_MSG })); return; }
+        const allowOutside = params.get('allowOutside') === '1';
+        const r = resolveAgentPathEx(params.get('path') || AGENT_APP_ROOT, permission, isLocal, allowOutside);
+        if (!r.ok) return denyPath(res, r.reason, isLocal);
+        const target = r.path;
+        const full = (isLocal && permission === 'computer') || allowOutside;
         const info = await stat(target).catch(() => null);
         if (!info || !info.isDirectory()) {
             // 带上真实位置提示：AI 猜错路径时，下一轮能自己纠正（旧实现只回「目录不存在」，它就卡死了）
-            const hint = (permission === 'computer' && isLocal) ? shellFolderHint() : '';
+            const hint = full ? shellFolderHint() : '';
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, message: '目录不存在：' + target + (hint ? '。' + hint : '') }));
             return;
@@ -991,11 +1044,14 @@ async function agentLs(params, res, isLocal) {
 async function agentRead(params, res, isLocal) {
     try {
         const permission = String(params.get('permission') || 'app');
-        const target = resolveAgentPath(params.get('path'), permission, isLocal);
-        if (!target) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, message: (permission === 'computer' && isLocal) ? '路径无效' : PERM_DENIED_MSG })); return; }
+        const allowOutside = params.get('allowOutside') === '1';
+        const r = resolveAgentPathEx(params.get('path'), permission, isLocal, allowOutside);
+        if (!r.ok) return denyPath(res, r.reason, isLocal);
+        const target = r.path;
+        const full = (isLocal && permission === 'computer') || allowOutside;
         const info = await stat(target).catch(() => null);
         if (!info || !info.isFile()) {
-            const hint = (permission === 'computer' && isLocal) ? shellFolderHint() : '';
+            const hint = full ? shellFolderHint() : '';
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, message: '文件不存在：' + target + (hint ? '。' + hint : '') }));
             return;
@@ -1026,15 +1082,25 @@ async function agentWrite(request, res, isLocal) {
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return jsonResponse(res, 400, { ok: false, message: '请求体无效' }); }
         const permission = String(body.permission || 'app');
-        const target = resolveAgentPath(body.path, permission, isLocal);
-        if (!target) { return jsonResponse(res, 403, { ok: false, message: (permission === 'computer' && isLocal) ? '路径无效' : PERM_DENIED_MSG }); }
+        const allowOutside = body.allowOutside === true;
+        const r = resolveAgentPathEx(body.path, permission, isLocal, allowOutside);
+        if (!r.ok) return denyPath(res, r.reason, isLocal);
+        const target = r.path;
         // 应用文件夹模式下禁写危险类型：这些文件一旦落进 web/，静态服务就会以同源身份
         // 执行/渲染它们（.html 直接构成存储型 XSS）。computer 模式本来就允许操作电脑
         // 任意路径（用户自担风险），不做这个限制。
         //
         // 判据走 isBlockedWritePath（剥掉 ADS / 尾随点 / 尾随空格后再取扩展名）——
         // 直接 path.extname(target) 会被 `x.html::$DATA` 这类写法绕过，落盘仍是 x.html。
-        if (!(isLocal && permission === 'computer') && isBlockedWritePath(target)) {
+        //
+        // 注意 allowOutside **不能**参与这条判据，判据只看"目标是否在 web/ 内"：
+        //   · 越界批准只可能发生在 web/ 之外（web/ 内的路径本来就放行，无需批准）；
+        //   · 若写成 `!full && isBlockedWritePath(...)`，那么
+        //     `{path:'web/x.html::$DATA', permission:'app', allowOutside:true}`
+        //     会因为 allowOutside 把 full 顶成 true 而**跳过拦截**，落盘一个 web/ 内的
+        //     .html —— 等于给同源代码注入开了后门。所以 in-web 的保护永不放宽。
+        const inAppRoot = target === AGENT_APP_ROOT || target.startsWith(AGENT_APP_ROOT + path.sep);
+        if (inAppRoot && !(isLocal && permission === 'computer') && isBlockedWritePath(target)) {
             return jsonResponse(res, 400, { ok: false, message: '应用文件夹内不允许写 .html/.js/.svg 等可执行类型的文件（防止同源代码注入）' });
         }
         // 只在目录不存在时创建（Windows 对盘符根目录如 D:\ 执行 mkdir 会报 EPERM）

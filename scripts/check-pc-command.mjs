@@ -28,6 +28,8 @@ import { readFrontend } from './frontend-sources.mjs';
 import { classifyCommand, buildShellArgv, availableShells, __test__ } from '../server/pc-command.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// 写入探针文件名（越界批准不能绕过 web/ 内的可执行类型拦截）
+const PROBE = '__pc_cmd_probe_' + process.pid;
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -209,6 +211,48 @@ try {
         ok(r.json?.ok === false, '回报 ok:false');
         ok(Boolean(r.json?.stderr || r.json?.text), '带上了错误输出');
     }
+
+    // ---- 越界申请：限制模式碰 web/ 之外 → 403 + needEscalation，批准后放行 ----
+    //
+    // 这是 ④ 里"需申请越界"的落点。旧行为是硬 403 让用户自己去设置页改全局权限；
+    // 现在改成就这一次问一次。必须打在真实 HTTP 上，因为"是否放行"是服务端说了算。
+    {
+        const outside = path.join(ROOT, '..', 'elaina-escalation-probe.txt');
+        const ls = (q) => fetch(`${BASE}/api/agent/ls?${q}`);
+        const readQ = (allowOutside) => 'permission=app&path=' + encodeURIComponent(ROOT)
+            + (allowOutside ? '&allowOutside=1' : '');
+
+        // ① 限制模式下访问 web/ 之外 → 403 且带 needEscalation（前端据此弹窗）
+        const r1 = await ls(readQ(false));
+        const j1 = await r1.json();
+        ok(r1.status === 403, '限制模式越界被拒绝（403）', `status=${r1.status}`);
+        ok(j1?.needEscalation === true, '★ 越界时回 needEscalation（前端才知道该问用户）');
+
+        // ② 批准后放行（ROOT 是项目根，web/ 之外，确实是越界路径）
+        const r2 = await ls(readQ(true));
+        ok(r2.status === 200, '★ 用户批准后越界可访问（200）', `status=${r2.status}`);
+
+        // ③ web/ 之内不需要申请（本来就放行），且不该冒出 needEscalation
+        const r3 = await ls('permission=app&path=' + encodeURIComponent(path.join(ROOT, 'web')));
+        ok(r3.status === 200, 'web/ 内无需申请即可访问', `status=${r3.status}`);
+
+        // ④ ★ 越界批准**不能**成为同源代码注入的后门：
+        //    带着 allowOutside 往 web/ 里写 .html 仍必须 400。
+        const w = await fetch(`${BASE}/api/agent/write`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: 'web/' + PROBE + '.html', content: '<script>1</script>',
+                permission: 'app', allowOutside: true }),
+        });
+        ok(w.status === 400, '★ 越界批准不能绕过 web/ 内的可执行类型拦截（400）', `status=${w.status}`);
+
+        // ⑤ 探针不许落盘
+        const leaked = (await import('node:fs')).readdirSync(path.join(ROOT, 'web'))
+            .filter((f) => f.startsWith(PROBE));
+        ok(leaked.length === 0, '★ web/ 内没有落盘探针', leaked.join(', '));
+        // 清理 ①/② 可能碰到的外部路径（read 不会创建文件，这里只是防御性清理）
+        try { (await import('node:fs')).rmSync(outside, { force: true }); } catch { /* ignore */ }
+    }
 } catch (err) {
     ok(false, '服务端链路检查未完成', String(err?.message || err));
 } finally {
@@ -235,6 +279,16 @@ console.log('\n=== 4. 前端接线 ===');
     ok(/if \(IS_NATIVE_APP\) return '';/.test(agent), 'APK 上不注入电脑命令能力（用 IS_NATIVE_APP 判定）');
     ok(/IS_NATIVE_APP/.test(agent) && !/location\.protocol/.test(agent),
         'APK 判定用 IS_NATIVE_APP 而不是 location.protocol');
+
+    // 越界申请：前端要识别 needEscalation 并问用户，批准后**重发**带 allowOutside 的请求
+    ok(/needEscalation/.test(agent), '前端识别服务端的 needEscalation');
+    ok(/function confirmAgentEscalation/.test(agent), '有越界确认函数');
+    ok(/allowOutside/.test(agent), '批准后重发时带上 allowOutside');
+    ok(/agentEscalationApproved/.test(agent), '同一路径本轮不重复询问');
+    // 越界确认也必须 forceAsk：它属于"改变安全边界"的操作，
+    // 不能被"本轮已确认过任意敏感操作"的豁免吞掉
+    ok(/requestApproval\('访问文件夹外'[\s\S]{0,120}forceAsk: true/.test(agent),
+        '★ 越界确认带 forceAsk（不被豁免吞掉）');
 
     // ★ 危险命令不能被"本轮已确认过敏感操作"的豁免吞掉。
     //   这是最容易漏的一条：`电脑命令` 在 AGENT_RISK 里是 sensitive（因为同类里
