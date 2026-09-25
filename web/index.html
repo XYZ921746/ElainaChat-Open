@@ -4172,6 +4172,11 @@
          放在 app-* 之后、mods.js 之前 —— 它只改 html 属性与一个设置容器，
          不依赖 app-* 的内部函数；而 mods 的界面不该被主题切换影响。 -->
     <script src="/js/theme.js"></script>
+    <!-- 诊断输出格式（window.ElainaDiag）。
+         必须排在 mods.js **之前**：插件加载器用它打结构化日志
+         （自报家门 + 三段式问题报告），没它就退回旧的裸字符串输出。
+         与 server/diagnostics.mjs 是同一套格式，两端日志看起来是一回事。 -->
+    <script src="/js/diagnostics.js"></script>
     <!-- 插件系统（mod 加载器）。
          必须排在 app-07-init.js **之前**：初始化会读插件清单来渲染
          「设置 → 插件」那一栏，加载器没就位的话那一栏会是空的。

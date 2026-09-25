@@ -311,8 +311,19 @@ console.log('\n=== 4. 端到端：从局域网地址发起，SSRF 拦截必须�
             ok(up, '服务已就绪（经局域网地址 ' + LAN + ' 访问）', up ? '' : out.slice(-400));
 
             if (up) {
-                // 非本机访问必须登录
-                const pwd = (out.match(/访问密码[:：]\s*(\S+)/) || [])[1] || '';
+                // 非本机访问必须登录。
+                //
+                // ★ 密码的抓取要**容忍文案改版**（2026-09 踩到）：
+                //   重做日志后，密码不再跟在「访问密码: 」后面，而是
+                //   单独占一行（「怎么用」块里，标签是"手机 / 平板连进来时要输这个密码"）。
+                //   旧正则 /访问密码[:：]\s*(\S+)/ 抓不到 → pwd 为空 → 登录 401
+                //   → 后面所有 SSRF 断言连锁失败（假故障，不是安全问题）。
+                //   现在按**标签行 + 下一行取值**来抓，同时保留旧格式的回落。
+                const pwd = (out.match(/访问密码[:：]\s*(\S+)/) || [])[1]
+                    || (out.match(/要输这个密码\s*\n\s*(\S+)/) || [])[1]
+                    || '';
+                ok(Boolean(pwd), '能从启动日志里抓到访问密码（后续登录要用）',
+                    pwd ? '' : '日志格式可能又变了，检查 check-security-hardening 的抓取正则');
                 const login = await fetch(`http://${LAN}:${port}/api/auth/login`, {
                     method: 'POST', headers: { 'content-type': 'application/json' },
                     body: JSON.stringify({ password: pwd }),

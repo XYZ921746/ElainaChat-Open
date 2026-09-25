@@ -685,13 +685,22 @@
         // 既可能是**成功**（旧实现里成功日志走 console.log、不被转发），
         // 也可能是 **mods.js 压根没跑 / 清单读不到** —— 两者在启动窗口里
         // 长得一模一样，无法据此排查（实测就卡在这里）。
-        // 现在无论成败，先留一条"我开始加载了、清单里有几个"的痕迹。
+        // 现在无论成败，先留一条"我是谁、我开始加载了、清单里有几个"的痕迹。
         const manifests = await discover();
-        console.log('[Mod] 开始加载：清单里发现 ' + manifests.length + ' 个插件'
-            + (manifests.length ? '（' + manifests.map((m) => m.id).join('、') + '）' : ''));
+        console.log('[Mod] 【插件系统】（提供界面扩展与功能增强）开始加载 —— '
+            + '清单里发现 ' + manifests.length + ' 个插件'
+            + (manifests.length ? '：' + manifests.map((m) => m.name || m.id).join('、') : ''));
         if (!manifests.length) {
             // 清单为空 = 没装任何插件，或 index.json 取不到。后者要能看出来。
-            console.warn('[Mod] 插件清单为空 —— 没安装任何插件，或 /mods/index.json 读取失败');
+            const D0 = window.ElainaDiag;
+            console.warn('[Mod] ' + (D0 ? D0.problem({
+                what: '没有发现任何插件',
+                where: '/mods/index.json',
+                why: '两种可能：① 你还没装插件（这是正常的，程序本体的文字聊天不受影响）；'
+                    + '② 清单文件读不到（服务端没起来或返回了错误）。',
+                how: '想加功能就到「设置 → 插件」上传扩展包；'
+                    + '若你确信装过插件，请确认服务端窗口还开着，然后刷新页面。',
+            }) : '插件清单为空 —— 没安装任何插件，或 /mods/index.json 读取失败'));
             return [];
         }
 
@@ -699,8 +708,16 @@
         //   判定同时看"装没装"与"启用没启用"，并认清单 id / 目录名 / 注册名三种键。
         const missing = findMissingDeps(manifests);
         for (const [id, lack] of missing) {
-            console.error('[Mod] 插件「' + id + '」无法加载 —— 它依赖的前置插件不可用：\n'
-                + lack.map((d) => '        · 「' + d.id + '」' + d.reason).join('\n'));
+            const D1 = window.ElainaDiag;
+            const detail = lack.map((d) => '「' + d.id + '」' + d.reason).join('、');
+            console.error('[Mod] ' + (D1 ? D1.problem({
+                what: '插件「' + id + '」的前置插件不可用，它不会被加载',
+                where: 'web/mods/',
+                why: '它依赖 ' + detail,
+                how: lack.some((d) => d.reason === '未启用')
+                    ? '到「设置 → 插件」把那个前置插件的开关打开，然后刷新页面。'
+                    : '先安装缺失的前置插件（见 Releases 的扩展包），再刷新页面。',
+            }) : '插件「' + id + '」无法加载 —— 它依赖的前置插件不可用：' + detail));
         }
 
         let ordered;
@@ -744,11 +761,15 @@
      *   看到这行，既不知道 `disabled` 是好是坏，也看不出
      *   "前置没启用、依赖它的却起来了"这个关键矛盾。
      *
-     *   日志是给**排查问题的人（或 AI）**看的，不是给程序看的。所以改成：
-     *     · 先一句话总结（几个可用、几个有问题）
+     *   日志是给**排查问题的人（或 AI）**看的，不是给程序看的。所以：
+     *     · 先自报家门（哪个模块在说话、它负责什么）
+     *     · 先给结论（几个可用、几个未启用、几个有问题）
      *     · 每个有问题的插件：名字 + 中文状态 + 具体原因 + **下一步该做什么**
-     *     · 正常的插件只列名字，不刷屏
-     *   这样即使把日志原样丢给一个完全不了解本项目的 AI，它也能读懂并给出建议。
+     *     · 全部正常时**明确说一句**（"什么都没有"与"一切正常"视觉上无法区分）
+     *
+     * 格式走 window.ElainaDiag（与 server/diagnostics.mjs 同一套），
+     * 这样浏览器日志与服务端日志看起来是一回事，对照着读不会错位。
+     * 没有该模块时（老页面缓存）回落到等价的手写输出，不让日志消失。
      */
     function logLoadSummary(results) {
         const total = results.length;
@@ -756,42 +777,85 @@
         const disabled = results.filter((e) => e.state === 'disabled');
         const broken = results.filter((e) => e.state !== 'ready' && e.state !== 'disabled');
 
-        // ---- ① 一句话总结：先给结论 ----
-        console.log('[Mod] 插件加载完成：共 ' + total + ' 个'
-            + '，可用 ' + ready.length + ' 个'
-            + (disabled.length ? '，未启用 ' + disabled.length + ' 个' : '')
-            + (broken.length ? '，有问题 ' + broken.length + ' 个' : '')
-            + '。');
+        // 插件的中文名（显示名优先，id 附在后面备查）
+        const nm = (e) => {
+            const name = e.manifest.name || e.manifest.id;
+            return name === e.manifest.id ? name : name + '（' + e.manifest.id + '）';
+        };
 
-        // ---- ② 可用的：只列名字 ----
-        if (ready.length) {
-            console.log('[Mod]   ✔ 可用：' + ready.map((e) => e.manifest.name || e.manifest.id).join('、'));
-        }
-
-        // ---- ③ 未启用的：说明这是正常的，并给开启方法 ----
-        if (disabled.length) {
-            console.log('[Mod]   ○ 未启用（这是正常的，插件默认关闭）：'
-                + disabled.map((e) => e.manifest.name || e.manifest.id).join('、')
-                + '\n        如需使用，到「设置 → 插件」打开对应开关。');
-        }
-
-        // ---- ④ 有问题的：这是重点，逐条给原因 + 下一步 ----
-        if (broken.length) {
+        const D = window.ElainaDiag;
+        if (!D) {
+            // ---- 回落路径：没有诊断模块时保持旧格式，至少不丢信息 ----
+            console.log('[Mod] 插件加载完成：共 ' + total + ' 个，可用 ' + ready.length + ' 个'
+                + (disabled.length ? '，未启用 ' + disabled.length + ' 个' : '')
+                + (broken.length ? '，有问题 ' + broken.length + ' 个' : '') + '。');
+            if (ready.length) console.log('[Mod]   ✔ 可用：' + ready.map(nm).join('、'));
+            if (disabled.length) {
+                console.log('[Mod]   ○ 未启用（这是正常的，插件默认关闭）：' + disabled.map(nm).join('、')
+                    + '\n        如需使用，到「设置 → 插件」打开对应开关。');
+            }
             for (const e of broken) {
-                const label = STATE_LABEL[e.state] || e.state;
-                const name = (e.manifest.name || e.manifest.id)
-                    + (e.manifest.id !== (e.manifest.name || e.manifest.id) ? '（' + e.manifest.id + '）' : '');
-                console.error('[Mod]   ✘ ' + name + '：' + label);
+                console.error('[Mod]   ✘ ' + nm(e) + '：' + (STATE_LABEL[e.state] || e.state));
                 if (e.error) console.error('[Mod]     ' + e.error);
             }
-            console.error('[Mod] 以上插件不会生效。按上面每条给出的方法处理后，刷新页面重试。');
+            if (!broken.length && !disabled.length) console.log('[Mod]   全部正常。');
+            return;
         }
 
-        // ---- ⑤ 全部正常时明确说一句 ----
-        //   为什么不省略：日志里"什么都没有"与"一切正常"在视觉上无法区分 ——
-        //   用户会以为日志坏了（这个坑实际发生过）。
-        if (!broken.length && !disabled.length) {
-            console.log('[Mod]   全部正常。');
+        // ---- ① 结论行 ----
+        console.log('[Mod] ' + D.checklist([{
+            state: broken.length ? 'bad' : 'ok',
+            label: '插件加载完成：共 ' + total + ' 个，可用 ' + ready.length + ' 个'
+                + (disabled.length ? '，未启用 ' + disabled.length + ' 个' : '')
+                + (broken.length ? '，有问题 ' + broken.length + ' 个' : ''),
+            hint: total ? '插件由 web/mods/ 下的扩展包提供，可在「设置 → 插件」里开关。' : undefined,
+        }], '插件系统'));
+
+        // ---- ② 可用的 ----
+        if (ready.length) {
+            console.log('[Mod] ' + D.checklist([
+                { state: 'ok', label: '正常工作：' + ready.map(nm).join('、') },
+            ]));
+        }
+
+        // ---- ③ 未启用的：说明这是**正常状态**，并给开启方法 ----
+        //   为什么单独一段：默认关闭是设计如此，不该和故障混在一起报警 ——
+        //   否则用户会对警告脱敏，真正的问题反而被忽略。
+        if (disabled.length) {
+            console.log('[Mod] ' + D.checklist([
+                {
+                    state: 'note',
+                    label: '未启用（这是正常的，插件默认关闭）：' + disabled.map(nm).join('、'),
+                    hint: '如需使用，到「设置 → 插件」打开对应开关，然后刷新页面。',
+                },
+            ]));
+        }
+
+        // ---- ④ 有问题的：逐条三段式（发生了什么 / 为什么 / 怎么办）----
+        for (const e of broken) {
+            const label = STATE_LABEL[e.state] || e.state;
+            const dep = (e.missingDeps || []).map((d) => d.id + '（' + d.reason + '）').join('、');
+            console.error('[Mod] ' + D.problem({
+                what: '插件「' + nm(e) + '」' + label,
+                where: 'web/mods/' + (e.manifest.dir || e.manifest.id) + '/',
+                why: e.error || (dep ? '它依赖的前置插件不可用：' + dep : '加载过程中出错'),
+                how: e.state === 'blocked'
+                    ? '先修好它依赖的前置插件（见上面的原因），再刷新页面。'
+                    : '把这条日志（含上面的原因）整份复制出来，就是排查依据。',
+            }));
+        }
+        if (broken.length) {
+            console.error('[Mod] ' + D.summary(
+                broken.map((e) => nm(e) + '：' + (STATE_LABEL[e.state] || e.state)),
+                { after: '以上插件不会生效。按上面每条给出的方法处理后，刷新页面重试。' },
+            ));
+        } else {
+            // ---- ⑤ 全部正常时明确说一句 ----
+            console.log('[Mod] ' + D.summary([], {
+                notes: disabled.length
+                    ? ['上面列出的「未启用」是正常状态，需要时到「设置 → 插件」开启即可。']
+                    : ['所有插件都已正常工作。'],
+            }));
         }
     }
 

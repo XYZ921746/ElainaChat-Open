@@ -123,6 +123,21 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
     const INDEX_FILE = path.join(modsDir, 'index.json');
 
     /**
+     * 最近一次扫描"装出来的结果"缓存。
+     *
+     * 为什么需要它：zip 装成功后会被删掉（见 scanAndSync 里的说明），
+     * 于是**下一次扫描的 zips 是空的**，安装结果也就没了。
+     * 而用户要看的恰恰是那份结果 —— 尤其"哪些文件被拦下了"
+     * （恶意 zip 里混了 .exe / 路径穿越时，只有这里能告诉用户）。
+     *
+     * 用时间窗而不是"读一次就清"：同一个 zip 装完后，前端可能先后请求
+     * /mods/index.json（页面加载）和 /api/plugins（设置页），
+     * "读一次就清"会让先到的那次把结果吃掉，后到的什么也看不到。
+     */
+    let installReport = { at: 0, results: [] };
+    const INSTALL_REPORT_TTL = 5 * 60 * 1000;   // 5 分钟，足够用户打开设置页看到
+
+    /**
      * 读插件目录里的 manifest.json（优先）或从目录名推断。
      *
      * ★ id 的权威来源是 **manifest.id**，不是目录名（2026-09 改）。
@@ -260,6 +275,7 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
      * 什么时候调用：
      *   · 服务启动时（把用户刚拷进来的 zip 装上）
      *   · 前端请求 /api/plugins 时（用户可能在服务运行期间拷了 zip 进来）
+     *   · 前端请求 /mods/index.json 时（清单必须新鲜，见 serve.mjs 里的说明）
      */
     async function scanAndSync() {
         await mkdir(modsDir, { recursive: true }).catch(() => {});
@@ -294,6 +310,18 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         //
         // 删掉之后语义就清楚了：目录存在 = 已安装；要重装就再放一次 zip。
         // 这也让"删目录"变成真正有效的卸载方式。
+        //
+        // ★ 装完的**结果要留住**，不能扫完就丢（2026-09 修）。
+        //
+        //   为什么：安装结果（尤其"哪些文件被拦下了"）是给用户看的反馈。
+        //   zip 装成功后会被删掉，所以下一次扫描时 zips 已经空了 ——
+        //   若结果只存在本次调用的局部变量里，用户打开设置页那次扫描
+        //   就会看到一片空白，以为"装了什么都没发生"。
+        //
+        //   实现用**时间窗**而不是"读一次就清"：同一个 zip 装完之后，
+        //   前端可能先后请求 /mods/index.json（页面加载）与 /api/plugins
+        //   （设置页），"读一次就清"会让先到的那次把结果吃掉。
+        //   留一个时间窗，期间任何一次读都能看到，过期自然失效。
         const installResults = [];
         for (const z of zips) {
             // ★ id 要先过 normalizeModId 剥掉版本号 ——
@@ -368,7 +396,19 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         };
         await writeFile(INDEX_FILE, JSON.stringify(out, null, 2), 'utf8');
 
-        return { installed: list, results: installResults };
+        // 安装结果的留存（见 installReport 的说明）：
+        //   · 本次真的装了东西 → 记下来，并把时间戳刷新
+        //   · 本次没装（zip 已在上一次被消费）→ 把未过期的旧结果一并返回，
+        //     这样"装完 → 打开设置页"仍能看到"哪些文件被拦下了"
+        if (installResults.length) {
+            installReport = { at: Date.now(), results: installResults };
+        }
+        const fresh = Date.now() - installReport.at < INSTALL_REPORT_TTL;
+        const results = installResults.length
+            ? installResults
+            : (fresh ? installReport.results : []);
+
+        return { installed: list, results };
     }
 
     async function exists(p) {

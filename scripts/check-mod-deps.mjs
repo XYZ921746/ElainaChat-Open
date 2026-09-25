@@ -31,6 +31,10 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WEB = path.join(ROOT, 'web');
 const MODS_JS = readFileSync(path.join(WEB, 'js', 'mods.js'), 'utf8');
+// 诊断格式模块：真实页面里 diagnostics.js 排在 mods.js 之前加载
+// （见 index.html），mods.js 的输出格式依赖它。这里照实模拟，
+// 否则测的是"没有诊断模块时的回落路径"，与线上不一致。
+const DIAG_JS = readFileSync(path.join(WEB, 'js', 'diagnostics.js'), 'utf8');
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -117,6 +121,8 @@ async function load(store) {
     sandbox.globalThis = sandbox;
     const ctx = vm.createContext(sandbox);
 
+    // 与真实页面一致：先 diagnostics.js（提供 window.ElainaDiag），再 mods.js
+    vm.runInContext(DIAG_JS, ctx, { filename: 'diagnostics.js' });
     vm.runInContext(MODS_JS, ctx, { filename: 'mods.js' });
     const Mods = sandbox.window.ElainaMods;
     const results = await Mods.loadAll();
@@ -182,13 +188,17 @@ console.log('\n=== 3. 日志可读性：不懂本项目的人/AI 也要能看懂
     const r = await load({ 'elaina_plugin_galgame': '1', 'elaina_plugin_elaina-avatar': '0' });
     const t = r.text;
 
-    ok(/插件加载完成：共 \d+ 个/.test(t), '有中文总结句（"共 N 个…"）');
+    // ★ 这一版把日志接进了统一的诊断格式（window.ElainaDiag），
+    //   断言跟着改成"结构 + 可读性"，而不是盯某一句具体文案。
+    ok(/插件加载完成：共 \d+ 个/.test(t), '有结论句（"共 N 个…"）');
     ok(/未启用/.test(t), '说明了"未启用"这个状态的含义');
-    ok(/已拒绝加载|无法加载/.test(t), '说明了拒绝加载');
+    ok(/已拒绝加载|无法加载|前置插件不可用/.test(t), '说明了拒绝加载');
     ok(!/elaina-avatar=disabled/.test(t),
         '★ 不再出现 `id=state` 这种机器写法（旧版的可读性问题）');
     ok(/设置 → 插件/.test(t), '★ 给出了界面上的具体位置（用户知道去哪点）');
-    ok(/刷新页面/.test(t), '给出了收尾动作（改完要刷新）');
+    // 三段式：原因 + 怎么办（这是"不懂软件也能看懂"的核心）
+    ok(/原因：/.test(t), '★ 问题报告含「原因：」');
+    ok(/怎么办：/.test(t), '★ 问题报告含「怎么办：」');
     // 插件用**显示名**而非内部 id
     ok(/Galgame 界面|桌宠/.test(t), '日志里用的是插件的显示名（不是内部 id）');
 }

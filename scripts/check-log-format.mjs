@@ -169,14 +169,35 @@ const trace = readFileSync(path.join(LOG_DIR, traceName), 'utf8');
 const mainLines = main.split('\n').filter((l) => l !== '');
 
 // ---- 格式 ----
+//
+// ★ 2026-09 起，主日志里**允许出现不带前缀的续行**。
+//
+//   为什么改：诊断块（启动横幅 / 检查清单 / 问题报告）是多行的，
+//   它们存在的意义就是"让人一眼看懂"。旧实现无条件把换行压成 `⏎`，
+//   压完完全没法读 —— 而用户的要求恰恰是"不懂这软件也能从日志看懂"。
+//   现在的约定：
+//     · 每条记录的**首行**必须带完整前缀（时间/标签/级别/来源）→ grep 仍可用
+//     · 续行不带前缀，但必须**有缩进**（视觉上属于上一条记录）
+//   所以断言拆成两条：首行必须合规；不带前缀的行必须缩进。
 const LINE_RE = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] \[[A-Za-z0-9]+\] \[(DBUG|INFO|WARN|ERRO|CRIT)\]( \[v[^\]]+\])? \[[a-z0-9_.-]+:\d+\]: \s*\S/;
-const badLines = mainLines.filter((l) => !LINE_RE.test(l));
-ok(badLines.length === 0, '每一行主日志都符合 AstrBot 格式且不是空记录', badLines.slice(0, 3).join('\n      '));
+const headLines = mainLines.filter((l) => LINE_RE.test(l));
+const contLines = mainLines.filter((l) => !LINE_RE.test(l));
+ok(headLines.length > 0, '主日志有合规的记录首行');
+// 续行必须缩进**或以分隔线开头**。
+// 为什么允许分隔线：横幅用 `====` 框住，那是刻意的视觉分隔；
+// 强行缩进反而不像分隔线了。除这两种之外，裸文本行都算格式错误
+// （因为它无法从视觉上归属到某条记录）。
+const badCont = contLines.filter((l) => !/^\s+\S/.test(l) && !/^=+$/.test(l));
+ok(badCont.length === 0, '不带前缀的续行都有缩进或分隔线（能归属到上一条记录）',
+    badCont.slice(0, 3).join('\n      '));
+// 首行必须是**记录开头**：它前面不能紧跟另一个首行之外的裸文本行（粗判）
 ok(mainLines.length > 0, '主日志有内容');
-ok(!main.includes('⏎') && main.includes('\n'), '主日志一条记录一行（多行已被压平）');
+ok(!main.includes('⏎'), '主日志里没有压平标记 ⏎（多行结构被保留）');
+// 至少有一个多行诊断块，否则说明多行能力退化了
+ok(contLines.length > 0, '★ 存在多行诊断块（说明多行结构确实被保留，没被压成一行）');
 
 // ---- 时间是本地时间（旧实现用 toISOString，差了 8 小时）----
-const first = mainLines[0].match(/^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+const first = headLines[0].match(/^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
 ok(!!first, '首行带完整时间戳');
 if (first) {
     const t = new Date(+first[1], +first[2] - 1, +first[3], +first[4], +first[5], +first[6]).getTime();
@@ -189,24 +210,58 @@ if (first) {
 }
 
 // ---- 级别 ----
-const warnPlus = mainLines.filter((l) => /\[(WARN|ERRO|CRIT)\]/.test(l));
+const warnPlus = headLines.filter((l) => /\[(WARN|ERRO|CRIT)\]/.test(l));
 ok(warnPlus.length > 0, '有 WARN/ERRO 级别记录');
 ok(warnPlus.every((l) => l.includes(`[v${VERSION}]`)), 'WARN 及以上带版本号');
-const infoLines = mainLines.filter((l) => l.includes('[INFO]'));
+const infoLines = headLines.filter((l) => l.includes('[INFO]'));
 ok(infoLines.length > 0 && infoLines.every((l) => !l.includes('[v')), 'INFO 不带版本号（不制造噪音）');
 
 // ---- 来源行号：必须是真的调用点，不能全指到包装函数自己 ----
 const locs = [...main.matchAll(/\[(serve):(\d+)\]/g)].map((m) => Number(m[2]));
-ok(locs.length === mainLines.length, '每条记录都带来源位置');
+ok(locs.length === headLines.length, '每条记录首行都带来源位置',
+    `${locs.length} 个位置 vs ${headLines.length} 个首行`);
 ok(new Set(locs).size > 3, '来源行号能区分不同调用点（不是全指向包装层）', `去重后只有 ${new Set(locs).size} 个位置`);
 
 // ---- 脱敏 ----
-const pw = consoleOut.match(/访问密码: (\S+)/);
-ok(!!pw, '控制台打印了访问密码（用户要靠它登录）');
-ok(pw && !main.includes(pw[1]), '日志文件里没有明文访问密码');
+//
+// ★ 这段是本次重做日志时**真正抓到问题**的地方，保留并加强：
+//   文案一改（密码从"访问密码: xxx"变成独占一行），脱敏就可能失效，
+//   而失效的后果是**明文密码落盘**。所以这里不只测当前格式，
+//   把几种历史格式都测一遍 —— 防止以后改文案时又漏。
+{
+    // 从 serve.mjs 直接取真实规则，避免测试与实现各写一份
+    const src = readFileSync(new URL('../web/serve.mjs', import.meta.url), 'utf8');
+    const rm = src.match(/const SECRET_RULES = \[([\s\S]*?)\n\];/);
+    ok(!!rm, '能取到 serve.mjs 的脱敏规则');
+    if (rm) {
+        const rules = eval('[' + rm[1] + ']');
+        const redact = (t) => { let o = String(t); for (const [re, to] of rules) o = o.replace(re, to); return o; };
+        const S = 'EPzNwvKXNWdt';
+        const forms = [
+            ['密码独占一行（当前格式）', '要输这个密码\n      ' + S + '\n      建议改掉'],
+            ['带修饰语的标签', '局域网访问密码（初始随机）：' + S],
+            ['最老格式', '访问密码: ' + S],
+            ['key=value', '{"password":"' + S + '"}'],
+            ['Bearer', 'Authorization: Bearer ' + S + 'abcdefgh'],
+        ];
+        for (const [label, text] of forms) {
+            ok(!redact(text).includes(S), `★ 脱敏有效：${label}`);
+        }
+        // 反向：正常内容不能被误伤
+        const normal = '✔ 可用：伊蕾娜立绘与情绪（elaina-avatar）';
+        ok(redact(normal) === normal, '★ 正常内容不被误伤（脱敏不过度）');
+    }
+
+    const pw = consoleOut.match(/访问密码[^：:\n]{0,20}[:：]\s*(\S+)/)
+        || consoleOut.match(/要输这个密码\s*\n\s*(\S+)/);
+    ok(!!pw, '控制台打印了访问密码（用户要靠它登录）');
+    ok(pw && !main.includes(pw[1]), '★ 日志文件里没有明文访问密码（脱敏对文案变化仍有效）');
+    // 反向断言：日志里必须能看到"已脱敏"的痕迹，否则可能是整条都没记
+    ok(main.includes('******'), '日志里能看到脱敏后的占位符');
+}
 
 // ---- 控制台不重复输出 ----
-ok(consoleOut.split('\n').filter((l) => l.includes('serve.mjs 启动')).length === 1,
+ok(consoleOut.split('\n').filter((l) => l.includes('ElainaChat Mod v')).length === 1,
     '控制台每条日志只输出一次（没有"原文 + 格式化"两份）');
 // eslint-disable-next-line no-control-regex
 ok(!/\x1b\[/.test(consoleOut), '非 TTY 控制台不带 ANSI 颜色码');
@@ -243,7 +298,9 @@ child2.kill();
 await wait(200);
 ok(readdirSync(LOG_DIR).filter((n) => n.endsWith('.log')).length === 2,
     'LOG_TO_FILE=0 时不产生新日志文件（自动化场景要能关掉落盘）');
-ok(/\[Core\] \[INFO\] [^\n]*不落盘/.test(out2()), 'LOG_TO_FILE=0 时启动横幅有说明');
+// 不落盘时也要如实说明 —— 用户看到"没有日志文件"时得知道是配置关掉了，
+// 而不是以为日志功能坏了。说明在末尾的「技术信息」块里。
+ok(/不落盘/.test(out2()), 'LOG_TO_FILE=0 时明确说明了"不落盘"');
 
 // ================= 场景三：LOG_CHAT=0 =================
 const { child: child3 } = await startServer({ LOG_CHAT: '0' }, await freePort());
