@@ -1536,7 +1536,11 @@ async function handleUserInput(message, conversation) {
             updateUI();
             return;
         }
-        console.error('API Error:', error);
+        // ★ 已在上游记录过详情的错误不再重复打（2026-09 修）：
+        //   throwProviderResponseError 已经把"HTTP 状态 + 服务商返回"记成一条，
+        //   这里再 console.error 一遍，同一次失败就在启动窗口出现两条
+        //   几乎一样的 ERRO —— 纯刷屏。界面提示（showClientApiError）照常弹。
+        if (!error?.providerLogged) console.error('API Error:', error);
         removeThinkingMessage();
         state.voiceState = 'error';
 

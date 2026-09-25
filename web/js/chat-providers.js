@@ -30,6 +30,47 @@
     'use strict';
 
     /**
+     * 从 400 响应里判断"网关拒绝的是哪个**思考参数**"。
+     *
+     * ★ 只认 thinking / reasoning_effort（2026-09 修）：剥离逻辑只能解决这两类
+     *   冲突。若网关拒的是别的参数（如 param:"image"、param:"tools"），剥思考
+     *   字段毫无用处，重试只会白白多打几次请求 —— 那种 400 必须原样抛错，
+     *   让用户看到真正的原因。
+     *
+     * 依据两类信号（实测 AMD Radeon 端点 + GitHub 各项目报错样例）：
+     *   ① OpenAI 风格错误的 `param` 字段（最可靠 —— 网关亲口点名）：
+     *      {"error":{"message":"…","param":"thinking","code":"unsupported_parameter"}}
+     *   ② 报错文本里点名（各家措辞不同，按关键词匹配）
+     *
+     * @param {{status:number, payload?:object, rawText?:string}} result
+     * @returns {string|null} 被拒的思考参数名；认不出返回 null（照常抛错，别重试）
+     */
+    function rejectedRequestParam(result) {
+        if (!result || result.status !== 400) return null;
+        const KNOWN = new Set(['thinking', 'reasoning_effort']);
+        // ① 结构化字段：error.param（可能嵌在 detail 里 —— FastAPI 系网关爱包一层）
+        const payloads = [result.payload, result.payload?.detail];
+        for (const p of payloads) {
+            const param = p?.error?.param;
+            if (typeof param === 'string' && KNOWN.has(param.trim())) return param.trim();
+        }
+        // ② 报错文本关键词（原文可能出现在 message 或 rawText 里）
+        const text = [
+            result.payload?.error?.message,
+            result.payload?.detail?.error?.message,
+            result.payload?.detail?.message,
+            result.payload?.message,
+            typeof result.payload?.detail === 'string' ? result.payload.detail : '',
+            result.rawText,
+        ].filter(Boolean).join(' ');
+        // 顺序有讲究：先认 reasoning_effort（更长、更specific，避免被 "reasoning" 抢先命中）
+        if (/reasoning_effort/i.test(text) && /(not|un)supported|invalid|unknown|must be/i.test(text)) return 'reasoning_effort';
+        if (/"?thinking"? is (not supported|unknown)|unsupported_parameter.*thinking|unknown parameter: ?"?thinking/i.test(text)) return 'thinking';
+        if (/both ['"]?thinking['"]? and ['"]?reasoning_effort/i.test(text)) return 'thinking';
+        return null;
+    }
+
+    /**
      * 取依赖。每次调用都取一次而不是在模块顶层缓存 ——
      * 顶层缓存会在"本文件先加载、ChatDeps 后挂上"时拿到 undefined，
      * 而且那种失败是**静默的**（函数存在，调用时才炸）。每次取最稳。
@@ -87,17 +128,51 @@
         const requestModel = isDeepSeekOfficial(baseUrl)
             ? legacyDeepSeekModel(rawModel, opts.thinking === true)
             : rawModel;
-        const result = await requestChatJson(endpoint, {
+        // 思考开关与强度：显式发 disabled 很重要 —— DeepSeek 现在**默认开启**思考，
+        // 不发这个字段的话，用户明明关了开关，模型照样思考（慢且费 token）。
+        const thinkingFields = buildThinkingParams(opts.thinking, opts.thinkingEffort, 'openai-compatible', settings);
+        const buildBody = (extra) => ({
             model: requestModel,
             messages,
             ...(opts.temperature !== undefined && { temperature: opts.temperature }),
             ...(Number.isFinite(opts.maxTokens) && { max_tokens: Math.max(1, Math.floor(opts.maxTokens)) }),
-            // 思考开关与强度：显式发 disabled 很重要 —— DeepSeek 现在**默认开启**思考，
-            // 不发这个字段的话，用户明明关了开关，模型照样思考（慢且费 token）。
-            ...buildThinkingParams(opts.thinking, opts.thinkingEffort, 'openai-compatible', settings)
-        }, { Authorization: 'Bearer ' + apiKey }, {
-            signal: opts.signal, onDelta: opts.onDelta, stream: opts.stream,
-        }, 'openai-compatible');
+            ...extra,
+        });
+        let result = await requestChatJson(endpoint, buildBody(thinkingFields),
+            { Authorization: 'Bearer ' + apiKey }, {
+                signal: opts.signal, onDelta: opts.onDelta, stream: opts.stream,
+            }, 'openai-compatible');
+
+        // ★ 严格网关兼容：400 + 报错点名某参数 → 剥掉它重试（2026-09，实测 AMD Radeon 端点）。
+        //
+        //   背景（GitHub 调研结论，2026-09）：`thinking` 不是 OpenAI Chat Completions
+        //   标准字段（只有 DeepSeek 系认），`reasoning_effort` 也有网关不认（如 OpenAI
+        //   Responses 系模型报"moved to reasoning.effort"）；甚至有的网关报
+        //   "cannot specify both 'thinking' and 'reasoning_effort'"。**没有一个字段
+        //   全网通用**，hermes-agent #34786 等项目的做法都是"先发，被 400 拒了按
+        //   报错剥参数重试"。这里照做，且按 OpenAI 风格错误里的 `param` 字段精确剥：
+        //
+        //     "thinking" is not supported …（AMD，param: "thinking"）→ 只剥 thinking
+        //     Invalid 'reasoning_effort' …          → 只剥 reasoning_effort
+        //
+        //   剥掉 thinking 后 DeepSeek 系网关会回到"模型默认思考"状态 —— 这是没办法
+        //   的事（网关不支持就是不支持），但至少对话能通，好过整个请求失败。
+        //   记忆结论：同一 baseUrl 只撞一次 400，之后直接跳过被拒字段（见 supportsParam）。
+        const rejectedParams = new Set();   // 本次调用里已被该网关拒绝的参数名
+        for (let attempt = 0; attempt < 3 && !result.ok && result.status === 400; attempt++) {
+            const param = rejectedRequestParam(result);
+            if (!param || !rejectedParams.add(param)) break;   // 认不出元凶 / 已经剥过了
+            console.warn(`[Provider] gateway rejected "${param}" - retrying without it`
+                + ` (base=${baseUrl})`);
+            delete thinkingFields[param];
+            // thinking 和 reasoning_effort 常被一起拒（"invalid combination"），
+            // 报错点名 thinking 时把强度也一并剥掉，省一次往返。
+            if (param === 'thinking' && 'reasoning_effort' in thinkingFields) delete thinkingFields.reasoning_effort;
+            result = await requestChatJson(endpoint, buildBody(thinkingFields),
+                { Authorization: 'Bearer ' + apiKey }, {
+                    signal: opts.signal, onDelta: opts.onDelta, stream: opts.stream,
+                }, 'openai-compatible');
+        }
         if (!result.ok) await throwProviderResponseError(result, '对话服务请求失败');
         if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', '对话服务返回格式异常');
         const message = result.payload.choices?.[0]?.message || {};

@@ -1231,6 +1231,18 @@ function buildThinkingParams(enabled, effort, format, settings) {
     }
 
     // openai-compatible：thinking.type 开关 + reasoning_effort 强度
+    //
+    // ★ 兼容策略（2026-09 定稿，与 chat-providers.js 的降级重试配合）：
+    //   这里**一律**带上 thinking 字段（关闭时显式 disabled —— DeepSeek 默认
+    //   开启思考，不发就关不掉；包着 DeepSeek 的中转站也靠这个字段传开关）。
+    //
+    //   严格网关（如 AMD Radeon 端点）不认这个字段会回 400 —— 那由
+    //   chat-providers.js 的兼容层处理：报错点名某个思考参数时自动剥掉重试，
+    //   用户无感。分层职责：
+    //     · 这里负责"按厂商语义把思考意图表达全"（该发的字段都发）
+    //     · chat-providers.js 负责"网关不认时自动降级"
+    //   之前试过"generic 厂商不发 thinking"——那会让靠这个字段关思考的
+    //   DeepSeek 中转用户失效（发出去总有可能被忽略，但收不到就一定失效）。
     const out = { thinking: { type: on ? 'enabled' : 'disabled' } };
     if (on && level) out.reasoning_effort = level;
     return out;
@@ -1630,16 +1642,20 @@ async function throwProviderResponseError(result, fallbackMessage) {
     const payload = result?.payload;
     const rawText = String(result?.rawText || '');
     const message = String(extractProviderErrorMessage(payload) || fallbackMessage).trim();
-    // 完整错误日志：状态码 + 服务商返回原文，方便排查"测试能通、实际报错"
-    console.error(`[Provider] 接口返回错误 HTTP ${result?.status}`, {
-        status: Number(result?.status || 0),
-        message,
-        rawText: rawText.slice(0, 800),
-        payload
-    });
+    // 完整错误日志：状态码 + 服务商返回原文，方便排查"测试能通、实际报错"。
+    //
+    // ★ 单行、不重复（2026-09 修）：旧版把 message / rawText / payload 三个字段
+    //   一起打出去 —— 而 payload 里装的内容和前两个基本是同一份，一条错误在
+    //   日志里出现三遍（用户贴的日志里仅这一条就占了 4 行）。
+    //   现在压成一行：状态码 + 挖出来的 message + 截断的原文。
+    console.error(`[Provider] HTTP ${Number(result?.status || 0)}: ${message}`
+        + (rawText && rawText !== message ? ' | raw: ' + rawText.slice(0, 300) : ''));
     const error = new ClientApiError(inferApiErrorCode(Number(result?.status || 0), payload, rawText), message, {
         status: Number(result?.status || 0)
     });
+    // 标记"详情已记过"：外层 catch（如 handleUserInput）看到这个标记就不再
+    // console.error 一遍 —— 之前同一次失败会在 [Page] 里出现两条 ERRO。
+    error.providerLogged = true;
     throw error;
 }
 
