@@ -1115,6 +1115,30 @@ async function saveSettings() {
         showCustomAlert('自定义模式下必须填写 API Base URL。', '设置未保存');
         return;
     }
+    // ★ 从「限制」切到「允许操作电脑」时，把后果在这里一次性讲清楚。
+    //
+    // 为什么放在保存这一步、而不是每次操作都弹：
+    // 全权限下 AI 每一步都问，用户会从"看清内容再决定"退化成"闭眼点允许"，
+    // 最后那道闸反而等于没有（这正是旧版"每步确认"被反馈太烦的原因）。
+    // 所以判断前移到这个**一次性**的节点上：开了之后同类不可逆操作同一对话只问一次。
+    //
+    // 只在"真的发生切换"时问 —— 已经是 computer 又点保存不该再打扰。
+    const nextPermission = document.querySelector('input[name="agentPermission"]:checked')?.value || 'app';
+    if (nextPermission === 'computer' && (state.settings.agentPermission || 'app') !== 'computer') {
+        const agreed = await showCustomConfirm(
+            '「允许操作电脑」= 把 AI 的操作范围从应用文件夹扩到整台电脑。\n\n'
+            + '开启后，AI 可以：\n'
+            + '· 读写这台电脑上任意路径的文件\n'
+            + '· 执行 PowerShell / cmd 命令\n'
+            + '· 删除文件、改注册表、关机、下载并执行网上的脚本\n'
+            + '· 覆盖已有文件（原内容不会自动备份）\n\n'
+            + '其中「覆盖已有文件」和「删除/格式化这类危险命令」会在每个对话里首次询问你一次，'
+            + '同意后该对话内不再重复询问；安全命令直接执行。\n\n'
+            + '这些操作大多不可撤销，请只在你自己可控、且信任当前对话内容时开启。\n\n'
+            + '确定开启吗？',
+            '⚠️ 开启「允许操作电脑」');
+        if (!agreed) return;
+    }
     state.settings = {
         ...providerSettings,
         ttsSpeed: parseFloat(elements.settingTtsSpeed.value) || 1.0,
@@ -1124,7 +1148,7 @@ async function saveSettings() {
         asrProvider,
         autoMemory: elements.settingAutoMemory.checked,
         memoryEvery: Math.max(3, Math.min(50, parseInt(elements.settingMemoryEvery.value, 10) || 6)),
-        agentPermission: document.querySelector('input[name="agentPermission"]:checked')?.value || 'app',
+        agentPermission: nextPermission,
         agentApproval: document.querySelector('input[name="agentApproval"]:checked')?.value || 'once',
         agentPhoneEnabled: document.getElementById('settingAgentPhoneEnabled')?.checked !== false,
         // 思考模式：以设置面板当前状态为准。

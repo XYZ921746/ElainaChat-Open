@@ -373,17 +373,23 @@ console.log('\n=== 4. 端到端：从局域网地址发起，SSRF 拦截必须�
                     }
                     ok(!leaked, '★ 内网服务的内容没有经中转泄漏出来（SSRF 实质被挡住）');
 
-                // ★ 越界申请不能被局域网伪造。
+                // ★ 越界申请的边界：从"局域网一律拒绝"变成"**未登录**一律拒绝"。
                 //
-                //   "申请越界"（allowOutside）是给本机用户的一次性放行，它等价于临时
-                //   把该路径提升到 computer 权限。若只按请求体里的 allowOutside 判断，
-                //   局域网设备（或任何非回环来源）只要传 allowOutside=true 就能读写整台
-                //   电脑 —— isLocal 这条底线会被一个布尔字段直接绕过。
-                //   所以这里从局域网地址发**带 allowOutside=true** 的请求，必须仍是 403。
-                const escalate = async (body) => {
+                //   背景（本轮的刻意改动）：局域网设备登录后可获得与本机同等的
+                //   电脑操作权限（文件 + 命令）。所以原来那条"局域网传 allowOutside
+                //   必须 403"已经不成立了 —— 那条断言测的是旧的 isLocal 边界。
+                //
+                //   但真正要守的那条线**没有变松，只是换了位置**：
+                //   allowOutside 不能成为一个"凭一个布尔字段就绕过认证"的后门。
+                //   所以现在必须断言：**不带有效会话 cookie** 时，
+                //   allowOutside / permission=computer 都拿不到任何东西。
+                //   这才是"改完之后依然安全"的判据。
+                const escalate = async (body, withCookie = true) => {
                     const r = await fetch(`http://${LAN}:${port}/api/agent/write`, {
                         method: 'POST',
-                        headers: { 'content-type': 'application/json', cookie },
+                        headers: withCookie
+                            ? { 'content-type': 'application/json', cookie }
+                            : { 'content-type': 'application/json' },
                         body: JSON.stringify(body),
                     });
                     const raw = await r.text();
@@ -391,21 +397,47 @@ console.log('\n=== 4. 端到端：从局域网地址发起，SSRF 拦截必须�
                     return { status: r.status, j, raw };
                 };
                 const outsideTarget = path.join(path.dirname(ROOT), 'elaina-lan-escape-probe.txt');
-                const esc = await escalate({
-                    path: outsideTarget, content: 'LAN-ESCAPE', permission: 'app', allowOutside: true,
-                });
-                ok(esc.status === 403,
-                    '★ 局域网伪造 allowOutside 仍被拒绝（403）', `status=${esc.status}`);
-                ok(esc.j?.needEscalation !== true,
-                    '★ 局域网连"申请越界"的入口都不给（不返回 needEscalation）',
-                    JSON.stringify(esc.j));
-                ok(!existsSync(outsideTarget), '★ 越界探针文件没有被写出来');
-                // 即使退一步用 computer 模式（局域网本来就不该拿到），也必须被拒
-                const esc2 = await escalate({
-                    path: outsideTarget, content: 'LAN-ESCAPE', permission: 'computer', allowOutside: true,
-                });
-                ok(esc2.status === 403, '★ 局域网声明 permission=computer 也被拒绝（403）', `status=${esc2.status}`);
-                ok(!existsSync(outsideTarget), '★ computer 声明同样没有写出文件');
+
+                // ★ 先清掉上一轮可能留下的探针。
+                //
+                //   为什么要这一步（真实踩过）：旧版本没有清理，而"局域网被放开"之后
+                //   同一段测试里的已登录请求会**真的写成功**，那个文件留到下一次运行，
+                //   就会撞上新加的覆盖闸门（目标已存在 → 403），表现为
+                //   "已登录的局域网设备居然不能写" —— 一条假失败，排查成本很高。
+                //   测试自己造的中间状态，必须自己收拾干净。
+                try { rmSync(outsideTarget, { force: true }); } catch { /* ignore */ }
+
+                // ① ★ 未登录（无 cookie）+ allowOutside=true → 必须被拦。
+                //    这是本轮改动后最关键的一条：认证是唯一那道门，不能被布尔字段绕过。
+                //    实际状态码是 401（鉴权闸门在最前面），420/403 都算拦住了 ——
+                //    这里断言"不是 2xx 且没写出文件"，比钉死某个具体码更贴近真实意图。
+                const anon = await escalate({
+                    path: outsideTarget, content: 'LAN-ANON-ESCAPE', permission: 'app', allowOutside: true,
+                }, false);
+                ok(anon.status === 401 || anon.status === 403,
+                    '★ 未登录的局域网传 allowOutside=true 被拦（401/403）', `status=${anon.status}`);
+                ok(anon.j?.needEscalation !== true,
+                    '★ 未登录连"申请越界"的入口都不给（不返回 needEscalation）',
+                    JSON.stringify(anon.j));
+
+                // ② ★ 未登录 + permission=computer → 同样被拦
+                const anon2 = await escalate({
+                    path: outsideTarget, content: 'LAN-ANON-PC', permission: 'computer', allowOutside: true,
+                }, false);
+                ok(anon2.status === 401 || anon2.status === 403,
+                    '★ 未登录声明 permission=computer 也被拦（401/403）', `status=${anon2.status}`);
+                ok(!existsSync(outsideTarget), '★ 未登录的两条路径都没有写出文件（探针不存在）');
+
+                // ③ 反向断言：**已登录**的局域网设备现在**可以**操作电脑（本轮刻意的放开）。
+                //    钉住它是刻意的，别被后来的人"顺手改回去"而不知道那是需求。
+                const authed = await escalate({
+                    path: outsideTarget, content: 'LAN-AUTHED', permission: 'computer',
+                }, true);
+                ok(authed.status === 200,
+                    '★ 已登录的局域网设备可以操作电脑（本轮刻意的放开）', `status=${authed.status}`);
+                ok(existsSync(outsideTarget),
+                    '已登录设备确实写出了文件（放开是真实生效的，不是纸面）');
+                try { rmSync(outsideTarget, { force: true }); } catch { /* ignore */ }
                 } finally {
                     internal.close();
                 }

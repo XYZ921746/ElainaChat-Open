@@ -253,6 +253,58 @@ try {
         // 清理 ①/② 可能碰到的外部路径（read 不会创建文件，这里只是防御性清理）
         try { (await import('node:fs')).rmSync(outside, { force: true }); } catch { /* ignore */ }
     }
+
+    // ---- 覆盖闸门：写入已存在的文件 = 修改，两种模式都必须先经用户同意 ----
+    //
+    // 旧实现是无条件 writeFile —— 目标已存在就**静默覆盖**，而提示词却写着
+    // 「AI 没有修改文件的权限（仅可新建）」。这段就是钉住"文案与实现对齐"的回归：
+    // 只要有人把闸门删了（或忘了让全权限模式也受它约束），这里立刻红。
+    {
+        const fs = await import('node:fs');
+        const ovNew = path.join(ROOT, 'web', PROBE + '_ov_new.txt');
+        const ovExist = path.join(ROOT, 'web', PROBE + '_ov_exist.txt');
+        const wpost = (body) => fetch(`${BASE}/api/agent/write`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+        }).then(async (r) => ({ status: r.status, j: await r.json().catch(() => null) }));
+
+        try {
+            fs.writeFileSync(ovExist, 'ORIGINAL', 'utf8');
+
+            // ① 新建不存在的文件 → 直接成功（别把"写入"这个功能本身修死）
+            let r = await wpost({ path: 'web/' + PROBE + '_ov_new.txt', content: 'v1', permission: 'app' });
+            ok(r.status === 200, '覆盖闸门：新建文件直接成功（不误伤）', `status=${r.status}`);
+
+            // ② app 模式覆盖 → 403 + needOverwrite，且磁盘内容原样
+            r = await wpost({ path: 'web/' + PROBE + '_ov_exist.txt', content: 'CLOBBER', permission: 'app' });
+            ok(r.status === 403, '★ 覆盖已存在文件被拒（403）', `status=${r.status} ${JSON.stringify(r.j)}`);
+            ok(r.j?.needOverwrite === true, '★ 响应带 needOverwrite（前端据此弹窗）');
+            ok(fs.readFileSync(ovExist, 'utf8') === 'ORIGINAL', '★ 未获批准时原内容没被改动');
+
+            // ③ 带 overwrite:true → 放行
+            r = await wpost({ path: 'web/' + PROBE + '_ov_exist.txt', content: 'OK-NEW', permission: 'app', overwrite: true });
+            ok(r.status === 200, '★ 批准后覆盖成功（200）', `status=${r.status}`);
+            ok(fs.readFileSync(ovExist, 'utf8') === 'OK-NEW', '批准后内容已更新');
+
+            // ④ ★★ 全权限（computer）模式同样要拦 —— 这是需求的核心：
+            //    "就算完全开放，也要限制删除和修改"。覆盖就是修改。
+            r = await wpost({ path: 'web/' + PROBE + '_ov_exist.txt', content: 'PC-CLOBBER', permission: 'computer' });
+            ok(r.status === 403, '★ 全权限模式覆盖仍被拦截（两模式共同下限）', `status=${r.status}`);
+            ok(r.j?.needOverwrite === true, '★ 全权限模式也回 needOverwrite');
+            ok(fs.readFileSync(ovExist, 'utf8') === 'OK-NEW', '★ 全权限下未获批准也没改动原文件');
+
+            // ⑤ 全权限 + 批准 → 放行；且新建仍免问
+            r = await wpost({ path: 'web/' + PROBE + '_ov_exist.txt', content: 'PC-OK', permission: 'computer', overwrite: true });
+            ok(r.status === 200, '全权限 + 批准后覆盖成功', `status=${r.status}`);
+            r = await wpost({ path: 'web/' + PROBE + '_ov_new2.txt', content: 'x', permission: 'computer' });
+            ok(r.status === 200, '全权限：新建文件不打扰（无需确认）', `status=${r.status}`);
+        } finally {
+            for (const f of [ovNew, ovExist, path.join(ROOT, 'web', PROBE + '_ov_new2.txt')]) {
+                try { fs.rmSync(f, { force: true }); } catch { /* ignore */ }
+            }
+        }
+    }
 } catch (err) {
     ok(false, '服务端链路检查未完成', String(err?.message || err));
 } finally {
@@ -290,6 +342,41 @@ console.log('\n=== 4. 前端接线 ===');
     ok(/requestApproval\('访问文件夹外'[\s\S]{0,120}forceAsk: true/.test(agent),
         '★ 越界确认带 forceAsk（不被豁免吞掉）');
 
+    // ---- 覆盖已有文件：前端识别 needOverwrite 并问用户 ----
+    ok(/needOverwrite/.test(agent), '前端识别服务端的 needOverwrite');
+    ok(/function confirmAgentOverwrite/.test(agent), '有覆盖确认函数');
+    ok(/overwrite: true/.test(agent), '批准后重发时带上 overwrite:true');
+    // ★ 两个旗标必须用局部变量记住，不能从响应里读 —— 服务端不回显 allowOutside，
+    //   写成 result.allowOutside 永远是 undefined，"越界 + 覆盖"同时发生时
+    //   第二次重发会丢掉 allowOutside，用户批准了却依然 403。
+    ok(/let allowOutside = false;/.test(agent),
+        '★ 越界旗标用局部变量记忆（不能从响应里读，否则越界+覆盖会失败）');
+
+    // ★ 不可逆操作的确认改为"同一对话内只问一次"。
+    //   为什么钉这条：旧的 forceAsk-per-call 会让 AI 清一批文件弹七八次，
+    //   用户退化成闭眼点允许，闸门反而失效。这里断言语义确实按对话收敛。
+    ok(/agentDestructiveScope/.test(agent), '有"按对话记"的不可逆操作授权state');
+    ok(/agentScopeKey/.test(agent) && /getCurrentConversation/.test(agent),
+        '★ 授权范围绑定当前对话 id');
+    ok(/agentDestructiveApproved\('execDanger'\)/.test(agent),
+        '★ 危险命令在同一对话内复用已有授权（不重复弹窗）');
+    ok(/agentDestructiveApproved\('write'\)/.test(agent),
+        '★ 覆盖确认在同一对话内复用已有授权');
+    // 换对话必须作废旧授权（否则"这个对话信任"会泄漏到下一个对话）
+    ok(/agentDestructiveScope\.convId !== key[\s\S]{0,220}agentDestructiveScope\.write = false/.test(agent),
+        '★ 切换对话后旧授权被清空');
+
+    // 设置页必须把全权限的**后果**讲清楚（删除/覆盖不可撤销），
+    // 而不是指望用户从每次弹窗里自己领悟
+    ok(/不可撤销|无法恢复/.test(html), '★ 设置页说明了后果不可撤销');
+    ok(/能删除文件|删除文件、改注册表/.test(html), '★ 设置页列明"能删除文件"');
+    ok(/能覆盖已有文件|覆盖已有文件/.test(html), '★ 设置页列明"能覆盖已有文件"');
+    // 开启全权限时的一次性确认
+    ok(/showCustomConfirm\([\s\S]{0,200}允许操作电脑/.test(html) || /'⚠️ 开启「允许操作电脑」'/.test(html),
+        '★ 切到全权限时弹一次后果确认');
+    ok(/每个对话里首次询问|首次会问你一次|每个对话首次会问你一次/.test(html),
+        '★ 设置页说明了"每个对话首次询问"的确认语义');
+
     // ★ 危险命令不能被"本轮已确认过敏感操作"的豁免吞掉。
     //   这是最容易漏的一条：`电脑命令` 在 AGENT_RISK 里是 sensitive（因为同类里
     //   既有 dir 也有 del），而 once 策略的豁免是按**操作名**记的。若不显式
@@ -302,18 +389,28 @@ console.log('\n=== 4. 前端接线 ===');
         '★ 豁免分支同时排除 dangerous 与 mustAsk（否则 del 会被静默放行）');
 
     // 分发顺序：电脑命令必须排在文件操作之前，否则命令正文里的
-    // "查看文件" 这类词会被文件分支吃掉
-    const cmdIdx = live2d.indexOf('^(电脑命令|执行命令|运行命令|电脑执行)');
-    const fileIdx = live2d.indexOf('列出文件|列出目录');
-    ok(cmdIdx > 0, 'live2d 分发里有电脑命令分支');
+    // "查看文件" 这类词会被文件分支吃掉。
+    //
+    // ★ 分发逻辑已从 live2d-video.js 移到宿主自有模块 web/js/agent-tags.js
+    //   （解耦：Live2D 是可卸的，不能让它持有全部 [操作:] 的分发权）。
+    //   这里断言新位置，并在 live2d 那侧确认它**不再**持有该分支。
+    const tags = await import('node:fs').then(m => m.readFileSync(path.join(ROOT, 'web', 'js', 'agent-tags.js'), 'utf8'));
+    const cmdIdx = tags.indexOf('^(电脑命令|执行命令|运行命令|电脑执行)');
+    const fileIdx = tags.indexOf('列出文件|列出目录');
+    ok(cmdIdx > 0, 'agent-tags.js 分发里有电脑命令分支');
     ok(fileIdx > 0 && cmdIdx < fileIdx, '电脑命令分支排在文件操作之前（避免命令正文被误吃）');
+    ok(!/\^\(电脑命令/.test(live2d),
+        '★ live2d-video.js 不再持有操作分发（解耦：Live2D 卸掉不影响 Agent）');
+    // 宿主各处必须走 ElainaTags，而不是 window.Live2DCall
+    ok(/window\.ElainaTags/.test(agent), '宿主用 ElainaTags 剥离/分发标签');
+    ok(!/Live2DCall\.stripTags/.test(agent), '★ 宿主不再依赖 Live2DCall.stripTags');
 
     // 两条提示词路径都要注入（分层版 + legacy 回滚路径）
     ok((data.match(/agentCommandSkillText\(\)/g) || []).length >= 2,
         '分层版与 legacy 两条路径都注入了电脑命令能力');
 
-    // 设置页要说明"危险命令会先确认"
-    ok(/危险命令.*确认|执行前弹窗请你确认/.test(html), '设置页说明了危险命令需确认');
+    // 设置页要说明"危险命令会先确认"（并且确认是按对话收敛的）
+    ok(/危险命令.*确认|危险命令会让用户确认/.test(html), '设置页说明了危险命令需确认');
 }
 
 console.log('\n' + '='.repeat(46));

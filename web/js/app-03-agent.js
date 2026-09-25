@@ -27,9 +27,13 @@ window.agentActions = {
     agentFileOperation(raw) {
         const permission = state.settings.agentPermission || 'app';
         const text = String(raw || '').trim();
-        // 删除/修改类操作一律拒绝（AI 无此权限）
-        if (/删除|删掉|移除|重命名|改名|移动文件|修改文件|覆盖文件/.test(text)) {
-            insertAgentResult('该操作不可用：AI 没有删除/修改文件的权限（仅可查看、读取、新建文件），建议手动操作。');
+        // 删除/改名类操作一律拒绝：文件操作接口本身就没有这两个动作（只有列出/读取/写入）。
+        // 注意这不等于"不能覆盖" —— 覆盖一个已存在的文件走的是「保存文件」标签，
+        // 由服务端的覆盖闸门 + 用户确认把关（见 confirmAgentOverwrite）。
+        if (/删除|删掉|移除|重命名|改名|移动文件/.test(text)) {
+            insertAgentResult('该操作不可用：文件操作只有「列出 / 读取 / 保存」三种，没有删除或改名。'
+                + '需要删改已有的文件请手动操作；在「允许操作电脑」模式下也可以改用 [操作:电脑命令 …]，'
+                + '但那会让你确认一次。');
             return;
         }
         let action = 'ls';
@@ -859,13 +863,16 @@ function agentCommandSkillText() {
         '',
         '【工作方式】',
         '1. 普通命令（查看目录、读系统信息、跑 git / node 等）会**直接执行**，结果立刻回灌给你。',
-        '2. ⚠️ **危险命令会先弹窗问用户**（删除文件、改注册表、关机、下载并执行、提权等）。'
+        '2. ⚠️ **危险命令会让用户确认一次**（删除文件、改注册表、关机、下载并执行、提权等）。'
+            + '每个对话里第一次遇到危险命令时询问，用户同意后该对话内后续的危险命令不再重复问。'
             + '用户可能拒绝 —— 被拒绝时如实说明并换个更安全的思路，不要反复重试同一条命令。',
         '3. 命令输出较长时会被截断，需要看别的部分就换一条更精确的命令（例如加过滤条件）。',
         '4. ⚠️ 只有输出 [操作:电脑命令 …] 标签才会真正执行。**绝不编造**"我已经执行了/命令输出是…"；',
         '   执行结果一律以系统回灌的「【AI 操作结果】」为准。',
         '5. 不确定命令的写法时，先用 [操作:电脑命令 <命令> --help] 或 [操作:电脑命令 where <程序名>] 探一下，'
             + '不要凭猜测拼一条可能破坏系统的命令。',
+        '6. ⚠️ 删除类命令（del / Remove-Item / rmdir 等）**不可撤销**。执行前先确认你删的确实是目标，'
+            + '能用更保守的写法（先列目录确认、只删明确的那一个文件）就不要用通配符。',
     ].join('\n');
 }
 
@@ -1141,21 +1148,92 @@ document.getElementById('backendPanel')?.addEventListener('click', (e) => {
     if (e.target && e.target.id === 'backendPanel') closeBackendPanel();
 });
 
-// 「允许操作电脑」模式下写文件前必须确认一次（同一路径只问一次）。
-// 之前 AI 可以完全无声地把任意内容写到任意路径 —— 一旦提示词被图片文字、
-// 长期记忆或第三方模型输出污染，等于把整台机器的写权限交给了一次模型输出。
-const agentWriteApproved = new Set();
-function confirmAgentWrite(path, permission) {
-    if (permission !== 'computer') return true; // 限制模式只在应用文件夹内，无需打断
-    const target = String(path || '').trim();
-    if (!target) return false;
-    if (agentWriteApproved.has(target)) return true;
+// 覆盖已有文件 = 修改，需要用户同意一次。
+//
+// 为什么按「同一对话」而不是「同一路径」记：
+//   · 按路径记（旧做法）等于每个新路径都要打断一次 —— AI 改十个文件就弹十次，
+//     用户很快就会条件反射地点"允许"，确认形同虚设；
+//   · 按对话记的语义是"这个会话里我信任它做修改"，一次说清、后续不打扰，
+//     换一个对话重新问 —— 与新对话可能换了语境、换了角色卡这一点对齐。
+//
+// 与删除类命令共用同一条语义（见 confirmAgentDangerousCommand）：两者都是"不可逆的改动"。
+const agentDestructiveScope = { convId: null, write: false, execDanger: false };
+
+/** 当前对话 id（拿不到就退回一个空串，等价于"每次都问"） */
+function agentScopeKey() {
+    try {
+        const conv = getCurrentConversation();
+        return conv && conv.id ? String(conv.id) : '';
+    } catch { return ''; }
+}
+
+/**
+ * 检查是否已在本对话内授权过某类不可逆操作；换了对话自动清空。
+ * @param {'write'|'execDanger'} kind
+ */
+function agentDestructiveApproved(kind) {
+    const key = agentScopeKey();
+    // 对话切换 → 作废旧授权。不能只看"key 变了"就重置后放行，
+    // 所以这里只清空、不置位，由调用方在用户同意时才置位。
+    if (agentDestructiveScope.convId !== key) {
+        agentDestructiveScope.convId = key;
+        agentDestructiveScope.write = false;
+        agentDestructiveScope.execDanger = false;
+    }
+    return agentDestructiveScope[kind] === true;
+}
+
+/** 记下"本对话内已授权该类操作" */
+function agentMarkDestructiveApproved(kind) {
+    agentDestructiveScope.convId = agentScopeKey();
+    agentDestructiveScope[kind] = true;
+}
+
+/**
+ * 危险电脑命令的确认（删除 / 格式化 / 改注册表 / 关机 / 下载并执行…）。
+ *
+ * 语义与覆盖确认一致：**同一对话内只问一次**。
+ *   · 旧行为是每条危险命令都弹（forceAsk）—— AI 清理一批临时文件要弹七八次，
+ *     用户从"看清内容再决定"退化成"闭眼点允许"，最后那道闸反而没了；
+ *   · 现在改成一次问清、本对话内不再打扰，并在弹窗里把**后果**说明白
+ *     （删除不可恢复），把判断放在"是否开启全权限"和"这一次"两个点上。
+ *
+ * ★ 服务端仍是权威：不带 approved:true 的请求一律 403（见 agentExec）。
+ *   所以"本对话已授权"这个状态只影响**问不问**，不影响"服务端卡不卡"。
+ */
+async function confirmAgentDangerousCommand(command, reasonList) {
+    if (agentDestructiveApproved('execDanger')) return true;
+    const reasons = Array.isArray(reasonList) && reasonList.length
+        ? reasonList.join('、')
+        : '可能改变系统状态';
+    const detail = 'AI 想执行一条危险命令：\n\n' + command + '\n\n风险：' + reasons
+        + '\n\n⚠️ 这类命令可能**不可撤销**（删除的文件、改掉的注册表、关掉的进程都不会自己回来）。'
+        + '\n请确认命令内容确实是你想要的。同意后，本对话内后续的危险命令不再重复询问。';
     let ok = false;
     try {
-        ok = window.confirm('AI 请求在「允许操作电脑」模式下写入文件：\n\n' + target
-            + '\n\n允许这次写入吗？\n（同一路径只询问一次；可在「设置 → 高级」把权限改回"限制模式"彻底关闭）');
+        ok = await agentRuntime.requestApproval('电脑命令', detail, { forceAsk: true });
     } catch { ok = false; }
-    if (ok) agentWriteApproved.add(target);
+    if (ok) agentMarkDestructiveApproved('execDanger');
+    return ok;
+}
+
+/**
+ * 覆盖已有文件的确认（服务端回 needOverwrite 后由前端问一次）。
+ *
+ * ★ 服务端是权威：不带 overwrite:true 的请求拿不到覆盖能力，
+ *   所以"问不问"可以被前端优化，但"能不能覆盖"始终由服务端说了算。
+ */
+async function confirmAgentOverwrite(path) {
+    if (agentDestructiveApproved('write')) return true;
+    const target = String(path || '').trim();
+    const detail = 'AI 想写入一个**已经存在**的文件，这会覆盖它原有的内容：\n\n' + target
+        + '\n\n覆盖后原内容无法恢复。同意后，本对话内后续的写入/修改不再重复询问。\n'
+        + '（想彻底关掉：设置 → 能力 → 「AI 操作电脑」改回「限制：仅应用文件夹内操作」）';
+    let ok = false;
+    try {
+        ok = await agentRuntime.requestApproval('覆盖已有文件', detail, { forceAsk: true });
+    } catch { ok = false; }
+    if (ok) agentMarkDestructiveApproved('write');
     return ok;
 }
 
@@ -1201,11 +1279,6 @@ async function doAgentFile(action, { path, content } = {}, permission) {
     try {
         let result;
         if (action === 'write') {
-            if (!confirmAgentWrite(path, permission)) {
-                updateTurnTool(traceItem, { state: 'stopped', result: '用户取消了这次写入' });
-                insertAgentResult('已取消写入：在「允许操作电脑」模式下没有确认这次操作。\n目标：' + (path || '（未提供路径）'));
-                return;
-            }
             // 必须用**同源 fetch**，不能用 postJsonFromDevice。
             //
             // postJsonFromDevice 是给"外部服务商"用的：它会走本机中转
@@ -1215,11 +1288,11 @@ async function doAgentFile(action, { path, content } = {}, permission) {
             //
             // 真实故障：日志里能看到 `[Relay] [WARN] 目标地址无效：/api/agent/write`，
             // 而 ls / read 走的是同源 fetch 所以正常 —— 表现为"读取能用、写入不行"。
-            const send = async (allowOutside) => {
+            const send = async ({ allowOutside, overwrite }) => {
                 const res = await fetch('/api/agent/write', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ permission, path, content, allowOutside })
+                    body: JSON.stringify({ permission, path, content, allowOutside, overwrite })
                 });
                 const r = await res.json();
                 // 同源 fetch 不像 postJsonFromDevice 那样带 rawText，补一份便于错误提示
@@ -1227,9 +1300,34 @@ async function doAgentFile(action, { path, content } = {}, permission) {
                 if (!('ok' in r)) r.ok = res.ok;
                 return r;
             };
-            result = await send(false);
-            if (result.needEscalation && await confirmAgentEscalation(path)) {
-                result = await send(true);
+            // ★ 两个授权旗标要用**局部变量**记住，不能从响应里读。
+            //   服务端不会把 allowOutside 回显在响应里，写成 `result.allowOutside` 永远是
+            //   undefined —— 那样"越界 + 覆盖"同时发生时，第二次重发会丢掉 allowOutside，
+            //   于是被 403 打回，用户批准了却依然失败。
+            let allowOutside = false;
+            result = await send({ allowOutside, overwrite: false });
+            // ① 越界（限制模式下碰 web/ 之外）→ 申请一次，批准后带 allowOutside 重发
+            if (result.needEscalation) {
+                if (!await confirmAgentEscalation(path)) {
+                    updateTurnTool(traceItem, { state: 'stopped', result: '用户没有允许访问应用文件夹外的位置' });
+                    insertAgentResult('已取消：没有获得访问该位置的许可。\n目标：' + (path || '（未提供路径）'));
+                    return;
+                }
+                allowOutside = true;
+                result = await send({ allowOutside, overwrite: false });
+            }
+            // ② 覆盖已有文件 → 申请一次，批准后带 overwrite 重发。
+            //    与 ① 是**两件独立的事**（能不能去那个位置 / 能不能改那个文件），
+            //    所以刻意不是 else-if，且重发时两条旗标都要如实带上。
+            if (result.needOverwrite) {
+                if (!await confirmAgentOverwrite(path)) {
+                    updateTurnTool(traceItem, { state: 'stopped', result: '用户没有允许覆盖这个文件' });
+                    insertAgentResult('已取消写入：目标文件已存在，而你没有允许覆盖它。\n'
+                        + '目标：' + (path || '（未提供路径）')
+                        + '\n（想保留原文件的话，可以让 AI 换一个新文件名保存。）');
+                    return;
+                }
+                result = await send({ allowOutside, overwrite: true });
             }
         } else {
             const buildQuery = (allowOutside) => 'permission=' + encodeURIComponent(permission)
@@ -1333,16 +1431,7 @@ async function doAgentCommand(command, permission) {
 
         // 服务端判定为危险 → 现在才问用户（安全命令已经在上面执行完了，不打扰）
         if (result && result.needApproval) {
-            const reasons = Array.isArray(result.reasons) && result.reasons.length
-                ? result.reasons.join('、')
-                : '可能改变系统状态';
-            const allowed = await agentRuntime.requestApproval('电脑命令',
-                '命令：' + command + '\n\n风险：' + reasons,
-                // ★ forceAsk：服务端已判定这一条**具体**命令是危险的。
-                //   必须无视"本轮已确认过敏感操作"的豁免 —— 否则用户确认过一次
-                //   任意敏感操作后，一条 del 就会静默执行（见 requestApproval 的说明）。
-                { forceAsk: true });
-            if (!allowed) {
+            if (!await confirmAgentDangerousCommand(command, result.reasons)) {
                 updateTurnTool(traceItem, { state: 'stopped', result: '用户没有允许执行这条命令' });
                 insertAgentResult('已跳过这条命令：用户没有允许。请换一种更安全的方式，或先向用户说明为什么要执行它。');
                 return;
@@ -1407,9 +1496,7 @@ async function explainAgentFailure(reason) {
             raw = '';
         }
     }
-    const text = window.Live2DCall && typeof window.Live2DCall.stripTags === 'function'
-        ? window.Live2DCall.stripTags(raw || '')
-        : (raw || '');
+    const text = window.ElainaTags ? window.ElainaTags.strip(raw || '') : (raw || '');
     const wantsRetry = canRetry && /\[操作[:：]/.test(raw || '');
     if (text) {
         const aiMessage = { id: generateId(), role: 'ai', text, timestamp: new Date().toLocaleTimeString() };
@@ -1426,8 +1513,8 @@ async function explainAgentFailure(reason) {
         insertAgentResult('操作失败：' + shortReason, { continueLoop: false });
     }
     // 解释里带了新的 [操作:…] → 真的执行它（走同一条标签管线，停止/授权照常生效）
-    if (wantsRetry && window.Live2DCall && typeof window.Live2DCall.drive === 'function') {
-        window.Live2DCall.drive(raw);
+    if (wantsRetry && window.ElainaTags) {
+        window.ElainaTags.drive(raw);
     }
 }
 
@@ -1530,9 +1617,7 @@ async function continueAgentLoop() {
     }
     // 续跑途中用户按了停止 → 不渲染这半截回复
     if (typeof rt.isHalted === 'function' && rt.isHalted()) return;
-    const text = window.Live2DCall && typeof window.Live2DCall.stripTags === 'function'
-        ? window.Live2DCall.stripTags(raw || '')
-        : (raw || '');
+    const text = window.ElainaTags ? window.ElainaTags.strip(raw || '') : (raw || '');
     if (text) {
         const aiMessage = { id: generateId(), role: 'ai', text, timestamp: new Date().toLocaleTimeString() };
         conv.messages.push(aiMessage);
@@ -1559,8 +1644,8 @@ async function continueAgentLoop() {
     // drive() 里的操作是异步的（要先弹授权、再发请求），此刻定时器还没被设上，
     // 那样判断会误判成"AI 已收尾"而提前 endRun。
     const hasMoreOps = /\[操作[:：]/.test(String(raw || ''));
-    if (hasMoreOps && window.Live2DCall && typeof window.Live2DCall.drive === 'function') {
-        window.Live2DCall.drive(raw || '');
+    if (hasMoreOps && window.ElainaTags) {
+        window.ElainaTags.drive(raw || '');
         return;   // 后续由新一轮 insertAgentResult 接力
     }
     // 没有操作标签 → AI 认为任务完成，结束本次运行（收起状态条）
@@ -1752,11 +1837,11 @@ async function fireScheduledTask(task) {
     }
     try {
         const raw = await callAI(`（定时提醒任务）请以你的角色身份，用一两句话自然提醒我这件事，不要提及"定时任务"或"提醒"：${task.content}`);
-        const text = window.Live2DCall ? window.Live2DCall.stripTags(raw) : raw;
+        const text = window.ElainaTags ? window.ElainaTags.strip(raw) : raw;
         const aiMessage = { id: generateId(), role: 'ai', text, timestamp: new Date().toLocaleTimeString() };
         conv.messages.push(aiMessage);
         saveConversations();
-        if (window.Live2DCall) window.Live2DCall.drive(raw);
+        if (window.ElainaTags) window.ElainaTags.drive(raw);
         if (state.currentConversationId === conv.id) {
             renderMessage(aiMessage);
         }

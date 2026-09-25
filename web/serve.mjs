@@ -23,6 +23,9 @@ import { activitySummaryCached } from '../server/activity.mjs';
 // 电脑命令执行（全权限模式下 AI 跑 PowerShell / cmd）。危险命令的判定是纯函数，
 // 单独成模块便于穷举断言 —— 判定错了后面所有防护都是空的（见 pc-command.mjs）。
 import { classifyCommand, runCommand, formatCommandResult, availableShells } from '../server/pc-command.mjs';
+// 登录防爆破 + 密码强度。单独成模块的理由与 pc-command 一致：纯逻辑、可注入时钟、
+// 能穷举断言锁定策略 —— 而放开"局域网可执行命令"之后，密码是唯一还站着的防线。
+import { createLoginGuard, validatePasswordStrength, PWD_MIN_LEN } from '../server/auth-guard.mjs';
 // zip 解压 / 危险扩展名判定：**服务端唯一的实现**在 server/zip.mjs。
 // 原先 serve.mjs 里还另有一份几乎相同的 unzip（含体积上限、危险类型拦截、GBK 解码、
 // zip64 回退），与 zip.mjs 的 readZip 逐段重复 —— 两份实现意味着安全修复要改两处，
@@ -919,18 +922,39 @@ function shellFolderHint() {
 }
 
 /**
- * 判断请求是否来自本机。
- * 安全前提：服务默认监听 0.0.0.0（方便手机/平板访问），而 Agent 文件操作接口没有鉴权，
- * 权限模式又是由**请求方自己传参**决定的。如果不做来源校验，局域网内任何设备只要访问
- * http://<本机IP>:4173 就能带上 permission=computer 往本机任意路径写文件/读文件。
- * 因此："允许操作电脑"只对本机请求开放，局域网请求一律降级为应用文件夹模式。
+ * 判断请求是否来自本机（回环地址，免密视为管理员）。
+ *
+ * ★ 注意：这个函数**不再**是"能不能操作电脑"的判据。
+ *   放开局域网权限后，判据变成了 hasComputerGrant（已认证即可）——
+ *   本机只是"免密码"这一种拿到授权的途径，另一种是通过密码登录。
  */
 function isLocalRequest(request) {
     const addr = request.socket?.remoteAddress || '';
     return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
-const PERM_DENIED_MSG = '限制模式：仅可操作应用文件夹（web/）。如需操作电脑其他路径，请在本机用 http://127.0.0.1:4173 打开（出于安全，局域网访问一律限制在应用文件夹内）。';
+/**
+ * 是否已获得「操作这台电脑」的授权。
+ *
+ * ── 这里为什么从"仅本机"改成"已认证" ──────────────────────────────────
+ *
+ * 旧规则：只有 127.0.0.1 能拿 computer 模式，局域网一律降级到 app 模式。
+ * 现在（按用户要求）：**局域网设备登录后与本机同等能力** —— 文件读写 + 执行命令。
+ *
+ * 这不是把防线去掉了，而是把它**前移并收紧**：
+ *   · 旧规则下局域网设备"猜不到密码也没关系"，因为它本来就什么都不能干；
+ *   · 新规则下密码成了唯一那道门 —— 所以密码强度校验与登录防爆破
+ *     （server/auth-guard.mjs）从"加分项"变成了这套权限模型的**必要组成**。
+ *     没有那个模块，这个改动就是危险的；有它，边界仍然是清晰的。
+ *
+ * 能走到 /api/agent/* 的请求必然已经过了 handleLogin 那关（见主处理链里的
+ * isAuthenticated 闸门），所以这里的判定实际上等价于"已登录或本机"。
+ */
+function hasComputerGrant(request) {
+    return isAuthenticated(request);
+}
+
+const PERM_DENIED_MSG = '限制模式：仅可操作应用文件夹（web/）。如需操作电脑其他路径，请在「设置 → 能力 → 电脑操作权限」里切到「允许操作电脑」（局域网设备需先登录）。';
 
 /**
  * 解析 Agent 路径，并区分"路径无效"与"越界"两种失败。
@@ -942,34 +966,34 @@ const PERM_DENIED_MSG = '限制模式：仅可操作应用文件夹（web/）。
  *
  * @param {string} rawPath
  * @param {string} permission 'app' | 'computer'
- * @param {boolean} isLocal 只有本机才可能放开
+ * @param {boolean} privileged 已获得操作电脑的授权（本机或已登录的局域网设备）
  * @param {boolean} allowOutside 用户已就本次操作批准越界（前端确认后回传）
  * @returns {{ok:true, path:string} | {ok:false, reason:'invalid'|'outside'|'remote'}}
  */
-function resolveAgentPathEx(rawPath, permission, isLocal, allowOutside = false) {
+function resolveAgentPathEx(rawPath, permission, privileged, allowOutside = false) {
     const p = expandPathAliases(rawPath);
     if (!p) return { ok: false, reason: 'invalid' };
     const resolved = path.resolve(p);
 
-    // 全权限：本机即可
-    if (isLocal && permission === 'computer') return { ok: true, path: resolved };
+    // 全权限：已授权即可（本机 or 已登录的局域网设备）
+    if (privileged && permission === 'computer') return { ok: true, path: resolved };
 
     // 限制模式：应用文件夹内直接放行
     if (resolved === AGENT_APP_ROOT || resolved.startsWith(AGENT_APP_ROOT + path.sep)) {
         return { ok: true, path: resolved };
     }
 
-    // 越界。★ 只有**本机**请求才允许"申请越界" —— 局域网设备即使传
-    //   allowOutside 也必须被拒（否则等于把 computer 模式送给了整个局域网，
-    //   而 isLocal 检查的全部意义就在于此）。
-    if (!isLocal) return { ok: false, reason: 'remote' };
+    // 越界。★ 只有**已获得操作电脑授权**的请求才允许"申请越界" ——
+    //   未认证的设备即使伪造 allowOutside 也必须被拒（否则等于把 computer 模式
+    //   白送给整个局域网，而认证检查的全部意义就在于此）。
+    if (!privileged) return { ok: false, reason: 'remote' };
     if (allowOutside === true) return { ok: true, path: resolved };
     return { ok: false, reason: 'outside' };
 }
 
 /** 旧签名保留：只要最终路径，拿不到就是 null（供不关心失败原因的调用方用） */
-function resolveAgentPath(rawPath, permission, isLocal, allowOutside = false) {
-    const r = resolveAgentPathEx(rawPath, permission, isLocal, allowOutside);
+function resolveAgentPath(rawPath, permission, privileged, allowOutside = false) {
+    const r = resolveAgentPathEx(rawPath, permission, privileged, allowOutside);
     return r.ok ? r.path : null;
 }
 
@@ -980,7 +1004,7 @@ function resolveAgentPath(rawPath, permission, isLocal, allowOutside = false) {
  * 而不是让用户自己去设置页切换全局模式 —— 那是一次性需求却要改全局配置，
  * 用户改完往往忘了改回来，等于把限制模式永久关掉了。
  */
-function denyPath(res, reason, isLocal) {
+function denyPath(res, reason, privileged) {
     if (reason === 'outside') {
         return jsonResponse(res, 403, {
             ok: false,
@@ -989,6 +1013,9 @@ function denyPath(res, reason, isLocal) {
         });
     }
     if (reason === 'remote') {
+        // 走到这里说明请求既没有 computer 权限、目标又在 web/ 之外。
+        // 认证闸门在更前面（未登录的请求根本到不了 /api/agent/*），
+        // 所以这通常意味着"已登录但用的是 app 模式"。
         return jsonResponse(res, 403, { ok: false, message: PERM_DENIED_MSG });
     }
     return jsonResponse(res, 403, { ok: false, message: '路径无效' });
@@ -1016,14 +1043,14 @@ async function listAgentEntries(target) {
     return list.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
 }
 
-async function agentLs(params, res, isLocal) {
+async function agentLs(params, res, privileged) {
     try {
         const permission = String(params.get('permission') || 'app');
         const allowOutside = params.get('allowOutside') === '1';
-        const r = resolveAgentPathEx(params.get('path') || AGENT_APP_ROOT, permission, isLocal, allowOutside);
-        if (!r.ok) return denyPath(res, r.reason, isLocal);
+        const r = resolveAgentPathEx(params.get('path') || AGENT_APP_ROOT, permission, privileged, allowOutside);
+        if (!r.ok) return denyPath(res, r.reason, privileged);
         const target = r.path;
-        const full = (isLocal && permission === 'computer') || allowOutside;
+        const full = (privileged && permission === 'computer') || allowOutside;
         const info = await stat(target).catch(() => null);
         if (!info || !info.isDirectory()) {
             // 带上真实位置提示：AI 猜错路径时，下一轮能自己纠正（旧实现只回「目录不存在」，它就卡死了）
@@ -1041,14 +1068,14 @@ async function agentLs(params, res, isLocal) {
     }
 }
 
-async function agentRead(params, res, isLocal) {
+async function agentRead(params, res, privileged) {
     try {
         const permission = String(params.get('permission') || 'app');
         const allowOutside = params.get('allowOutside') === '1';
-        const r = resolveAgentPathEx(params.get('path'), permission, isLocal, allowOutside);
-        if (!r.ok) return denyPath(res, r.reason, isLocal);
+        const r = resolveAgentPathEx(params.get('path'), permission, privileged, allowOutside);
+        if (!r.ok) return denyPath(res, r.reason, privileged);
         const target = r.path;
-        const full = (isLocal && permission === 'computer') || allowOutside;
+        const full = (privileged && permission === 'computer') || allowOutside;
         const info = await stat(target).catch(() => null);
         if (!info || !info.isFile()) {
             const hint = full ? shellFolderHint() : '';
@@ -1066,7 +1093,7 @@ async function agentRead(params, res, isLocal) {
     }
 }
 
-async function agentWrite(request, res, isLocal) {
+async function agentWrite(request, res, privileged) {
     try {
         // 读请求体并限制大小（旧实现无上限，一个超大 body 就能把进程内存吃满）
         const chunks = [];
@@ -1083,8 +1110,8 @@ async function agentWrite(request, res, isLocal) {
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return jsonResponse(res, 400, { ok: false, message: '请求体无效' }); }
         const permission = String(body.permission || 'app');
         const allowOutside = body.allowOutside === true;
-        const r = resolveAgentPathEx(body.path, permission, isLocal, allowOutside);
-        if (!r.ok) return denyPath(res, r.reason, isLocal);
+        const r = resolveAgentPathEx(body.path, permission, privileged, allowOutside);
+        if (!r.ok) return denyPath(res, r.reason, privileged);
         const target = r.path;
         // 应用文件夹模式下禁写危险类型：这些文件一旦落进 web/，静态服务就会以同源身份
         // 执行/渲染它们（.html 直接构成存储型 XSS）。computer 模式本来就允许操作电脑
@@ -1099,10 +1126,46 @@ async function agentWrite(request, res, isLocal) {
         //     `{path:'web/x.html::$DATA', permission:'app', allowOutside:true}`
         //     会因为 allowOutside 把 full 顶成 true 而**跳过拦截**，落盘一个 web/ 内的
         //     .html —— 等于给同源代码注入开了后门。所以 in-web 的保护永不放宽。
+        //
+        // ⚠️ 诚实说明：这道闸门在 computer 模式下**本来就不拦**（本机也是），
+        //    而且它只挡"通过写入接口"这条路 —— 有了命令执行之后，
+        //    `echo x > web/a.html` 这类写法被危险判定归为 **safe**（重定向目标不是
+        //    绝对系统路径），不带授权就能落盘。所以它防的是"模型顺手写个文件"，
+        //    不是"铁了心要注入的人"。真正的边界是"要不要给命令执行"。
         const inAppRoot = target === AGENT_APP_ROOT || target.startsWith(AGENT_APP_ROOT + path.sep);
-        if (inAppRoot && !(isLocal && permission === 'computer') && isBlockedWritePath(target)) {
+        if (inAppRoot && !(privileged && permission === 'computer') && isBlockedWritePath(target)) {
             return jsonResponse(res, 400, { ok: false, message: '应用文件夹内不允许写 .html/.js/.svg 等可执行类型的文件（防止同源代码注入）' });
         }
+
+        // ★ 覆盖已有文件 = 修改，必须经用户同意（两种模式都生效，含全权限模式）。
+        //
+        // 为什么这条要放在服务端、且两个模式都拦：
+        //   旧实现是无条件 `writeFile(target, ...)` —— 目标已存在就**静默覆盖**。
+        //   而提示词里却写着「AI 没有修改文件的权限（仅可新建）」，两边不一致：
+        //   AI 只要对已存在的路径发一次 [操作:保存文件 …]，就能在用户毫无察觉的情况下
+        //   改写 web/css/themes.css、web/mods/index.json，全权限模式下更能改写电脑上
+        //   任意文件。所谓"仅可新建"从来没被强制过。
+        //
+        // 判据用 stat 而不是 existsSync：目标可能是目录（写它会 ENOTDIR/EISDIR），
+        // 那种情况交给下面的 writeFile 自己报错，不在这里伪装成"覆盖确认"。
+        //
+        // overwrite 由前端在用户同意后回传（与 allowOutside 同一套模式）：
+        // 服务端不认识"用户是否同意过"这个状态，它只认"这次请求有没有带授权旗标"，
+        // 而前端问不问、问几次由前端按"同一对话只问一次"的语义决定。
+        // 绕过前端直接 POST 的话，不带 overwrite 一样拿不到覆盖能力。
+        let targetExists = false;
+        try {
+            const existed = await stat(target);
+            targetExists = existed.isFile();
+        } catch { /* 不存在 / 无权限：都按"新建"处理，真正的错误由 writeFile 抛出 */ }
+        if (targetExists && body.overwrite !== true) {
+            return jsonResponse(res, 403, {
+                ok: false,
+                needOverwrite: true,
+                message: '目标文件已存在：这次写入会**覆盖**它原有的内容。需要你确认后才能继续。',
+            });
+        }
+
         // 只在目录不存在时创建（Windows 对盘符根目录如 D:\ 执行 mkdir 会报 EPERM）
         const dir = path.dirname(target);
         try {
@@ -1131,14 +1194,15 @@ async function agentWrite(request, res, isLocal) {
  *   攻击者传 approved:true 即可执行任意命令。所以服务端**自己判**，
  *   并且在前端没带 approved 时拒绝 —— 这样绕过前端也拿不到危险命令。
  */
-async function agentExec(request, res, isLocal) {
+async function agentExec(request, res, privileged) {
     try {
         let body;
         try { body = await readJsonBody(request, 256 * 1024); } catch { return jsonResponse(res, 400, { ok: false, message: '请求体无效' }); }
 
         const permission = String(body.permission || 'app');
-        // 限制模式：命令执行整体不可用（见上）
-        if (!(isLocal && permission === 'computer')) {
+        // 限制模式：命令执行整体不可用（见上）。
+        // privileged = 本机（免密管理员）或**已登录**的局域网设备。
+        if (!(privileged && permission === 'computer')) {
             return jsonResponse(res, 403, { ok: false, message: PERM_DENIED_MSG });
         }
         const command = String(body.command || '').trim();
@@ -1160,7 +1224,7 @@ async function agentExec(request, res, isLocal) {
         // cwd 仍受权限约束：app 模式到不了这里，computer 模式允许指定目录
         let cwd;
         if (body.cwd) {
-            const target = resolveAgentPath(body.cwd, permission, isLocal);
+            const target = resolveAgentPath(body.cwd, permission, privileged);
             if (!target) return jsonResponse(res, 403, { ok: false, message: '工作目录无效' });
             cwd = target;
         }
@@ -1427,17 +1491,19 @@ const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
 const LEGACY_AUTH_FILE = path.join(root, '.local-auth.json');
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_COOKIE = 'elaina_session';
-const LOGIN_MAX_FAILS = 5;
-const LOGIN_LOCK_MS = 60 * 1000;
+// 登录防爆破：单 IP 指数退避 + 全局限流。参数集中在 auth-guard.mjs 里，那里有完整的推导。
+//
+// 为什么不再用旧的"5 次 / 锁 60 秒"：那是固定窗口，等于告诉攻击者
+// "每 60 秒能试 5 次" —— 保持低频就能一天试七千多次。现在锁定时间逐次翻倍（上限 1 小时），
+// 且**计数只在成功时清零**，持续攻击只会越锁越久。
+const loginGuard = createLoginGuard();
 const sessions = new Map();   // token -> 过期时间戳
-const loginFails = new Map(); // ip -> { count, until }
 
-// 定期清理过期会话与登录失败记录。
+// 定期清理过期会话。
 // 旧实现只在"该 token / 该 IP 再次被访问"时顺带清理，长期运行会缓慢堆积内存。
 const pruneTimer = setInterval(() => {
     const now = Date.now();
     for (const [token, exp] of sessions) if (now > exp) sessions.delete(token);
-    for (const [ip, rec] of loginFails) if (rec.until && now > rec.until + LOGIN_LOCK_MS) loginFails.delete(ip);
 }, 10 * 60 * 1000);
 pruneTimer.unref?.();
 
@@ -2034,23 +2100,32 @@ async function handleRelay(request, response) {
 }
 
 async function handleLogin(request, response) {
-    const ip = request.socket?.remoteAddress || 'unknown';
-    const rec = loginFails.get(ip);
-    if (rec && rec.count >= LOGIN_MAX_FAILS && Date.now() < rec.until) {
-        const sec = Math.ceil((rec.until - Date.now()) / 1000);
+    const ip = ipOf(request);
+    // ① 先看是否已被锁（全局冻结优先报出来 —— 它连正常用户一起挡，用户需要知道原因）
+    const st = loginGuard.status(ip);
+    if (st.blocked) {
         request.resume(); // 丢弃请求体，避免客户端连接被重置
-        return jsonResponse(response, 429, { ok: false, message: '尝试次数过多，请 ' + sec + ' 秒后再试' });
+        const scopeMsg = st.scope === 'global'
+            ? '失败次数过多，登录已临时冻结'
+            : '尝试次数过多';
+        return jsonResponse(response, 429, {
+            ok: false,
+            retryAfterSec: st.retryAfterSec,
+            message: scopeMsg + '，请 ' + st.retryAfterSec + ' 秒后再试',
+        }, { 'Retry-After': String(st.retryAfterSec) });
     }
     let body;
     try { body = await readJsonBody(request); } catch { return jsonResponse(response, 400, { ok: false, message: '请求无效' }); }
     if (!(await verifyPassword(body.password || ''))) {
-        // 上一轮锁定已过期时重新计数，否则累计次数会永远停在高位
-        const expired = !rec || Date.now() > rec.until;
-        const count = expired ? 1 : rec.count + 1;
-        loginFails.set(ip, { count, until: Date.now() + LOGIN_LOCK_MS });
+        const r = loginGuard.fail(ip);
+        // 失败日志：爆破时这是唯一的现场记录（谁在试、锁了多久）
+        const lockNote = r.lockMs > 0
+            ? `，已锁定 ${Math.ceil(r.lockMs / 1000)} 秒`
+            : `（第 ${r.count} 次）`;
+        console.warn('[鉴权] 密码错误 · ' + ip + lockNote + (r.globalLocked ? ' · 触发全局冻结' : ''));
         return jsonResponse(response, 401, { ok: false, message: '密码不正确' });
     }
-    loginFails.delete(ip);
+    loginGuard.succeed(ip);
     const token = randomBytes(32).toString('hex');
     sessions.set(token, Date.now() + SESSION_TTL_MS);
     jsonResponse(response, 200, { ok: true }, {
@@ -2524,11 +2599,23 @@ const requestHandler = async (request, response) => {
             let body;
             try { body = await readJsonBody(request); } catch { return jsonResponse(response, 400, { ok: false, message: '请求无效' }); }
             const next = String(body.next || '');
-            if (next.length < 6) return jsonResponse(response, 400, { ok: false, message: '新密码至少 6 位' });
-            if (next.length > 128) return jsonResponse(response, 400, { ok: false, message: '新密码过长' });
+            // ★ 强度校验：密码是"能不能在这台电脑上执行命令"的唯一那道门。
+            //   旧规则只要 6 位，可以设成 123456 —— 在跑得动 scrypt 的机器上离线爆破是秒级。
+            //   规则与界面提示见 server/auth-guard.mjs 的 validatePasswordStrength。
+            const strength = validatePasswordStrength(next);
+            if (!strength.ok) {
+                return jsonResponse(response, 400, { ok: false, message: strength.message });
+            }
             await setPassword(next);
+            // 改密码后把登录失败记录一并清掉：旧密码攒下的锁定不该连累新密码，
+            // 否则用户刚设完强密码却发现自己的手机还被锁着。
+            loginGuard.reset();
             console.log('[鉴权] 访问密码已更新（局域网设备需重新登录）');
-            return jsonResponse(response, 200, { ok: true, message: '访问密码已更新，局域网设备需要重新登录' });
+            return jsonResponse(response, 200, {
+                ok: true,
+                message: '访问密码已更新，局域网设备需要重新登录',
+                minLength: PWD_MIN_LEN,
+            });
         }
 
         // API：上传模型
@@ -2636,37 +2723,47 @@ const requestHandler = async (request, response) => {
         }
 
         // API：AI Agent 文件操作（权限模式：app=仅应用文件夹；computer=允许操作电脑）
-        const isLocal = isLocalRequest(request);
+        //
+        // ★ privileged = 本机（免密管理员）**或已登录的局域网设备**。
+        //   放开局域网是本轮的刻意改动：登录之后的设备与本机同等能力（文件 + 命令）。
+        //   相应地，密码强度与登录防爆破成了这套权限模型的必要组成（见 auth-guard.mjs）。
+        //   注意能走到这里的请求必然已过上面的 isAuthenticated 闸门，
+        //   所以 privileged 实际等价于"已认证"。
+        const privileged = hasComputerGrant(request);
         if (pathname === '/api/agent/roots' && request.method === 'GET') {
             // 把「桌面/文档/下载…到底在哪」告诉前端 —— 用户可以把桌面移动到任意位置，
             // 让 AI 按惯例猜 C:\Users\<用户名>\Desktop 是会猜错的（实测踩过）。
             const { roots } = resolveShellFolders();
-            const visible = (isLocal && url.searchParams.get('permission') === 'computer')
-                ? roots
-                : roots.map(r => ({ ...r, path: undefined })); // 非本机不泄露宿主机的真实路径
+            // 只有**真正拿到 computer 权限**的请求才看得到真实路径。
+            // 已登录但用 app 模式的设备拿不到（与"app 模式看不见 web/ 之外"语义一致）。
+            const full = privileged && url.searchParams.get('permission') === 'computer';
+            const visible = full ? roots : roots.map(r => ({ ...r, path: undefined }));
             return jsonResponse(response, 200, { ok: true, platform: process.platform, roots: visible });
         }
         if (pathname === '/api/agent/ls' && request.method === 'GET') {
-            return await agentLs(url.searchParams, response, isLocal);
+            return await agentLs(url.searchParams, response, privileged);
         }
         if (pathname === '/api/agent/read' && request.method === 'GET') {
-            return await agentRead(url.searchParams, response, isLocal);
+            return await agentRead(url.searchParams, response, privileged);
         }
         if (pathname === '/api/agent/write' && request.method === 'POST') {
-            return await agentWrite(request, response, isLocal);
+            return await agentWrite(request, response, privileged);
         }
         // 电脑命令执行（全权限模式）。危险命令由服务端强制要求 approved（见 agentExec）。
         if (pathname === '/api/agent/exec' && request.method === 'POST') {
-            return await agentExec(request, response, isLocal);
+            return await agentExec(request, response, privileged);
         }
         // 看电脑在干什么（前台窗口 + 进程）—— 供桌宠让 AI"知道你在做什么"并主动搭话。
         //
-        // ★ 仅本机：这是"用户在看什么"的隐私数据，绝不能经局域网泄露。
-        //   即使对方有访问密码也不该给 —— 密码保护的是"能聊天"，
-        //   不是"能窥探宿主机在跑什么"。
+        // ★ 本轮改为：**已登录的局域网设备也可以读**（按用户要求一并放开）。
+        //
+        //   这是"用户在看什么"的隐私数据（前台窗口标题与可见文本、进程列表），
+        //   放开等于把它交给了每一个拿到访问密码的设备。仍然拦住的只有"未登录"，
+        //   以及下面 certInfo 之外的情况 —— 也就是说**密码就是这道门**。
+        //   如果你不希望手机能看到电脑上开着什么窗口，把这里改回 isLocalRequest(request)。
         if (pathname === '/api/agent/activity' && request.method === 'GET') {
-            if (!isLocal) {
-                return jsonResponse(response, 403, { ok: false, message: '只有本机可以读取电脑活动状态' });
+            if (!privileged) {
+                return jsonResponse(response, 403, { ok: false, message: '需要登录后才能读取电脑活动状态' });
             }
             const force = url.searchParams.get('force') === '1';
             return jsonResponse(response, 200, activitySummaryCached(force));

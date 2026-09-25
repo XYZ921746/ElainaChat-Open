@@ -1789,9 +1789,9 @@
         #settingsOverlay *::after {
             box-sizing: border-box;
         }
-        #settingsPanel,
         #settingsContent,
         #settingsContent > section { min-width: 0; max-width: 100%; }
+        #settingsPanel { min-width: 0; }
         #settingsPanel .modal-input,
         #settingsPanel .modal-textarea,
         #settingsPanel select {
@@ -3758,7 +3758,31 @@
                                 <input type="radio" name="agentPermission" value="computer" class="accent-pink-500"> 💻 允许操作电脑（文件读写 + 执行命令，风险自担）
                             </label>
                         </div>
-                        <p class="text-[11px] text-indigo-300 leading-relaxed">限制模式：AI 只能读取/写入本应用文件夹（web/）内的文件，<b>不能执行任何命令</b>。允许模式：AI 可读写电脑上的任意路径，并可执行 PowerShell / cmd 命令（通过本地服务执行）——<b>危险命令（删除、改注册表、关机、下载并执行等）会在执行前弹窗请你确认，普通命令直接执行</b>。请仅在可信环境开启。</p>
+                        <p class="text-[11px] text-indigo-300 leading-relaxed mb-2">
+                            <b>限制模式</b>：AI 只能读写本应用文件夹（<code class="text-indigo-500">web/</code>）内的文件，
+                            <b>不能执行任何命令</b>；碰文件夹外的位置时会就那一次问你。
+                        </p>
+
+                        <!-- 全权限模式的后果说明。
+                             为什么要把后果摆在这里、而不是靠每次操作弹窗：
+                             全权限下 AI 每一步都问，用户会从"看清再决定"退化成"闭眼点允许"，
+                             最后那道闸等于没有。所以把判断前移到"要不要开这个模式"这一个点上，
+                             开了之后同一个对话内同类操作只问一次（删除/覆盖这类不可逆的），
+                             普通操作直接执行。 -->
+                        <div class="rounded-2xl border px-3 py-2.5" style="border-color:#fed7aa;background:rgba(255,247,237,.75)">
+                            <div class="text-[11px] font-semibold mb-1" style="color:#b45309">⚠️ 开启「允许操作电脑」意味着</div>
+                            <ul class="text-[11px] leading-relaxed space-y-1" style="color:#9a3412">
+                                <li>· AI 能读写这台电脑上<b>任意路径</b>的文件，并能执行 <code>PowerShell</code> / <code>cmd</code> 命令。</li>
+                                <li>· <b>能删除文件</b>（<code>del</code> / <code>Remove-Item</code> 等）、改注册表、关机、下载并执行网上的脚本。<b>这些操作不可撤销</b>。</li>
+                                <li>· <b>能覆盖已有文件</b>，原内容不会自动备份。</li>
+                                <li>· 保护措施：覆盖已有文件、以及删除/格式化这类危险命令，<b>每个对话首次会问你一次</b>，
+                                    同意后该对话内不再重复询问；安全命令（列目录、<code>git status</code> 等）直接执行不打扰。</li>
+                                <li>· <b>局域网设备登录后同样能用这个模式</b>（与本机同等能力）。
+                                    所以访问密码是这台电脑的唯一防线 —— 请务必设强密码，别用默认的随手改个简单的。</li>
+                                <li>· <b>请只在你自己可控、且信任当前对话内容时开启</b>：AI 的指令来自模型输出，
+                                    而图片文字、长期记忆、插件都可能影响它。</li>
+                            </ul>
+                        </div>
                     </div>
 
                     <!-- 手机操作也从「高级」移到这里 —— 它同样属于"给 AI 开权限"，
@@ -3829,9 +3853,9 @@
                 <!-- ============ 高级：程序本身的设置 ============
                      这里放的是"应用怎么跑"，不是"AI 能做什么"（后者在「能力」）。
                      日志 / 我的数据 / 访问密码都属于这一层。 -->
-                <div id="tab-advanced" class="settings-tab-panel">>
-<section>
-                    <div class="mt-4 pt-3 border-t border-indigo-100" id="logSettingsSection">
+                <div id="tab-advanced" class="settings-tab-panel">
+                    <section>
+                    <div id="logSettingsSection">
                         <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> 日志</div>
                         <div class="text-[11px] text-indigo-400 mb-2 leading-relaxed">
                             控制<b>写入日志文件</b>的级别。启动窗口（终端）始终显示全部级别，不受这里影响 ——
@@ -3879,7 +3903,7 @@
                         <div class="text-xs font-semibold text-indigo-700 mb-1"><span class="text-fuchsia-500">✦</span> 访问密码（局域网）</div>
                         <div id="authStatusBox" class="text-[11px] text-indigo-400 mb-2 leading-relaxed">检测中…</div>
                         <div class="flex flex-wrap items-center gap-2">
-                            <input id="authNewPwd" type="password" class="modal-input text-sm w-40 py-1.5" placeholder="新密码（≥6位）" autocomplete="new-password">
+                            <input id="authNewPwd" type="password" class="modal-input text-sm w-40 py-1.5" placeholder="新密码（≥8位，含数字+大小写）" autocomplete="new-password">
                             <input id="authNewPwd2" type="password" class="modal-input text-sm w-40 py-1.5" placeholder="再输一次" autocomplete="new-password">
                             <button id="authChangeBtn" class="btn-secondary text-xs" type="button">修改访问密码</button>
                             <button id="authLogoutBtn" class="btn-secondary text-xs" type="button">退出登录</button>
@@ -3889,6 +3913,26 @@
                             手机/平板等局域网设备必须输入访问密码才能进入。密码显示在服务端启动的 cmd 窗口里，
                             改过之后控制台不再显示明文。
                         </p>
+
+                        <!-- 密码强度与防爆破说明。
+                             为什么必须把这段放在这里：本轮把「操作电脑」的权限给了
+                             已登录的局域网设备（含执行命令），**密码从此就是唯一那道门**。
+                             用户需要知道这个性质，才会认真对待自己设的密码。 -->
+                        <div class="rounded-2xl border px-3 py-2.5 mt-2" style="border-color:#fed7aa;background:rgba(255,247,237,.75)">
+                            <div class="text-[11px] font-semibold mb-1" style="color:#b45309">⚠️ 关于这个密码的分量</div>
+                            <ul class="text-[11px] leading-relaxed space-y-1" style="color:#9a3412">
+                                <li>· 登录后的设备<b>与本机同等能力</b>：可读写任意文件、可执行 PowerShell / cmd 命令。
+                                    所以这个密码是<b>整台电脑的钥匙</b>，不只是"聊天室的钥匙"。</li>
+                                <li>· 强度要求：<b>至少 8 位，且同时含数字、小写字母、大写字母</b>；
+                                    常见的弱口令、键盘顺子（<code>qwerty</code>）、以及"弱口令+数字尾巴"都会被拒。</li>
+                                <li>· 已内置防爆破：密码输错会<b>逐次延长锁定</b>（30 秒起，每次翻倍，最长 1 小时），
+                                    且失败次数<b>只在登录成功后才清零</b> —— 持续攻击只会越锁越久。</li>
+                                <li>· 另有全局限流：即使攻击者不断更换 IP，失败次数累计到阈值后
+                                    <b>全部登录会临时冻结</b>（正常设备也会被挡，这是全局限流固有的代价）。</li>
+                                <li>· 初始随机密码是 12 位（字符集排除了 0/O、1/l/I 这类易混字符），强度足够；
+                                    若要改，请按上面的规则来。</li>
+                            </ul>
+                        </div>
                     </div>
                 </section>
                 </div><!-- /tab-advanced -->
@@ -4118,6 +4162,7 @@
          不是加载时，所以顺序其实不敏感；但放在 core 之后更符合"core 定义出口、
          本文件提供能力"的依赖方向，也方便以后有人把它改成加载时就取。 -->
     <script src="/js/chat-stream.js"></script>
+    <script src="/js/agent-tags.js"></script>
     <script src="/js/app-02-data.js"></script>
     <script src="/js/app-03-agent.js"></script>
     <script src="/js/app-04-ui.js"></script>

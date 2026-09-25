@@ -1442,43 +1442,32 @@
     '青绿': '#0e8388',
   };
 
-  // Agent 操作：[操作:xxx] —— 触发应用功能（打开/关闭视频通话、整理记忆等）
-  function handleAgentOperation(name) {
-    const v = String(name || '').trim();
-    if (!v) return;
-    if (/打开|开始|进入/.test(v) && /视频通话|通话|live2d/i.test(v)) { window.agentActions?.openVideoCall(); return; }
-    if (/关闭|结束|挂断/.test(v) && /视频通话|通话|live2d/i.test(v)) { window.agentActions?.closeVideoCall(); return; }
-    if (/整理记忆|记忆整理/.test(v)) { window.agentActions?.organizeMemory(); return; }
-    // 手机操作（[操作:手机点击 500 800] 等）：转发主应用，由 Agent 运行时统一做
-    // 「停止检查 + 敏感操作授权」，结果回填对话。执行层是否可用由主应用判断。
-    if (/^(手机|设备)/.test(v)) {
-      if (window.agentActions?.agentPhoneOperation) window.agentActions.agentPhoneOperation(v);
-      else console.warn('[Live2D] 主应用手机操作不可用');
-      return;
-    }
-    // 电脑命令（[操作:电脑命令 dir]）：权限双模式 + 危险命令授权都在主应用里。
-    //
-    // ★ 必须放在**手机操作之前**：手机分支判据是 `/^(手机|设备)/`，不冲突；
-    //   但文件分支的判据里有「列出文件/查看文件」这类宽泛词，而电脑命令的正文
-    //   本身就可能含这些词（例如 `[操作:电脑命令 dir]` 不会命中，但
-    //   `[操作:电脑命令 git status]` 这类要稳）。用锚定前缀 `^电脑命令` 判定，
-    //   并放在文件分支前面，避免命令正文被当成文件操作标签吃掉。
-    if (/^(电脑命令|执行命令|运行命令|电脑执行)/.test(v)) {
-      if (window.agentActions?.agentCommandOperation) window.agentActions.agentCommandOperation(v);
-      else console.warn('[Live2D] 主应用电脑命令不可用');
-      return;
-    }
-    // 文件操作（权限模式由设置控制，转发主应用执行并把结果回填对话）
-    if (/列出文件|列出目录|查看文件夹|查看文件|读取文件|保存文件|写入文件|创建文件|新建文件/.test(v)) {
-      if (window.agentActions?.agentFileOperation) window.agentActions.agentFileOperation(v);
-      else console.warn('[Live2D] 主应用文件操作不可用');
-      return;
-    }
-    if (/隐藏水印|去掉水印|水印隐藏|去水印/.test(v)) { if (!watermarkOn) void toggleWatermark(); return; }
-    if (/显示水印|恢复水印|水印显示/.test(v)) { if (watermarkOn) void toggleWatermark(); return; }
-    if (/静音|静音AI/.test(v) && !/取消|解除/.test(v)) { if (!aiVoiceMuted) toggleMute(); return; }
-    if (/取消静音|解除静音|打开声音|恢复声音/.test(v)) { if (aiVoiceMuted) toggleMute(); return; }
-    console.warn('[Live2D] 未知操作:', v);
+  // ── Live2D 独有的两个操作：水印 / 静音 ──────────────────────────────────
+  //
+  // 它们只有 Live2D 知道怎么执行（要动模型参数、要静 TTS），
+  // 所以注册进宿主的操作分发链 —— 而不是像旧实现那样由本文件持有整条链。
+  //
+  // 判据刻意跟"宿主不认识的未知操作"划清界限：宿主先问扩展处理器，
+  // 都不认才轮到它自己的分支，最后才 warn「未知操作」。
+  if (window.ElainaTags && typeof window.ElainaTags.registerOperationHandler === 'function') {
+    window.ElainaTags.registerOperationHandler(
+      (v) => /隐藏水印|去掉水印|水印隐藏|去水印/.test(v) || /显示水印|恢复水印|水印显示/.test(v),
+      (v) => {
+        if (/隐藏水印|去掉水印|水印隐藏|去水印/.test(v)) { if (!watermarkOn) void toggleWatermark(); return; }
+        if (watermarkOn) void toggleWatermark();
+      }
+    );
+    window.ElainaTags.registerOperationHandler(
+      (v) => (/静音|静音AI/.test(v) && !/取消|解除/.test(v)) || /取消静音|解除静音|打开声音|恢复声音/.test(v),
+      (v) => {
+        if (/取消静音|解除静音|打开声音|恢复声音/.test(v)) { if (aiVoiceMuted) toggleMute(); return; }
+        if (!aiVoiceMuted) toggleMute();
+      }
+    );
+  } else {
+    // 宿主标签模块没加载（不该发生：它在 app-* 里先于本文件）。
+    // 明确记一笔，免得"AI 说隐藏水印但没反应"变成无从排查的问题。
+    console.warn('[Live2D] ElainaTags 不可用，水印/静音操作将无法通过标签触发');
   }
 
   // 取同类标签里最后一个。
@@ -1492,8 +1481,15 @@
     return v;
   }
 
-  // 统一入口：解析回复中的标签并驱动模型（表情/动作/情绪/位置/大小/背景/操作）
-  function driveText(text) {
+  /**
+   * 只驱动**表现**：表情 / 动作 / 情绪 / 位置 / 大小 / 背景。
+   *
+   * ★ 与旧 driveText 的区别（解耦的核心）：
+   *   旧函数末尾会遍历 [操作:…] 标签并调 handleAgentOperation —— 那是宿主的事。
+   *   现在操作标签由 ElainaTags.drive 先分发，发完了才把文本交到这里做表现。
+   *   所以本函数**不再碰** [操作:]，Live2D 卸掉也不会影响 Agent 能力。
+   */
+  function drivePresentation(text) {
     if (!text) return;
     const t = String(text);
 
@@ -1504,9 +1500,9 @@
 
     // 显式情绪优先。
     // ⚠️ 这里以前是 `driveEmotion(...); return;`，会把下面所有标签一起跳过——
-    // 而系统提示词要求 AI 每条回复都带一个情绪标签，结果 [位置]/[大小]/[背景]/[操作]
-    // （文件操作、打开通话、静音、隐藏水印）几乎永远不会被执行，且因为标签不显示给用户，
-    // 从表面完全看不出来。现在只把「跳过自动推断」这一件事交给这个标志，不再提前返回。
+    // 而系统提示词要求 AI 每条回复都带一个情绪标签，结果 [位置]/[大小]/[背景]
+    // 几乎永远不会被执行，且因为标签不显示给用户，从表面完全看不出来。
+    // 现在只把「跳过自动推断」这一件事交给这个标志，不再提前返回。
     const emoName = lastTagValue(t, '情绪');
     const explicitEmotion = emoName ? (driveEmotion(emoName) !== false) : false;
 
@@ -1518,12 +1514,6 @@
     if (bg) {
       const value = BG_PRESETS[bg] || bg;
       if (window.Live2DCall?.setBackground) window.Live2DCall.setBackground(value);
-    }
-    // 操作标签：支持一条回复里出现多个（例如同时「打开视频通话」+「隐藏水印」）
-    const ops = t.match(/\[操作[:：]\s*[^\]]+\]/g) || [];
-    for (const raw of ops) {
-      const inner = raw.replace(/^\[操作[:：]\s*/, '').replace(/\]$/, '').trim();
-      if (inner) handleAgentOperation(inner);
     }
 
     // 没有显式表情、也没有识别成功的显式情绪时，才按触发词自动推断
@@ -1622,7 +1612,6 @@
     speakEnd() { stopMouth(); },
     // 供主应用查询静音状态：静音 = 不播放 AI 语音（[操作:静音]）
     isVoiceMuted() { return aiVoiceMuted; },
-    drive: driveText,
     // 当前模型可用表情/动作（只给文件名，不带目录与扩展名），供主应用注入提示词让 AI 决策。
     // 清单内部存的是「相对模型根目录的路径」，这里剥成 AI 认识的名字
     // （AI 该说"脸红"，而不是"exp/脸红.exp3.json"）；同名文件去重，避免提示词里出现重复项。
@@ -1642,18 +1631,31 @@
     },
     // 当前模型是否带水印开关（供提示词提示 AI 用 [操作:隐藏水印]）
     hasWatermark() { return Boolean(watermarkExp); },
+
+    // ---- 标签协议：只保留"表现"部分 ----
+    //
+    // ★ 这里的变化（解耦）：
+    //   旧实现在本文件里持有 stripTags() 与 drive() → handleAgentOperation()，
+    //   而 handleAgentOperation 是**全部 [操作:] 标签的唯一分发器** ——
+    //   文件操作、电脑命令、手机操作、整理记忆全在里面。
+    //   宿主各处又都写成 `if (window.Live2DCall) { ... }`，
+    //   于是"Live2D 不在"就等于"整个 Agent 系统失效 + 标签漏出来给用户看"。
+    //
+    //   现在：剥离与操作分发归宿主（web/js/agent-tags.js），
+    //   本文件只提供**表现**（表情/动作/情绪/位置/大小/背景），
+    //   并通过 registerOperationHandler 把 Live2D 独有的两个操作
+    //   （水印 / 静音）追加进宿主的分发链。
+    //
+    //   下面这两个旧名保留为薄壳，只为不打断可能的外部调用；
+    //   新代码请用 ElainaTags.strip / ElainaTags.drive。
     stripTags(text) {
-      return String(text || '')
-        .replace(/\[表情[:：][^\]]*\]/g, '')
-        .replace(/\[动作[:：][^\]]*\]/g, '')
-        .replace(/\[情绪[:：][^\]]*\]/g, '')
-        .replace(/\[位置[:：][^\]]*\]/g, '')
-        .replace(/\[大小[:：][^\]]*\]/g, '')
-        .replace(/\[背景[:：][^\]]*\]/g, '')
-        .replace(/\[操作[:：][^\]]*\]/g, '')
-        .replace(/\[任务[:：][^\]]*\]/g, '')
-        .trim();
+      return window.ElainaTags ? window.ElainaTags.strip(text) : String(text || '');
     },
+    drive(text) {
+      if (window.ElainaTags) window.ElainaTags.drive(text);
+    },
+    drivePresentation: drivePresentation,
+
     isOpen() { return isOpen; },
     // 真实语音音量 → 嘴型（VAD 简化）：0~1 音量；传 null/0 恢复正弦波并停嘴
     setVoiceEnergy(level) {

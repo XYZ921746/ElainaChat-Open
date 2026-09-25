@@ -29,6 +29,10 @@ import { readFrontend } from './frontend-sources.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const html = readFrontend();
 const live2d = readFileSync(path.join(root, 'web', 'live2d-video.js'), 'utf8');
+// 标签分发已从 live2d-video.js 移到宿主自有模块（见 web/js/agent-tags.js 的说明）：
+// Live2D 是可卸的 mod，不能让它持有全部 [操作:] 的分发权 —— 否则卸掉它
+// 就等于 Agent 系统（文件/命令/手机）全体失效。
+const tags = readFileSync(path.join(root, 'web', 'js', 'agent-tags.js'), 'utf8');
 
 let pass = 0;
 const failures = [];
@@ -147,10 +151,14 @@ ok(/agentPhoneOperation\(raw\)/.test(html), 'agentActions 上有 agentPhoneOpera
 ok(/async function runAgentPhoneOperation\(/.test(html), 'runAgentPhoneOperation 存在');
 // 判据行与调用行是分开的两句：`if (window.agentActions?.agentPhoneOperation)` 之后
 // 才 `window.agentActions.agentPhoneOperation(v)` —— 断言要认这个真实形状。
-ok(/window\.agentActions\?\.agentPhoneOperation/.test(live2d)
-    && /window\.agentActions\.agentPhoneOperation\(v\)/.test(live2d),
-    'live2d-video.js 会把 [操作:手机…] 转发给主应用');
-ok(/\^\(手机\|设备\)/.test(live2d), 'live2d-video.js 的转发判据认得「手机」前缀');
+//
+// ★ 分发位置已变：从 live2d-video.js 移到 web/js/agent-tags.js。
+//   断言新位置，并确认 Live2D 那侧**不再**持有手机分支（解耦的判据）。
+ok(/agentPhoneOperation/.test(tags) && /callAction\('agentPhoneOperation'/.test(tags),
+    'agent-tags.js 会把 [操作:手机…] 转发给主应用');
+ok(/\^\(手机\|设备\)/.test(tags), 'agent-tags.js 的转发判据认得「手机」前缀');
+ok(!/\^\(手机\|设备\)/.test(live2d),
+    '★ live2d-video.js 不再持有手机分发（Live2D 卸掉不影响手机操作）');
 ok(/ElainaDevice/.test(html) && /@CapacitorPlugin\(name = "ElainaDevice"\)/.test(
     readFileSync(path.join(root, '..', 'android-app', 'android', 'app', 'src', 'main', 'java',
         'com', 'elainachat', 'opensource', 'ElainaShellPlugin.java'), 'utf8')),

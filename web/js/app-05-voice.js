@@ -1377,10 +1377,16 @@ async function handleUserInput(message, conversation) {
         // 新一批 Agent 动作开始：解除上一批留下的「已停止」状态
         // （用户的停止只作用于当次操作；AI 下一次回复是新批次，应重新可用）
         if (window.agentRuntime) window.agentRuntime.beginBatch();
-        // Live2D：解析 AI 文本中的 [表情:xxx] / [动作:xxx] 标签并触发；显示/朗读用剥离后的文本
-        if (window.Live2DCall) {
-            window.Live2DCall.drive(response);
-            const stripped = window.Live2DCall.stripTags(response);
+        // 标签协议：解析 AI 回复中的 [操作:…] / [表情:…] 等标签。
+        //
+        // ★ 走宿主的 ElainaTags，**不再**经过 window.Live2DCall ——
+        //   旧写法是 `if (window.Live2DCall) { drive(); stripTags(); }`，
+        //   而 drive() 是全部 [操作:] 标签的唯一分发器（文件/命令/手机/记忆）。
+        //   于是"Live2D 不在"就等于"整个 Agent 系统失效 + 标签漏给用户看"。
+        //   现在剥离与分发都归宿主，Live2D 只提供表现（表情/动作/口型）。
+        if (window.ElainaTags) {
+            window.ElainaTags.drive(response);
+            const stripped = window.ElainaTags.strip(response);
             if (stripped !== response) aiMessage.text = stripped;
         }
         // 定时任务：AI 回复中的 [任务:...] 标签 → 创建未来任务
