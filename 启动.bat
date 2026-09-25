@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title ElainaChat Open Server
+title ElainaChat Mod Server
 cd /d "%~dp0"
 where node >nul 2>nul
 if errorlevel 1 (

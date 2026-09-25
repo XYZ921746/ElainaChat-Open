@@ -2139,7 +2139,7 @@ function loginPageHtml() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ElainaChat Open · 需要访问密码</title>
+<title>ElainaChat Mod · 需要访问密码</title>
 <style>
   /* 配色取自应用实际渲染值（pixso 主题）：
      橄榄绿画布 #a8b974 / 白色面板 / 米色输入框 #f8f5f2 / 绿色药丸按钮 #a7bb6c / 棕色文字 #4c3123 */
@@ -2191,7 +2191,7 @@ function loginPageHtml() {
 </head>
 <body>
   <div class="card">
-    <div class="eyebrow">ElainaChat Open · 局域网访问</div>
+    <div class="eyebrow">ElainaChat Mod · 局域网访问</div>
     <h1>需要访问密码</h1>
     <p class="sub">这台设备不是本机，请输入访问密码后进入。</p>
     <form id="loginForm">

@@ -15,7 +15,7 @@
 // ── 用法 ─────────────────────────────────────────────────────────────────
 //
 //   node scripts/upload-release.mjs                    # 上传 dist/ 下全部 zip
-//   node scripts/upload-release.mjs --tag v1.2.0       # 指定 tag
+//   node scripts/upload-release.mjs --tag v1.3.0       # 指定 tag
 //   node scripts/upload-release.mjs --dry-run          # 只看会传什么
 //   node scripts/upload-release.mjs --repo owner/name  # 换仓库
 //
@@ -28,13 +28,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DEFAULT_REPO = 'XYZ921746/ElainaChat-Open';
+const DEFAULT_REPO = 'XYZ921746/ElainaChat-mod';
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
 const repoArg = args[args.indexOf('--repo') + 1];
 const repo = args.includes('--repo') ? repoArg : DEFAULT_REPO;
-const tag = args.includes('--tag') ? args[args.indexOf('--tag') + 1] : 'v1.2.0-open';
+const tag = args.includes('--tag') ? args[args.indexOf('--tag') + 1] : 'v1.3.0-mod';
 
 function ghToken() {
     try {

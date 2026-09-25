@@ -1,30 +1,64 @@
-# ElainaChat Open（二次开发改版）
+# ElainaChat Mod
 
-[![Version](https://img.shields.io/badge/version-1.2.0--open-blue)](https://github.com/XYZ921746/ElainaChat-Open/releases/latest)
+[![Version](https://img.shields.io/badge/version-1.3.0--mod-blue)](https://github.com/XYZ921746/ElainaChat-mod/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Web%20%7C%20Android-lightgrey)](https://github.com/XYZ921746/ElainaChat-Open/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Web%20%7C%20Android-lightgrey)](https://github.com/XYZ921746/ElainaChat-mod/releases/latest)
+[![Mods](https://img.shields.io/badge/%E6%89%A9%E5%B1%95%E5%8C%85-%E5%8F%AF%E8%A3%85%E5%8F%AF%E5%8D%B8-orange)](https://github.com/XYZ921746/ElainaChat-mod/releases/latest)
 
-一个面向角色陪伴与旅行叙事的开源 AI 角色聊天应用。通过自带 API Key（BYOK）直连服务商，没有作者网关、没有共享套餐、没有内置密钥。
+一个**以插件（Mod）为核心**的开源 AI 角色聊天应用。程序本体只有文字聊天 + Agent 能力，
+角色怎么呈现、界面长什么样，全都交给**可装可卸的扩展包**决定。
 
-本仓库基于 [shuixinggangzheng/ElainaChat-Open](https://github.com/shuixinggangzheng/ElainaChat-Open)（MIT 协议）二次开发。改造方向集中在三件事：**让角色更有存在感**、**让手机也能正常用**、**出问题能查得出来**。
+通过自带 API Key（BYOK）直连服务商 —— **没有作者网关、没有共享套餐、没有内置密钥**。
 
-> 本项目目前处于测试状态，可能存在未知问题。完整改造记录、踩坑与验证数据见 [`开发文档.md`](开发文档.md)。
+本仓库基于 [shuixinggangzheng/ElainaChat-Open](https://github.com/shuixinggangzheng/ElainaChat-Open)（MIT 协议）二次开发。
+主线是**让「扩展」成为一等公民**：新增一种呈现方式不需要改宿主代码，
+卸掉一个扩展包不会拖垮主程序，也不该让其它能力跟着失效。
+
+> 本项目处于测试状态，可能存在未知问题。完整改造记录、踩坑与验证数据见 [`开发文档.md`](开发文档.md)。
+
+---
+
+## 为什么是「Mod 优先」
+
+大多数聊天应用把花哨功能**焊死在主程序里** —— 你不用也得装着，卸不掉，坏了还会拖垮整个应用。
+本项目的取舍相反：
+
+| | 传统做法 | 本项目 |
+| --- | --- | --- |
+| 新功能怎么加 | 改宿主代码 | **加一个目录**（`web/mods/<名字>/`） |
+| 不想要怎么办 | 忍着，或自己改代码 | **关掉开关 / 删掉目录** |
+| 插件崩了 | 整个应用白屏 | **只标记那个插件出错**，其余照常 |
+| 未启用的插件 | 照样加载、占内存 | **不注入脚本、不占内存** |
+| 依赖缺失 | 静默失败，界面缺一块 | **设置里标「缺依赖」+ 控制台日志** |
+| 打包体积 | 全都要带上 | **纯净版约 10.8 MB**，资源按需下载 |
+
+支撑这套说法的是具体机制，不是口号：
+
+- **清单驱动**：加载器只认 `manifest.json`，**不硬编码任何插件名**
+- **失败隔离**：插件的加载与初始化都包在 `try/catch` 里，一个坏 mod 绝不白屏整个应用
+- **依赖声明 + 环形检测**：`manifest.after` 做拓扑排序，缺依赖会**明确报出来**
+  （「装了 galgame 却没有立绘」这类无声故障是重点防的对象）
+- **能力解耦**：Agent 的标签协议（文件 / 命令 / 手机操作）**不寄生在任何扩展包里** ——
+  卸掉 Live2D 不会让 Agent 系统跟着失效（这条是踩过坑才补上的，见「AI 标签协议」一章）
+
+---
 
 ## 下载
 
-**安卓版**：到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest) 下载
-`ElainaChat-Open-v1.2.0-open-lite-debug.apk`（**10.8 MB**），
+**安卓版**：到 [Releases](https://github.com/XYZ921746/ElainaChat-mod/releases/latest) 下载
+`ElainaChat-mod-v1.3.0-lite-debug.apk`（**约 10.8 MB**），
 在手机上允许「安装未知来源应用」后安装。
 
-> **这个 APK 是"纯净版"** —— 只含程序本体，**不含 Galgame 界面、桌宠与 Live2D 模型**。
-> 那些按需下载安装，见下方「[扩展包](#扩展包mod--插件)」。
-> 这样做的好处是安装包小（10.8 MB，含资源时是 33.6 MB），且不必为你用不到的资源买单。
+> **这个 APK 是「纯净版」** —— 只含程序本体 + 插件**代码**，
+> **不含 Galgame 界面、桌宠的图片素材与 Live2D 模型**。那些按需下载，见下方
+> 「[扩展包](#扩展包mod--插件)」。
+> 好处是安装包小（含资源时约 33.6 MB），且不必为你用不到的资源买单。
 
 **电脑版**：克隆本仓库，双击 `启动.bat` 即可（**零依赖、零构建**，只需已安装 Node.js ≥ 20）。
 
 ```bash
-git clone https://github.com/XYZ921746/ElainaChat-Open.git
-cd ElainaChat-Open
+git clone https://github.com/XYZ921746/ElainaChat-mod.git
+cd ElainaChat-mod
 # 双击 启动.bat，或：
 node web/serve.mjs
 ```
@@ -42,11 +76,11 @@ node web/serve.mjs
 
 ## 扩展包（Mod / 插件）
 
-程序本体只有文字聊天。**Galgame 界面、桌宠、Live2D 模型都是扩展包**，按需安装。
+程序本体只有**文字聊天 + Agent 能力**。**Galgame 界面、桌宠、Live2D 模型都是扩展包**，按需安装。
 
 ### 包含哪些
 
-都在同一个 [Releases 页面](https://github.com/XYZ921746/ElainaChat-Open/releases/latest)，
+都在同一个 [Releases 页面](https://github.com/XYZ921746/ElainaChat-mod/releases/latest)，
 **每个包一个直链，按需下载**（不用下整个大包再解压）：
 
 | 扩展包 | 内容 | 大小 | 说明 |
@@ -67,7 +101,7 @@ node web/serve.mjs
 
 **方式一：应用内上传（推荐，手机也能用）**
 
-1. 到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest) 下载需要的 `.zip`（**不要解压**）
+1. 到 [Releases](https://github.com/XYZ921746/ElainaChat-mod/releases/latest) 下载需要的 `.zip`（**不要解压**）
 2. 打开程序 → **设置 → 插件 → 上传安装** → 选中那个 zip
 3. 安装完在列表里**打开对应的开关**（插件默认关闭）
 
@@ -93,9 +127,44 @@ node web/serve.mjs
 > **所有插件默认关闭**，装完要手动开。这是刻意的 —— 插件会改动界面，
 > 不该在你不知情时生效。
 
+### 自己写一个插件
+
+插件就是一个目录 + 一份清单。宿主**不认识任何具体插件**，所以加功能不用碰主程序。
+
+```text
+web/mods/my-mod/
+├─ manifest.json     # 必需：id / name / version / entry / styles / defaultEnabled / after
+└─ index.js          # 入口：用 ElainaMods.register(id, factory) 注册
+```
+
+```js
+// index.js —— 拿到宿主给的 api，别直接摸宿主内部
+ElainaMods.register('my-mod', (host) => {
+    host.log('已加载');
+
+    // 往 system 提示词里追加一段（插件影响模型行为的唯一入口）
+    host.setPromptHint('当用户提到「天气」时，用 <weather>…</weather> 包裹城市名。');
+
+    // 读当前对话 / 发消息（走宿主既有链路，记忆、续跑、停止都自动生效）
+    host.on('reply-done', (text) => host.log('AI 回复了', String(text).slice(0, 40)));
+
+    return {
+        // 用户在插件列表里关掉它时调用 —— 把界面收起来
+        setEnabled(on) { /* ... */ },
+    };
+});
+```
+
+宿主 API 是一张**收窄的清单**（不是把 `window` 丢给插件）—— 这样宿主才能重构内部实现
+而不弄坏插件。完整清单见 `web/js/mods.js` 的 `createHostApi()`：
+`getConversation` / `getMessages` / `getUiMode` / `sendUserMessage` / `renderText` /
+`injectStyle` / `setPromptHint` / `on` / `emit` / `has`。
+
+> **安装插件 = 信任它的代码**（它在页面同源环境里运行）。请只装自己信得过的。
+
 ### 为什么扩展包不放在仓库里
 
-这些包合计 **22.6 MB，其中 87% 是图片**（PNG / JPG / moc3）。
+这些包合计 **约 22.6 MB，其中 87% 是图片**（PNG / JPG / moc3）。
 Git 对二进制**无法有效增量压缩** —— 改一张立绘，历史里就多存一整份，
 clone 会越来越慢。所以：
 
@@ -132,7 +201,7 @@ node scripts/pack-assets.mjs --list   # 先看看会打什么
 | 访问控制 | 无 | 局域网访问密码 + CSRF 防护 + Host 白名单（防 DNS rebinding） |
 | 问题排查 | 无 | 请求日志 + 浏览器报错转发到启动窗口；**日志按 AstrBot 格式落盘**（五级 `DBUG/INFO/WARN/ERRO/CRIT`，级别可在设置里调），完整记录对话内容与上游报错原因 |
 | 界面外观 | 固定一套配色 | **6 套主题**（粉紫 / iOS 蓝 / 陶土橙 / 鼠尾草 / 樱花桃 / **自定义 DIY**）+ 深色模式（含「跟随系统」） |
-| 扩展性 | 无 | **动态插件系统**：Galgame 界面、桌宠、Live2D 模型都是可装可卸的扩展包，坏插件不会拖垮主程序 |
+| 扩展性 | 无 | **动态插件系统**：Galgame 界面、桌宠、Live2D 模型都是可装可卸的扩展包，坏插件不会拖垮主程序；**Agent 能力不寄生在插件里**（卸掉 Live2D 不影响文件/命令/手机操作） |
 | 消息渲染 | 纯文本 | **Markdown + LaTeX**（表格、代码块、公式） |
 | 设置界面 | 单页 | 拆成 6 个分栏（角色 / 对话 / 语音 / 视觉 / Live2D / 高级） |
 | 手机能力 | 无 | **AI 手机操作**：点击 / 滑动 / 输入 / 读控件树 / 截图，四种实现方式（无障碍 / Shizuku / Root / 模块），运行时可停止、敏感操作分级授权 |
@@ -145,6 +214,60 @@ node scripts/pack-assets.mjs --list   # 先看看会打什么
 ---
 
 ## 更新日志
+
+### v1.3.0-mod
+
+**Agent 的标签协议不再寄生在 Live2D 里（架构）**
+
+- 修掉一个**能力寄生**问题：AI 标签的剥离（`stripTags`）与分发（`drive` →
+  `handleAgentOperation`）原先整个长在 `web/live2d-video.js` 里，而它是
+  **全部 `[操作:…]` 标签的唯一分发器** —— 文件操作、电脑命令、手机操作、整理记忆全在里面。
+  宿主各处又都写成 `if (window.Live2DCall) { … }`，于是 **Live2D 一旦不在
+  （被卸掉 / 该文件加载失败），Agent 系统会整体失效，标签还会漏给用户看**。
+  这不是界面耦合，是能力寄生
+- 现拆到 `web/js/agent-tags.js`（**宿主自有**）：剥离与分发归宿主，
+  Live2D 只提供**表现**（表情 / 动作 / 情绪 / 位置 / 大小 / 背景 / 口型），
+  并通过 `registerOperationHandler` 追加它独有的**水印 / 静音**两个操作 ——
+  它可以**扩展**这条分发链，但不再**拥有**它
+- 顺带修掉 `Live2DCall` 对象里两个 `drive` 键重名（`driveText` 成了死引用）
+- 新增 `scripts/check-agent-tags.mjs`：用**故意不提供 `window.Live2DCall`** 的沙箱
+  证明解耦成立（剥离干净、操作照常分发、表现层缺失不抛异常）
+
+**权限边界：局域网设备登录后与本机同等能力**
+
+- 原先「允许操作电脑」只对 `127.0.0.1` 开放，局域网一律降级到「仅应用文件夹」。
+  现改为按**是否已认证**判定（本机免密 / 局域网登录），`/api/agent/activity` 一并放开
+- ⚠️ 相应地，**访问密码从「聊天室的钥匙」变成「整台电脑的钥匙」** ——
+  所以本次必须同时补上配套防护（见下一条）
+- 「看电脑在干什么」（前台窗口 / 进程）也放开给已登录设备
+
+**登录防爆破与密码强度（新增 `server/auth-guard.mjs`）**
+
+- **密码强度**：至少 8 位且同时含数字 / 小写 / 大写；另拒弱口令表、键盘顺子（`qwerty`）、
+  「弱口令 + 数字尾巴」、字符种类过少（如 `Aaa1aaaa`）
+- **三层防爆破**：单 IP 指数退避（30 秒起、每次翻倍、上限 1 小时）；
+  **计数只在成功时清零**（锁定到期不重置，持续攻击只会越锁越久）；
+  **全局限流**（换 IP 也绕不过 —— 局域网里换地址太容易）
+- 换掉旧的固定窗口（5 次 / 锁 60 秒）—— 那等于告诉攻击者「每 60 秒可以试 5 次」，
+  保持低频就能长期爆破
+- 如实说明的代价：**全局冻结可被利用做拒绝服务**（攻击者制造足够失败，
+  正常设备也登不进去），这是全局限流固有的取舍；冻结最长 5 分钟
+
+**Agent 文件操作：覆盖已有文件 = 修改，必须确认**
+
+- 旧实现是无条件 `writeFile` —— 目标已存在就**静默覆盖**，而提示词却写着
+  「AI 没有修改权限（仅可新建）」。这个落差有两个害处：模型可能拒绝合理请求，
+  也可能照做而用户毫无防备
+- 现在服务端补**覆盖闸门**（`needOverwrite`，**两种模式都拦**），提示词同步改成
+  「可以覆盖，但每个对话首次会确认一次」，两边对齐
+- **不可逆操作的确认粒度改为「每对话一次」**：旧行为每条危险命令都弹，
+  用户会退化成闭眼点允许，闸门反而失效；判断前移到「要不要开全权限」
+  （设置页列出后果清单 + 开启时确认一次）
+
+**其它修复**
+
+- 修掉「高级」设置栏首块多出的一条横线（从「记忆」时代残留 ——
+  v1.1.0 把记忆等块搬去「能力」栏后，日志升为首块但分隔线没删）
 
 ### v1.2.0-open
 
@@ -382,6 +505,30 @@ LLM 的回复里可以携带标签来驱动模型表现和应用功能，**这�
 | `[任务:每天 09:00 ...]` | 创建定时任务 |
 
 **跨模型自适应**：模型列表接口会返回每个模型可用的表情与动作文件名，系统提示词动态注入这份清单，AI 直接选用真实文件名。情绪词与语义键经过「语义映射 → 精确匹配 → 子串兜底」三级解析，换任何模型都自动适配。
+
+### 这套协议归宿主所有，不归 Live2D
+
+标签的**剥离**与 `[操作:…]` 的**分发**在 `web/js/agent-tags.js`（宿主自有），
+**不在** `live2d-video.js` 里。这不是洁癖，是踩过坑：
+
+原先这两件事整个长在 Live2D 那个文件里，而它是**全部 `[操作:…]` 标签的唯一分发器**
+（文件操作 / 电脑命令 / 手机操作 / 整理记忆都在其中）。宿主各处又都写成
+`if (window.Live2DCall) { drive(); stripTags(); }` —— 于是 **Live2D 一旦不在
+（卸掉、或该文件加载失败），Agent 系统会整体失效，标签还会漏给用户看见**。
+
+现在分工是：
+
+| 文件 | 职责 |
+| --- | --- |
+| `web/js/agent-tags.js` | 标签**剥离** + `[操作:…]` **分发**（宿主能力，永远可用） |
+| `web/live2d-video.js` | 只做**表现**：表情 / 动作 / 情绪 / 位置 / 大小 / 背景 / 口型 |
+
+Live2D 通过 `registerOperationHandler` 把**水印 / 静音**这两个它独有的操作
+**追加**进分发链 —— 它可以扩展这条链，但不再拥有它。表现层缺失时，
+`ElainaTags.drive()` 照常分发操作，只是跳过表现。
+
+`scripts/check-agent-tags.mjs` 用**故意不提供 `window.Live2DCall`** 的沙箱钉住这一点：
+剥离要干净、操作要照常分发、表现层缺失不许抛异常。
 
 ---
 
@@ -852,7 +999,7 @@ Windows 下也可以直接双击 `启动.bat`。
 启动后访问 `http://127.0.0.1:4173`，首次打开时填写所选 API 格式的 Key。
 
 > **clone 下来是"纯净版"**：只有文字聊天。Galgame 界面、桌宠、Live2D 模型都是
-> 扩展包，需要到 [Releases](https://github.com/XYZ921746/ElainaChat-Open/releases/latest)
+> 扩展包，需要到 [Releases](https://github.com/XYZ921746/ElainaChat-mod/releases/latest)
 > 单独下载安装 —— 见上方「[扩展包](#扩展包mod--插件)」章节。
 
 手机 / 平板访问 `http://<本机局域网IP>:4173`（需要访问密码，会自动升级到 HTTPS）。可用 `HOST` / `PORT` / `HTTPS_PORT` 环境变量覆盖。
@@ -869,7 +1016,7 @@ Web 版没有任何中转服务。如果服务商拒绝浏览器跨域请求，�
 ## 目录结构
 
 ```text
-ElainaChat-Open/
+ElainaChat-mod/
 ├─ web/                          # 前端 + Node 服务端（静态服务的根目录）
 │  ├─ index.html                 # 主应用（界面 / 状态 / Agent / 对话逻辑）
 │  ├─ serve.mjs                  # 静态服务 + API + HTTPS + 访问密码 + 数据同步 + 本地中转
@@ -892,7 +1039,7 @@ ElainaChat-Open/
 ├─ scripts/                      # 检查脚本 + 构建工具（不参与运行）
 │  ├─ sync-web.mjs               #   把 web/ 同步到安卓工程（自动扫描 web/js/）
 │  ├─ pack-assets.mjs            #   打包插件与模型为 zip（供上传 Releases）
-│  └─ check-*.mjs                #   27 个回归检查，npm run check 全跑一遍
+│  └─ check-*.mjs                #   31 个回归检查，npm run check 全跑一遍
 ├─ android-app/                  # 安卓打包工程（本仓库已排除，见 .gitignore）
 ├─ poc/sandbox/                   # Windows 沙箱可行性验证（不参与运行）
 ├─ 开发文档.md                    # 完整改造记录 / 踩坑 / 验证数据
