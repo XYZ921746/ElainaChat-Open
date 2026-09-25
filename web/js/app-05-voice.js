@@ -1089,7 +1089,7 @@ function renderStreamingReplyPreview() {
     if (!streamingPreviewEl) {
         streamingPreviewEl = document.createElement('div');
         streamingPreviewEl.id = 'streaming-reply-preview';
-        streamingPreviewEl.className = 'flex gap-3 mb-4 animate-fade-in-up';
+        streamingPreviewEl.className = 'flex gap-3 mb-4';
         streamingPreviewEl.innerHTML = `
             <div class="pixso-chat-avatar" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="currentColor">
@@ -1113,7 +1113,18 @@ function renderStreamingReplyPreview() {
         elements.conversationHistory.appendChild(streamingPreviewEl);
     }
     const target = streamingPreviewEl.querySelector('#streaming-reply-text');
-    if (target) target.innerHTML = renderMessageText(text);
+    // ★ 流式期间用 **textContent 纯文本**，不用 renderMessageText 的 markdown 渲染
+    //   （2026-09 修"流式闪烁/看不见内容"）：
+    //   ① renderMessageText 每帧对**不断增长的文本**做完整 markdown 解析
+    //      （正则扫描 + marked.parse），越到后面越贵，主线程被塞满，
+    //      后续增量排队、渲染卡顿 —— 看起来就是"时不时闪一下"。
+    //   ② 半截 markdown（未闭合的 **、```、表格竖线）每帧解析出的 HTML 都不同，
+    //      气泡高度疯狂跳动，视觉上内容"闪没又冒出来"。
+    //   纯文本 + whitespace-pre-wrap 的观感已经足够流畅（用户就是要"先看见"），
+    //   完整的富文本渲染只在回复完成时做一次（下面的正式渲染路径）。
+    //   顺带去掉了预览容器的 animate-fade-in-up —— 每次会话它只创建一次，
+    //   动画本身无害，但创建时机与 thinking 气泡的 200ms 淡出重叠时会叠影。
+    if (target) target.textContent = text;
     elements.conversationHistory.scrollTop = elements.conversationHistory.scrollHeight;
 }
 

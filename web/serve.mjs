@@ -2030,7 +2030,16 @@ function traceRelayRequest({ method, target, reqJson, reqRaw }) {
     traceLine(lines.join('\n'));
     const lastUser = [...summary.messages].reverse().find((m) => m.role === 'user');
     if (lastUser && lastUser.text.trim()) {
-        console.log('[chat] 提问：' + clip(lastUser.text.replace(/\s+/g, ' ').trim(), 200, '已截断'));
+        // ★ 合成消息（桌宠"主动搭话"等 mod 注入的系统提示）不是人打的话 ——
+        //   原样打印会把整段提示词+电脑状态快照灌进主日志，还长得像用户发了
+        //   一句怪话（用户实测困惑："这个日志是你干的吗"）。
+        //   识别特征：mod 们约定的开头「（系统提示：」。此时只记一行来源事实，
+        //   提示词全文仍完整保留在追踪日志（上面逐条已记）。
+        if (/^（系统提示：/.test(lastUser.text.trim())) {
+            console.log('[chat] 提问来自自动功能（mod 注入的系统提示，全文见追踪日志）');
+        } else {
+            console.log('[chat] 提问：' + clip(lastUser.text.replace(/\s+/g, ' ').trim(), 200, '已截断'));
+        }
     }
     return summary;
 }

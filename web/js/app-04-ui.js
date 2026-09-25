@@ -1396,10 +1396,18 @@ function renderTurnProcess() {
         host = document.createElement('div');
         host.id = anchorId;
         host.className = 'turn-process';
-        // 插到 AI 气泡前面；找不到就追加到末尾（例如自动语音那条路径）
-        const anchor = activeTurnAnchorId ? document.getElementById(`msg-${safeAttrId(activeTurnAnchorId)}`) : null;
-        if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(host, anchor);
-        else elements.conversationHistory.appendChild(host);
+        // ★ 追加到容器末尾（2026-09 修，之前是插到用户气泡前面 —— 位置反了）。
+        //
+        //   时序：用户气泡先渲染 → 流式增量到来 → 过程区这时才创建。
+        //   旧代码拿用户消息 id 当锚点 insertBefore，结果过程区跑到了
+        //   **用户气泡上面**（实测截图：已思考横条出现在"在吗"上面）。
+        //   而且注释写的设计意图是"插在 AI 气泡前面"，AI 气泡此时还不存在
+        //   —— 注释与实现自相矛盾。
+        //
+        //   现在直接 appendChild 到末尾：过程区排在用户气泡之后；
+        //   AI 气泡回复完成时 appendChild 到末尾，自然排在过程区之后
+        //   —— 最终顺序正好是「用户消息 → 思考/过程 → AI 正文」。
+        elements.conversationHistory.appendChild(host);
     }
 
     const parts = [];

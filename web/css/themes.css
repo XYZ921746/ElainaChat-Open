@@ -625,6 +625,53 @@ html[data-theme="dark"] body .bubble-ai .text-indigo-500,
 html[data-theme="dark"] body .bubble-ai .text-indigo-400,
 html[data-theme="dark"] body .bubble-ai .text-indigo-300 { color: #a4afc0 !important; }
 
+/* ============================================================================
+ *  深色：气泡尾巴 + 语音条 + 名牌（2026-09，用户截图标出的三处突兀元素）
+ * ==========================================================================
+ *  根因各不相同，但表现一致——"深色下突兀"：
+ *
+ *  ① 尾巴（::after 小三角）：深色段只覆盖了 .bubble-ai::after，
+ *     **漏了 .bubble-user::after** —— 它还停留在浅色主题模板写的
+ *     var(--pixso-green-dark)（亮绿），配深色气泡就是一个突兀的亮三角
+ *     （用户截图右下角）。深色下两个尾巴都要换成与各自气泡底色一致的深色。
+ *
+ *  ② 语音条（.ai-voice-player）：宿主里写死 background:#dec9be（浅棕），
+ *     themes.css 此前**完全没有**它的深色规则 —— 深色气泡里嵌一块亮棕色块。
+ *     文字/波形用 var(--pixso-brown)，而该变量在深色下被主题改成亮色，
+ *     亮底配亮字对比度也崩了。这里整块换成深色玻璃质感，文字用亮色。
+ *
+ *  ③ 名牌（.ai-speaker-name"伊蕾娜"）：宿主写死浅色底深色字，同理处理。
+ * ========================================================================== */
+html[data-theme="dark"] body .bubble-user::after {
+    background: rgba(46, 56, 74, 0.95) !important;
+    box-shadow: 0 -3px 0 rgba(46, 56, 74, 0.95) !important;
+}
+html[data-theme="dark"] body .bubble-ai::after {
+    background: rgba(30, 40, 58, 0.92) !important;
+    box-shadow: 0 -3px 0 rgba(30, 40, 58, 0.92) !important;
+}
+html[data-theme="dark"] body .ai-voice-player {
+    background: rgba(255, 255, 255, 0.10) !important;
+    border: 1px solid rgba(255, 255, 255, 0.14) !important;
+}
+html[data-theme="dark"] body .ai-voice-player:hover {
+    background: rgba(255, 255, 255, 0.16) !important;
+}
+html[data-theme="dark"] body .ai-voice-player .voice-play-box,
+html[data-theme="dark"] body .ai-voice-player .voice-duration,
+html[data-theme="dark"] body .ai-voice-player .voice-wave-bar {
+    color: #dfe6f0 !important;
+    background: #dfe6f0 !important;
+}
+/* play-box 是图标容器，图标继承 currentColor —— 底要透出来，不能用上面那条的背景色 */
+html[data-theme="dark"] body .ai-voice-player .voice-play-box {
+    background: transparent !important;
+}
+html[data-theme="dark"] body .bubble-ai .ai-speaker-name {
+    background: rgba(255, 255, 255, 0.12) !important;
+    color: #eef2f7 !important;
+}
+
 html[data-theme="dark"] body .bg-pink-50,
 html[data-theme="dark"] body .bg-indigo-100 { background-color: rgba(255, 255, 255, 0.07) !important; }
 html[data-theme="dark"] body .border-indigo-100 { border-color: rgba(255, 255, 255, 0.12) !important; }
