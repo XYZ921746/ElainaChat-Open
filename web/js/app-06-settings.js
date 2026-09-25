@@ -829,28 +829,50 @@ async function refreshModsList() {
             badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-600 ml-1" title="'
                 + escapeHtml(m.error || '') + '">加载失败</span>';
         } else if (m.state === 'blocked') {
-            // 缺前置插件 → **拒绝加载**（不是"半残地跑起来"）。
-            // 状态与原因都要摆出来：这是"为什么这个插件不工作"的答案。
+            // 前置插件不可用（未安装 / 未启用）→ **拒绝加载**（不是"半残地跑起来"）。
             badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-600 ml-1" title="'
-                + escapeHtml(m.error || '') + '">缺少前置插件</span>';
+                + escapeHtml(m.error || '') + '">前置插件不可用</span>';
         } else if (m.state === 'ready') {
             badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-600 ml-1">已加载</span>';
+        } else if (m.state === 'disabled') {
+            badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 ml-1">未启用</span>';
         }
-        // 缺失的前置插件：显示成一行可读的原因（而不仅是一个角标）。
-        // 典型场景：只装了 galgame 没装 elaina-avatar（两者分开发布），
-        // 旧行为是"能打开但没有立绘"，现在直接拒绝加载并说明缺什么。
+
+        // 不可用的前置插件：逐条给出**原因 + 该做什么**（而不仅是一个角标）。
+        //
+        // ★ missingDeps 现在是结构化对象 { id, reason, fixable }（2026-09 改）。
+        //   旧版是字符串数组，只会说"缺少依赖：xxx"—— 而"未安装"和"未启用"
+        //   需要用户做的事完全不同（去下载 vs 去打开开关），笼统说"缺少"
+        //   会让人白跑。这里按 reason 给不同的下一步。
         const missing = Array.isArray(m.missingDeps) ? m.missingDeps : [];
         let blockReason = '';
         if (missing.length) {
+            const lines = missing.map((d) => {
+                const dep = typeof d === 'string' ? { id: d, reason: '不可用' } : d;
+                const what = '前置插件「' + escapeHtml(dep.id) + '」' + escapeHtml(dep.reason || '不可用');
+                if (dep.reason === '未启用') return what + ' —— 到下面把它的开关打开';
+                if (dep.reason === '未安装') return what + ' —— 需要先安装它';
+                if (dep.reason === '插件系统总开关已关闭') return what + ' —— 打开上面的「启用插件系统」并刷新页面';
+                return what;
+            });
             blockReason = '<span class="block text-[11px] text-red-500 leading-relaxed mt-0.5">'
-                + '缺少前置插件：' + escapeHtml(missing.join('、'))
-                + ' —— 请先在下面安装并启用它，本插件才会被加载。</span>';
+                + lines.join('<br>') + '</span>';
         }
-        // hidden 的 mod（如公共依赖）不显示开关 —— 它不提供界面，关掉只会让别的 mod 坏掉
-        const toggle = m.hidden
-            ? '<span class="text-[10px] text-indigo-300 flex-none">公共依赖</span>'
-            : '<input type="checkbox" class="accent-pink-500 flex-none mod-toggle" data-mod-id="' + id + '"'
-                + (m.enabled ? ' checked' : '') + '>';
+
+        // hidden 的 mod（如公共依赖）不提供界面，但**仍然要有开关**。
+        //
+        // ★ 这里修的是一个真实故障（2026-09）：hidden 的插件以前只显示
+        //   一个「公共依赖」文字标签、**没有开关**。于是它一旦被禁用
+        //   （例如用户的旧 localStorage 里留着 '0'），就**无法从界面上恢复** ——
+        //   而依赖它的插件会连带失效，用户完全不知道去哪修。
+        //   实测日志：`elaina-avatar=disabled galgame=ready pet=ready`
+        //   （前置被禁用、依赖方却起来了，于是拿不到立绘）。
+        //   现在一律给开关，只是对 hidden 的插件额外标一句用途说明。
+        const hiddenNote = m.hidden
+            ? '<span class="text-[10px] text-indigo-300 ml-1">（公共依赖，被其他插件共用）</span>'
+            : '';
+        const toggle = '<input type="checkbox" class="accent-pink-500 flex-none mod-toggle" data-mod-id="' + id + '"'
+            + (m.enabled ? ' checked' : '') + '>';
 
         // 删除按钮：调服务端的 DELETE /api/plugins/:id（会删目录 + 安装包）。
         //
@@ -870,7 +892,7 @@ async function refreshModsList() {
             + '<label class="flex items-start gap-2 min-w-0 flex-1 cursor-pointer">'
             + toggle
             + '<span class="min-w-0">'
-              + '<span class="text-xs font-semibold text-indigo-800">' + name + '</span>' + ver + badge
+              + '<span class="text-xs font-semibold text-indigo-800">' + name + '</span>' + ver + hiddenNote + badge
               + (desc ? '<span class="block text-[11px] text-indigo-400 leading-relaxed mt-0.5">' + desc + '</span>' : '')
               + blockReason
             + '</span></label>'

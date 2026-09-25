@@ -154,12 +154,17 @@ try {
         // 缺前置 → 拒绝加载
         ok(/entry\.state = 'blocked'/.test(MODS_JS),
             '★ 缺前置插件时状态标为 blocked（拒绝加载，不是警告后照跑）');
-        ok(/缺少前置插件：/.test(MODS_JS), '★ 报错文案说明了缺什么');
+        // 报错文案：现在是结构化的"原因 + 下一步"（见 check-mod-deps.mjs 验文案细节）
+        ok(/已拒绝加载：/.test(MODS_JS), '★ 报错文案说明了缺什么');
+        ok(/未启用|未安装/.test(MODS_JS), '★ 区分「未启用」与「未安装」两种原因');
         // host.require
         ok(/require\(key\) \{/.test(MODS_JS), 'host API 提供 require()（由系统解析依赖）');
-        // findMissingDeps 同时认目录名
-        ok(/if \(m\.dir\) ids\.add\(m\.dir\)/.test(MODS_JS),
+        // findMissingDeps 同时认目录名与注册名（避免改名后误报）
+        ok(/if \(m\.dir && !byKey\.has\(m\.dir\)\) byKey\.set\(m\.dir, m\)/.test(MODS_JS)
+            || /byKey\.set\(m\.dir, m\)/.test(MODS_JS),
             '★ 缺依赖判定同时认目录名（避免改名后误报）');
+        ok(/regByDir\.get\(m\.dir\)/.test(MODS_JS),
+            '★ 缺依赖判定也认注册名（三种身份都收进索引）');
     }
 
     // ============================================================

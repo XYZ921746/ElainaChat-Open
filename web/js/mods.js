@@ -450,13 +450,14 @@
      * 让整个白屏（那会让用户连"去设置里关掉它"都做不到）。
      *
      * @param {object} manifest 清单条目
-     * @param {string[]} [missingDeps] 缺失的前置插件 id（非空时**拒绝加载**）
+     * @param {Array<{id:string,reason:string,fixable:boolean}>} [missingDeps]
+     *        不可用的前置插件（非空时**拒绝加载**）
      */
     async function loadOne(manifest, missingDeps = []) {
         const entry = { manifest, state: 'pending', error: null, api: null };
         registry.set(manifest.id, entry);
 
-        // ★ 前置插件缺失 → **拒绝加载**，并给出可读原因。
+        // ★ 前置插件不可用 → **拒绝加载**，并给出可读原因。
         //
         // 旧行为只是 console.error 一句警告、然后照样加载。那很糟：
         // 插件会在"依赖不在"的前提下跑起来 —— 例如 galgame 拿不到
@@ -464,14 +465,29 @@
         // "界面能打开但没有人物"，而设置里那个"缺依赖"角标很容易被忽略。
         // 更麻烦的是**加载顺序失去保证**：依赖可能排在它后面才加载。
         //
-        // 现在明确拒绝：状态标为 blocked，error 里写清缺什么、去哪装，
-        // 设置界面直接显示这条原因（见 refreshModsList 的 blocked 处理）。
-        // 这样"为什么这个插件不工作"是有答案的，而不是一个静默的半残状态。
+        // 实测踩到的真实日志（旧实现只看"装没装"，漏了"启用没启用"）：
+        //     [Mod] 加载完成：elaina-avatar=disabled galgame=ready pet=ready
+        // 前置被禁用了，两个依赖方却照样 ready —— 拿不到立绘而系统认为正常。
+        // 现在"未启用"也算不可用，并按原因给出**可执行的下一步**。
         if (missingDeps.length) {
             entry.state = 'blocked';
-            entry.error = '缺少前置插件：' + missingDeps.join('、')
-                + '。请先在「设置 → 插件」里安装并启用它，否则本插件不会被加载'
-                + '（缺了前置就启动，功能只会是残缺的，所以这里直接拒绝）。';
+            entry.missingDeps = missingDeps;
+            // 每条原因一句话，人（和 AI）都能读懂该做什么
+            const detail = missingDeps.map((d) => {
+                const what = '前置插件「' + d.id + '」' + d.reason;
+                if (d.reason === '未启用') {
+                    return what + ' —— 到「设置 → 插件」里把它的开关打开';
+                }
+                if (d.reason === '未安装') {
+                    return what + ' —— 需要先安装它（见 Releases 的扩展包）';
+                }
+                if (d.reason === '插件系统总开关已关闭') {
+                    return what + ' —— 到「设置 → 插件」打开「启用插件系统」并刷新页面';
+                }
+                return what + ' —— 请先修好那个插件';
+            }).join('；');
+            entry.error = '已拒绝加载：' + detail
+                + '。（缺了前置就启动，功能只会是残缺的，所以这里直接拒绝而不是带病运行。）';
             console.error('[Mod:' + manifest.id + '] ' + entry.error);
             return entry;
         }
@@ -578,36 +594,85 @@
     let loadingDir = null;
 
     /**
-     * 找出每个插件**缺失的前置插件**。
+     * 找出每个插件**不可用的前置插件**，并说明原因。
      *
-     * 为什么要单独做这件事：`sortByDependency` 里对找不到的依赖是
-     * `if (d) visit(...)` —— **静默跳过**。这在单仓库时代问题不大（一起发布），
-     * 但 mod 资源一旦拆到独立仓库分发，用户只装 galgame 不装 elaina-avatar
-     * 就会变成常态。那时的表现是"Galgame 打开了但没有立绘"，
-     * 且控制台一声不响 —— 属于最难排查的那类问题。
+     * ── 为什么要单独做这件事 ─────────────────────────────────────────────
      *
-     * ★ 判定要同时认**清单 id** 与**目录名**（2026-09 修）：
+     * `sortByDependency` 里对找不到的依赖是 `if (d) visit(...)` —— **静默跳过**。
+     * 这在单仓库时代问题不大（一起发布），但 mod 拆到独立仓库分发后，
+     * "只装 galgame 不装 elaina-avatar"会变成常态。那时的表现是
+     * "Galgame 打开了但没有立绘"，控制台一声不响 —— 最难排查的那类问题。
+     *
+     * ── ★ 关键修正：装了但**没启用**，等于不可用（2026-09 实测踩到）──────
+     *
+     * 旧实现只判断"清单里有没有这个 id"，于是出现了这个真实日志：
+     *
+     *     [Mod] 加载完成：elaina-avatar=disabled galgame=ready pet=ready
+     *
+     * 前置被**禁用**了，依赖它的两个插件却照样 ready —— 它们拿不到立绘，
+     * 而系统认为一切正常。所以判定必须同时看**启用状态**：
+     *   · 前置不在清单里           → 原因：未安装
+     *   · 前置在清单里但被禁用      → 原因：未启用（用户可以在设置里打开）
+     *   · 前置自己被拦（缺它自己的前置）→ 原因：前置本身不可用（级联）
+     * 三种情况给三种不同的提示，用户才知道该做什么。
+     *
+     * ★ 身份判定要同时认**清单 id**、**目录名**、**注册名**：
      *   用户改了插件目录名、而 manifest 没写 id 时，清单 id 会等于目录名
      *   （如 `pet-renamed`），而依赖方 after 里写的仍是注册名 `pet`。
      *   只按清单 id 比会**误报"缺依赖"**，把好好的插件拦下来。
-     *   两个键都收进集合，才不会误伤。
      *
-     * @returns {Map<string, string[]>} 插件 id → 缺失的前置插件 id 列表
+     * @returns {Map<string, Array<{id:string, reason:string, fixable:boolean}>>}
      */
     function findMissingDeps(manifests) {
-        // 可用身份集合：清单 id、目录名，以及（已加载过的话）注册名
-        const ids = new Set();
+        // 建三张索引：清单 id / 目录名 / 注册名 → 清单条目
+        const byKey = new Map();
         for (const m of manifests) {
-            if (m.id) ids.add(m.id);
-            if (m.dir) ids.add(m.dir);
+            if (m.id) byKey.set(m.id, m);
+            if (m.dir && !byKey.has(m.dir)) byKey.set(m.dir, m);
             const rn = m.dir ? regByDir.get(m.dir) : null;
-            if (rn) ids.add(rn);
+            if (rn && !byKey.has(rn)) byKey.set(rn, m);
         }
+
+        // 第一轮：只算"未安装 / 未启用"（不涉及级联）
         const missing = new Map();
         for (const m of manifests) {
             const deps = Array.isArray(m.after) ? m.after : [];
-            const lack = deps.filter((d) => !ids.has(d));
+            const lack = [];
+            for (const d of deps) {
+                const target = byKey.get(d);
+                if (!target) {
+                    lack.push({ id: d, reason: '未安装', fixable: false });
+                    continue;
+                }
+                // 前置存在但被禁用（或全局插件系统关着）→ 同样不可用
+                if (!modsGloballyEnabled()) {
+                    lack.push({ id: d, reason: '插件系统总开关已关闭', fixable: true });
+                } else if (!isModEnabled(target.id, target)) {
+                    lack.push({ id: d, reason: '未启用', fixable: true });
+                }
+            }
             if (lack.length) missing.set(m.id, lack);
+        }
+
+        // 第二轮：级联 —— 前置自己也被拦时，标成"前置本身不可用"。
+        //   一遍不够（A 依赖 B、B 依赖 C），这里迭代到稳定，最多 N 轮。
+        //   不这样做的后果：A 会显示"前置 B 已就绪"，而 B 其实也没起来。
+        for (let round = 0; round < manifests.length; round++) {
+            let changed = false;
+            for (const m of manifests) {
+                const lack = missing.get(m.id);
+                if (!lack) continue;
+                for (const item of lack) {
+                    if (item.reason !== '未安装' && item.reason !== '未启用') continue;
+                    const depBlocked = missing.has(item.id);
+                    if (depBlocked) {
+                        item.reason = '前置本身不可用（它自己也缺前置）';
+                        item.fixable = false;
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) break;
         }
         return missing;
     }
@@ -630,13 +695,12 @@
             return [];
         }
 
-        // ★ 先查缺失依赖 —— 缺前置的插件会被**拒绝加载**（不是警告后照跑）。
-        //   判定同时认清单 id 与目录名：用户改了目录名时，after 里写的
-        //   仍是原注册名，两个键都试一遍才不会误报"缺依赖"。
+        // ★ 先查不可用的前置插件 —— 这类插件会被**拒绝加载**（不是警告后照跑）。
+        //   判定同时看"装没装"与"启用没启用"，并认清单 id / 目录名 / 注册名三种键。
         const missing = findMissingDeps(manifests);
         for (const [id, lack] of missing) {
-            console.error('[Mod:' + id + '] 缺少前置插件：' + lack.join('、')
-                + '（已拒绝加载 —— 缺了前置就启动，功能只会是残缺的）');
+            console.error('[Mod] 插件「' + id + '」无法加载 —— 它依赖的前置插件不可用：\n'
+                + lack.map((d) => '        · 「' + d.id + '」' + d.reason).join('\n'));
         }
 
         let ordered;
@@ -653,27 +717,82 @@
         for (const m of ordered) {
             const lack = missing.get(m.id) || [];
             const entry = await loadOne(m, lack);
-            // 缺失依赖也记到条目上，供设置界面显示（loadOne 已在 error 里写了原因）
+            // 不可用的前置也记到条目上，供设置界面显示（loadOne 已在 error 里写了原因）
             if (lack.length) entry.missingDeps = lack;
             results.push(entry);
         }
 
-        // ★ 加载完成汇总：每个插件的最终状态一行一条。
-        //
-        // 这是"插件到底怎么了"最直接的一处证据 —— 用户报"插件用不了"时，
-        // 看一眼启动窗口就知道是没启用、缺前置、还是加载报错，
-        // 不用再让人去开浏览器控制台（手机上根本开不了）。
-        console.log('[Mod] 加载完成：' + results.map((e) =>
-            e.manifest.id + '=' + e.state
-            + (e.manifest.dir && e.manifest.dir !== e.manifest.id ? '(' + e.manifest.dir + ')' : '')
-        ).join('  '));
-        const notReady = results.filter((e) => e.state !== 'ready');
-        if (notReady.length) {
-            console.log('[Mod] 未就绪的插件：' + notReady.map((e) =>
-                e.manifest.id + '=' + e.state + (e.error ? '（' + e.error + '）' : '')
-            ).join('  |  '));
-        }
+        logLoadSummary(results);
         return results;
+    }
+
+    /** 插件状态的**中文说明** —— 日志与设置界面共用一份，避免两处说法不一致 */
+    const STATE_LABEL = {
+        ready: '已加载',
+        disabled: '已关闭（未启用）',
+        blocked: '已拒绝加载（前置插件不可用）',
+        error: '加载失败',
+        pending: '加载中',
+    };
+
+    /**
+     * 打印加载结果汇总。
+     *
+     * ★ 为什么要把这段单独写好（2026-09 重做）：
+     *   上一版打的是 `elaina-avatar=disabled galgame=ready pet=ready` ——
+     *   那是**机器视角的键值对**：换个不知道本项目的 AI（或用户本人）
+     *   看到这行，既不知道 `disabled` 是好是坏，也看不出
+     *   "前置没启用、依赖它的却起来了"这个关键矛盾。
+     *
+     *   日志是给**排查问题的人（或 AI）**看的，不是给程序看的。所以改成：
+     *     · 先一句话总结（几个可用、几个有问题）
+     *     · 每个有问题的插件：名字 + 中文状态 + 具体原因 + **下一步该做什么**
+     *     · 正常的插件只列名字，不刷屏
+     *   这样即使把日志原样丢给一个完全不了解本项目的 AI，它也能读懂并给出建议。
+     */
+    function logLoadSummary(results) {
+        const total = results.length;
+        const ready = results.filter((e) => e.state === 'ready');
+        const disabled = results.filter((e) => e.state === 'disabled');
+        const broken = results.filter((e) => e.state !== 'ready' && e.state !== 'disabled');
+
+        // ---- ① 一句话总结：先给结论 ----
+        console.log('[Mod] 插件加载完成：共 ' + total + ' 个'
+            + '，可用 ' + ready.length + ' 个'
+            + (disabled.length ? '，未启用 ' + disabled.length + ' 个' : '')
+            + (broken.length ? '，有问题 ' + broken.length + ' 个' : '')
+            + '。');
+
+        // ---- ② 可用的：只列名字 ----
+        if (ready.length) {
+            console.log('[Mod]   ✔ 可用：' + ready.map((e) => e.manifest.name || e.manifest.id).join('、'));
+        }
+
+        // ---- ③ 未启用的：说明这是正常的，并给开启方法 ----
+        if (disabled.length) {
+            console.log('[Mod]   ○ 未启用（这是正常的，插件默认关闭）：'
+                + disabled.map((e) => e.manifest.name || e.manifest.id).join('、')
+                + '\n        如需使用，到「设置 → 插件」打开对应开关。');
+        }
+
+        // ---- ④ 有问题的：这是重点，逐条给原因 + 下一步 ----
+        if (broken.length) {
+            for (const e of broken) {
+                const label = STATE_LABEL[e.state] || e.state;
+                const name = (e.manifest.name || e.manifest.id)
+                    + (e.manifest.id !== (e.manifest.name || e.manifest.id) ? '（' + e.manifest.id + '）' : '');
+                console.error('[Mod]   ✘ ' + name + '：' + label);
+                if (e.error) console.error('[Mod]     ' + e.error);
+            }
+            console.error('[Mod] 以上插件不会生效。按上面每条给出的方法处理后，刷新页面重试。');
+        }
+
+        // ---- ⑤ 全部正常时明确说一句 ----
+        //   为什么不省略：日志里"什么都没有"与"一切正常"在视觉上无法区分 ——
+        //   用户会以为日志坏了（这个坑实际发生过）。
+        if (!broken.length && !disabled.length) {
+            console.log('[Mod]   全部正常。');
+        }
     }
 
     /** 运行时启用/停用（停用只隐藏，不卸载脚本 —— 卸载需要整页刷新） */
@@ -813,8 +932,13 @@
                 state: e.state,
                 error: e.error,
                 enabled: isModEnabled(e.manifest.id, e.manifest),
-                // 缺失的前置插件（manifest.after 里声明了但没装/没启用）——
-                // 这类插件会被**拒绝加载**，设置界面据此显示原因
+                // hidden：公共依赖类插件（不提供界面，被其他插件共用）。
+                // 设置界面用它加一句用途说明 —— 但**仍然给开关**：
+                // 以前 hidden 的插件不给开关，一旦被禁用就无法从界面恢复，
+                // 依赖它的插件会连带失效而用户找不到地方修（实测踩过）。
+                hidden: e.manifest.hidden === true,
+                // 不可用的前置插件（未安装 / 未启用 / 级联不可用）——
+                // 这类插件会被**拒绝加载**，设置界面据此显示原因与下一步
                 missingDeps: e.missingDeps || [],
             }));
         },
