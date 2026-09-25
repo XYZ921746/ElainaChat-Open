@@ -306,6 +306,43 @@ ok(readdirSync(LOG_DIR).filter((n) => n.endsWith('.log')).length === 2,
 ok(/disabled \(LOG_TO_FILE=0\)/.test(out2()) || /不落盘/.test(out2()),
     'LOG_TO_FILE=0 时明确说明了"不落盘"');
 
+// ================= 场景四：控制台级别门（2026-09 新增）=================
+// 用户要求："大量无用日志耽误排查进度" —— 成功请求归 DEBUG，
+// 控制台默认 INFO，所以日常窗口不刷请求行；切 DEBUG（或 LOG_CONSOLE）才全量。
+{
+    const port4 = await freePort();
+    const { child: c4, getOut: out4 } = await startServer({ LOG_TO_FILE: '0' }, port4);
+    await wait(400);
+    await fetch(`http://127.0.0.1:${port4}/api/plugins`).catch(() => {});
+    await fetch(`http://127.0.0.1:${port4}/api/server-info`).catch(() => {});
+    await wait(400);
+    // ① 默认（INFO）：成功请求不刷屏
+    ok(!/\[HTTP\]/.test(out4()), '★ 默认控制台级别下，成功请求不刷屏（[HTTP] 行消失）');
+    ok(/listening on http:\/\//.test(out4()), '启动事件仍然可见');
+    c4.kill();
+    await wait(300);
+
+    // ② LOG_CONSOLE=DEBUG：全量回归（旧行为）
+    const port5 = await freePort();
+    const { child: c5, getOut: out5 } = await startServer({ LOG_TO_FILE: '0', LOG_CONSOLE: 'DEBUG' }, port5);
+    await wait(400);
+    await fetch(`http://127.0.0.1:${port5}/api/plugins`).catch(() => {});
+    await wait(400);
+    ok(/\[HTTP\]/.test(out5()), '★ LOG_CONSOLE=DEBUG 时请求行可见（排查模式）');
+    c5.kill();
+    await wait(300);
+
+    // ③ 失败请求在任何控制台级别都可见（WARN > INFO）
+    const port6 = await freePort();
+    const { child: c6, getOut: out6 } = await startServer({ LOG_TO_FILE: '0' }, port6);
+    await wait(400);
+    await fetch(`http://127.0.0.1:${port6}/api/definitely-not-exist`).catch(() => {});
+    await wait(400);
+    ok(/\[HTTP\].*404/.test(out6()), '★ 4xx 是 WARN，任何控制台级别下都可见');
+    c6.kill();
+    await wait(300);
+}
+
 // ================= 场景三：LOG_CHAT=0 =================
 const { child: child3 } = await startServer({ LOG_CHAT: '0' }, await freePort());
 await wait(300);

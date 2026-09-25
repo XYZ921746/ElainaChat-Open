@@ -3872,6 +3872,16 @@
                             </select>
                             <span id="settingLogLevelHint" class="text-[11px] text-indigo-300"></span>
                         </div>
+                        <div class="flex flex-wrap items-center gap-2 mb-2">
+                            <label class="text-xs text-indigo-500">控制台级别</label>
+                            <select id="settingLogConsoleLevel" class="modal-input text-sm w-32 py-1.5">
+                                <option value="DEBUG">DEBUG · 全部（排查用）</option>
+                                <option value="INFO">INFO · 默认</option>
+                                <option value="WARN">WARN · 警告以上</option>
+                                <option value="ERROR">ERROR · 仅报错</option>
+                            </select>
+                            <span class="text-[11px] text-indigo-300">启动窗口显示的最低级别。日常保持 INFO，排查时切 DEBUG 能看到每个请求。</span>
+                        </div>
                         <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer mb-1">
                             <input id="settingLogTrace" type="checkbox" class="accent-pink-500"> 记录完整对话内容（追踪日志）
                         </label>

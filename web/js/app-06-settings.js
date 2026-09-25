@@ -372,6 +372,7 @@ function renderLogLevelHint() {
 async function refreshLogSettings() {
     const box = document.getElementById('logStatusBox');
     const sel = elements.settingLogLevel;
+    const consoleSel = document.getElementById('settingLogConsoleLevel');
     const traceBox = elements.settingLogTrace;
     const section = document.getElementById('logSettingsSection');
     if (!box) return;
@@ -381,6 +382,7 @@ async function refreshLogSettings() {
         const json = await res.json();
         if (!json.ok) { box.textContent = '无法读取日志设置'; return; }
         if (sel) sel.value = json.level || 'INFO';
+        if (consoleSel) consoleSel.value = json.consoleLevel || 'INFO';
         if (traceBox) traceBox.checked = Boolean(json.trace);
         renderLogLevelHint();
         if (!json.fileEnabled) {
@@ -405,6 +407,7 @@ async function refreshLogSettings() {
 
 async function applyLogSettings() {
     const sel = elements.settingLogLevel;
+    const consoleSel = document.getElementById('settingLogConsoleLevel');
     const traceBox = elements.settingLogTrace;
     if (!sel) return;
     // 整块已被隐藏（无本地服务）时不再发请求：否则会弹出"修改失败"，
@@ -417,6 +420,7 @@ async function applyLogSettings() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 level: sel.value,
+                consoleLevel: consoleSel ? consoleSel.value : undefined,
                 trace: traceBox ? traceBox.checked : undefined
             })
         });

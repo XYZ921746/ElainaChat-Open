@@ -182,6 +182,18 @@ function readSavedLogSettings() {
     } catch { return {}; }
 }
 
+// ── 控制台级别（2026-09 新增）──────────────────────────────────────────
+//
+// 原设计"终端永远全量"在请求日志降为 DEBUG 后出现了新问题：终端会被
+// 每个请求一行刷屏 —— 对日常使用是纯噪音（用户："大量的无用日志反而会
+// 耽误排查问题的进度"）。
+//
+// 现在**控制台与文件各有级别开关**（都可在 设置 → 高级 → 日志 运行时调整）：
+//   · consoleLevel = DEBUG → 和旧行为一样，什么都能看到（排查时用）
+//   · consoleLevel = INFO（默认）→ 日常干净，请求细节/页面调试不刷屏
+// 内存缓冲不受任何级别约束 —— 软件内查看器随时能看全部历史。
+let consoleLevel = 'INFO';
+
 // 初始化：环境变量 > data/log-settings.json > 默认。
 // 环境变量优先是刻意的 —— 自动化检查要能强制指定级别，而不受本机已保存的值干扰。
 {
@@ -189,14 +201,31 @@ function readSavedLogSettings() {
     fileLevel = normalizeLevelName(process.env.LOG_LEVEL)
         || normalizeLevelName(saved.level)
         || 'INFO';
+    // 控制台级别：环境变量 > 保存值 > 默认 INFO。
+    // 显式设过 DEBUG 就该被记住，重启动后仍然生效。
+    consoleLevel = normalizeLevelName(process.env.LOG_CONSOLE)
+        || normalizeLevelName(saved.consoleLevel)
+        || 'INFO';
     if (process.env.LOG_CHAT === undefined && typeof saved.trace === 'boolean') {
         traceEnabled = saved.trace;
     }
 }
 
-/** 当前级别是否该落盘（控制台不受它约束） */
+/** 当前级别是否该落盘 */
 function shouldLogToFile(level) {
     return (LEVEL_NO[level] || 20) >= (LEVEL_NO[fileLevel] || 20);
+}
+
+function shouldLogToConsole(level) {
+    return (LEVEL_NO[level] || 20) >= (LEVEL_NO[consoleLevel] || 20);
+}
+
+function setConsoleLevel(next) {
+    const level = normalizeLevelName(next);
+    if (!level || level === consoleLevel) return false;
+    consoleLevel = level;
+    persistLogSettings();
+    return true;
 }
 
 /** 落盘级别的持久化。改级别是低频操作，直接同步写，省掉一套异步队列 */
@@ -205,7 +234,7 @@ function persistLogSettings() {
     try {
         mkdirSync(LOG_DIR, { recursive: true });
         writeFileSync(LOG_SETTINGS_FILE, JSON.stringify({
-            level: fileLevel, trace: traceEnabled, updatedAt: new Date().toISOString(),
+            level: fileLevel, consoleLevel, trace: traceEnabled, updatedAt: new Date().toISOString(),
         }, null, 2), 'utf8');
     } catch { /* 写不进去不影响本次运行，只是下次启动回到旧值 */ }
 }
@@ -466,21 +495,23 @@ function emitLog(level, args) {
     // AstrBot 只在 WARNING 及以上附版本号 —— 正常信息里塞版本号纯属噪音
     const verTag = (LEVEL_NO[level] || 20) >= 30 ? ` [v${APP_VERSION}]` : '';
 
-    // 文件：单行保持一行一条（grep 可用）；多行保留结构（诊断块可读）。
-    // 低于当前落盘级别的记录只进控制台 —— 终端始终是全量，级别只用来收窄文件。
-    if (shouldLogToFile(level)) {
-        appendToFile(mainSink, formatForFile(body, now, tag, short, verTag, loc));
-    }
-
-    // 内存缓冲：**每条都收**（不受落盘级别约束，过滤在读的时候做）——
-    // 这样查看器切到 DEBUG 能看到全量（等同终端），切到 ERROR 只看报错。
+    // 内存缓冲：**每条都收**（不受任何级别约束，过滤在读的时候做）——
+    // 无论控制台/文件级别怎么调，软件内查看器随时能看到全部历史。
     // 脱敏后再存：缓冲会经 /api/logs/tail 提供出去，与文件同一口径。
     logBuffer.push({
         ts: now, level, tag, loc,
         message: redactSecrets(body).replace(/^\n+/, ''),
     });
 
-    // 控制台：正文保持原样（多行就多行），人看的
+    // 文件：按落盘级别过滤。
+    if (shouldLogToFile(level)) {
+        appendToFile(mainSink, formatForFile(body, now, tag, short, verTag, loc));
+    }
+
+    // 控制台：按控制台级别过滤（2026-09 新增；此前终端恒为全量）。
+    // 正文保持原样（多行就多行），人看的。被过滤的记录进了缓冲与（若达标）文件，
+    // 需要时切级别或开查看器都能找回来 —— 不会丢，只是不刷屏。
+    if (!shouldLogToConsole(level)) return;
     const head = CONSOLE_COLOR
         ? `${ANSI_TIME}[${logTimeShort(now)}]${ANSI_RESET} [${tag}] ${LEVEL_COLOR[level] || ''}[${short}]${ANSI_RESET}${verTag} [${loc}]: `
         : `[${logTimeShort(now)}] [${tag}] [${short}]${verTag} [${loc}]: `;
@@ -1741,8 +1772,18 @@ function ipOf(request) {
 }
 
 // 把 response 包一层，结束时打一行。
-// 静态资源且成功的不打 —— 否则窗口会被 js / css / 图片刷满，真正的信息反而被埋掉。
-// 状态码决定级别：5xx 记 ERRO、4xx 记 WARN、其余 INFO，这样在日志里能直接按级别筛出问题。
+//
+// ★ 级别纪律（2026-09 重定，解决"请求日志刷屏"）：
+//   之前每个成功请求都记 INFO —— 一次页面加载十几行 GET /api/xxx 200，
+//   把真正的启动/插件/对话事件淹没（用户："大量无用日志耽误排查进度"）。
+//   AstrBot 的做法是常规成功事件归 DEBUG。这里照做：
+//
+//     DEBUG  正常请求（默认不可见 —— 排查时把级别调到 DEBUG 就全回来了）
+//     WARN   请求失败（4xx）或响应超慢（>3s，能让"怎么这么卡"有据可查）
+//     ERROR  服务端错误（5xx）
+//
+//   也就是说：**默认终端/文件一条请求日志都看不到**（除了失败和超慢的），
+//   但软件内日志查看器（内存缓冲全量）随时能按需翻 —— 信息不丢，只是不再刷屏。
 function attachRequestLog(request, response) {
     const started = Date.now();
     const origWriteHead = response.writeHead;
@@ -1754,16 +1795,19 @@ function attachRequestLog(request, response) {
         const code = response.__logStatus || response.statusCode || 0;
         const rawPath = String(request.url || '/');
         const pathOnly = rawPath.split('?')[0];
+        // 静态资源与高频轮询：连 DEBUG 都不打（缓冲里也不存 —— 纯流量，无信息量）
         if (code < 400 && (QUIET_FILE_RE.test(pathOnly) || QUIET_POLL_RE.test(pathOnly + (rawPath.includes('?') ? '?' : '')))) return;
         const ms = Date.now() - started;
+        const slow = ms > 3000;
         const line = ipOf(request).padEnd(15) + ' '
             + String(request.method || '?').padEnd(5) + ' '
             + (rawPath.length > 52 ? rawPath.slice(0, 49) + '...' : rawPath).padEnd(52) + ' '
             + String(code).padEnd(4) + String(ms).padStart(5) + 'ms'
+            + (slow ? '  << SLOW' : '')
             + (response.__logNote ? '   ' + response.__logNote : '')
-            + (code >= 500 ? '   << 服务端错误' : code >= 400 ? '   << 请求失败' : '');
-        // 时间戳由日志系统统一加，这里不再自己拼一个 —— 旧实现两份时间格式混在一行里
-        console[code >= 500 ? 'error' : code >= 400 ? 'warn' : 'log']('[http] ' + line);
+            + (code >= 500 ? '   << server error' : code >= 400 ? '   << request failed' : '');
+        const level = code >= 500 ? 'ERROR' : (code >= 400 || slow) ? 'WARN' : 'DEBUG';
+        console[level === 'DEBUG' ? 'debug' : level === 'WARN' ? 'warn' : 'error']('[http] ' + line);
     });
 }
 
@@ -2533,6 +2577,7 @@ const requestHandler = async (request, response) => {
             return jsonResponse(response, 200, {
                 ok: true,
                 level: fileLevel,
+                consoleLevel,
                 levels: LEVEL_NAMES,
                 trace: traceEnabled,
                 fileEnabled: LOG_TO_FILE,
@@ -2552,16 +2597,22 @@ const requestHandler = async (request, response) => {
                 if (!want) return jsonResponse(response, 400, { ok: false, message: '级别无效，可选：' + LEVEL_NAMES.join(' / ') });
                 if (setFileLogLevel(want)) notes.push(`落盘级别已改为 ${want}`);
             }
+            if (body && body.consoleLevel !== undefined) {
+                const want = normalizeLevelName(body.consoleLevel);
+                if (!want) return jsonResponse(response, 400, { ok: false, message: '级别无效，可选：' + LEVEL_NAMES.join(' / ') });
+                if (setConsoleLevel(want)) notes.push(`控制台级别已改为 ${want}`);
+            }
             if (body && body.trace !== undefined) {
                 if (setTraceEnabled(body.trace)) notes.push(body.trace ? '对话追踪已开启' : '对话追踪已关闭');
             }
             // 这次调整本身也要留下痕迹：否则日志级别被改过、事后却看不出来，
             // 排查"怎么少了那么多日志"时会先怀疑代码而不是设置。
+            // 用 warn 级别：即便控制台级别是 INFO 它也一定显示（用户刚做的操作必须可见）。
             if (notes.length) {
-                console.log(`[log] 日志设置已更新：${notes.join('；')}（操作者 ${ipOf(request)}）`);
+                console.warn(`[log] 日志设置已更新：${notes.join('；')}（操作者 ${ipOf(request)}）`);
             }
             return jsonResponse(response, 200, {
-                ok: true, level: fileLevel, trace: traceEnabled, changed: notes,
+                ok: true, level: fileLevel, consoleLevel, trace: traceEnabled, changed: notes,
             });
         }
 
