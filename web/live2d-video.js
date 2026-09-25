@@ -1456,6 +1456,18 @@
       else console.warn('[Live2D] 主应用手机操作不可用');
       return;
     }
+    // 电脑命令（[操作:电脑命令 dir]）：权限双模式 + 危险命令授权都在主应用里。
+    //
+    // ★ 必须放在**手机操作之前**：手机分支判据是 `/^(手机|设备)/`，不冲突；
+    //   但文件分支的判据里有「列出文件/查看文件」这类宽泛词，而电脑命令的正文
+    //   本身就可能含这些词（例如 `[操作:电脑命令 dir]` 不会命中，但
+    //   `[操作:电脑命令 git status]` 这类要稳）。用锚定前缀 `^电脑命令` 判定，
+    //   并放在文件分支前面，避免命令正文被当成文件操作标签吃掉。
+    if (/^(电脑命令|执行命令|运行命令|电脑执行)/.test(v)) {
+      if (window.agentActions?.agentCommandOperation) window.agentActions.agentCommandOperation(v);
+      else console.warn('[Live2D] 主应用电脑命令不可用');
+      return;
+    }
     // 文件操作（权限模式由设置控制，转发主应用执行并把结果回填对话）
     if (/列出文件|列出目录|查看文件夹|查看文件|读取文件|保存文件|写入文件|创建文件|新建文件/.test(v)) {
       if (window.agentActions?.agentFileOperation) window.agentActions.agentFileOperation(v);

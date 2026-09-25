@@ -98,8 +98,20 @@
                 + 'filter:drop-shadow(0 18px 40px rgba(0,0,0,.35))';
             root.innerHTML =
                 '<div id="petDrag" style="height:26px;cursor:move;display:flex;align-items:center;justify-content:center;'
+                  + 'position:relative;'
                   + 'border-radius:14px 14px 0 0;background:rgba(255,255,255,.55);backdrop-filter:blur(10px);'
-                  + 'font-size:11px;color:#6366f1;user-select:none">⠿ 按住拖动</div>'
+                  + 'font-size:11px;color:#6366f1;user-select:none">⠿ 按住拖动'
+                  // 主动搭话开关：放在拖动条右侧。
+                  //
+                  // 为什么放这儿：这是桌宠自己的行为（定时读电脑状态 → 主动说话），
+                  // 属于"宠物在做什么"，和桌宠放一起最自然。
+                  // **默认关闭** —— 会主动发消息、还会读电脑状态的功能，
+                  // 必须用户明确开启，不能默认打开。
+                  + '<button id="petProactive" type="button" title="主动搭话：定时看看你在忙什么，主动说句话" '
+                    + 'style="position:absolute;right:6px;top:3px;height:20px;padding:0 7px;border-radius:10px;'
+                    + 'border:1px solid rgba(99,102,241,.35);background:rgba(255,255,255,.6);cursor:pointer;'
+                    + 'font-size:10px;color:#6366f1;line-height:18px">主动搭话</button>'
+                + '</div>'
                 + '<div id="petCard" style="border-radius:0 0 18px 18px;overflow:hidden;'
                   + 'background:linear-gradient(180deg,rgba(255,255,255,.72),rgba(255,255,255,.55));'
                   + 'backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.7);border-top:0">'
@@ -170,6 +182,51 @@
                 if (ev.key === 'Enter') { ev.stopPropagation(); send(); }
             });
             inputEl.addEventListener('click', (ev) => ev.stopPropagation());
+
+            // 主动搭话开关（默认关闭）
+            const proBtn = root.querySelector('#petProactive');
+            const paintProactive = () => {
+                if (!proBtn) return;
+                const on = isProactive();
+                proBtn.textContent = on ? '主动搭话 · 开' : '主动搭话';
+                proBtn.style.background = on ? 'rgba(99,102,241,.9)' : 'rgba(255,255,255,.6)';
+                proBtn.style.color = on ? '#fff' : '#6366f1';
+            };
+            proBtn.addEventListener('click', async (ev) => {
+                // 阻止冒泡：它在拖动条里，不拦的话点按钮会触发拖拽
+                ev.stopPropagation();
+                const next = !isProactive();
+                if (!next) {
+                    setProactive(false);
+                    paintProactive();
+                    addBubble('那我就不打扰你了', 'ai');
+                    return;
+                }
+                paintProactive();
+                // ⚠️ 顺序很重要：先 setProactive（它写 localStorage），再 paint。
+                //   反过来画的是**旧状态** —— 按钮显示"关"、存储却是"1"，
+                //   状态不一致（实测踩过）。
+                // setProactive 开启时会**立即执行一次**并把 Promise 返回回来，
+                // 我们只等这一个结果来决定说什么 —— 不要自己再探一次，
+                // 那会重复读活动（白花 4 秒）并弹重复气泡（实测踩过）。
+                const r = await setProactive(true);
+                paintProactive();
+                if (!r || r.skipped === 'no-activity') {
+                    // 读不到就如实说明，并且**关回去** —— 开着开关却什么都不发生
+                    // 比明说"这里没有这个能力"更糟
+                    addBubble('读不到电脑状态（需要电脑版 + 服务端运行；手机端没有这个能力）', 'ai');
+                    setProactive(false);
+                    paintProactive();
+                    return;
+                }
+                if (r.skipped === 'no-conversation') {
+                    addBubble('还没有对话呢，先开一个对话我才能跟你说话～', 'ai');
+                    return;
+                }
+                if (r.sent) addBubble('好呀，我会偶尔看看你在忙什么～', 'ai');
+                else addBubble('发送失败了，可能对话已经不在了', 'ai');
+            });
+            paintProactive();
 
             // 恢复上次位置
             const p = String(pos).split(',');
@@ -243,6 +300,134 @@
             else setEmotion('calm');
         }
 
+        // ==================== 看电脑在干什么（主动搭话的基础） ====================
+        //
+        // 上游桌宠（C# / WPF）有 `UiTextReader.cs`：用 UIAutomation 读前台窗口
+        // 的标题与控件文本，然后定期"主动搭话"（PetBrain 的定时器）。
+        //
+        // 我们是 Web，浏览器里拿不到 UIAutomation —— 但**服务端可以**
+        // （它就跑在这台电脑上），所以走 `GET /api/agent/activity`。
+        // 服务端那边用 PowerShell 调同一套 UIAutomation API，能力等价。
+        //
+        // 该接口**仅本机可访问**（服务端已限制）：这是"用户在看什么"的隐私数据。
+        //
+        // 桌宠在**浏览器里**，所以 APK 端没有这个能力（那边没有服务端）——
+        // 拿不到就安静降级，不报错。
+
+        /** 读一次"当前在干什么"。失败返回 null（静默降级） */
+        async function fetchActivity(force) {
+            try {
+                const r = await fetch('/api/agent/activity' + (force ? '?force=1' : ''), { cache: 'no-store' });
+                if (!r.ok) return null;
+                const j = await r.json();
+                return j && j.ok ? j : null;
+            } catch (e) {
+                // 网络失败 / APK 端没有这个接口 / 非 Windows —— 都属于"没有这个能力"，
+                // 不该打扰用户（他可能只是没开服务端）
+                return null;
+            }
+        }
+
+        /** 主动搭话的冷却与去重状态 */
+        let lastProactiveAt = 0;
+        let lastActivityKey = '';
+
+        /**
+         * 主动搭话：读当前在干什么 → 拼一句提示交给主对话。
+         *
+         * 为什么要**去重 + 冷却**：
+         *   · 去重：同一个窗口反复触发会让 AI 一直说"你还在看那个啊"，很烦
+         *   · 冷却：用户可能刚说过话，不该马上又被搭话
+         * 所以只有当"活动指纹"变了、且距上次超过冷却时间，才会真的发。
+         *
+         * ★ 本函数**不弹气泡**，只返回结果（{sent} / {skipped}）——
+         *   由调用方决定要不要说话。理由：定时器触发时不该打扰用户
+         *   （那是后台行为），而用户**手动开启**时该给反馈。若在这里弹，
+         *   两条路径的文案会打架、甚至重复弹（实测踩过重复气泡）。
+         */
+        async function proactiveOnce(opts) {
+            const o = opts || {};
+            const now = Date.now();
+            const cooldown = Number(get('proactiveCooldown', 5 * 60 * 1000)) || 5 * 60 * 1000;
+            if (!o.force && now - lastProactiveAt < cooldown) return { skipped: 'cooldown' };
+
+            const act = await fetchActivity(o.force);
+            if (!act) return { skipped: 'no-activity' };
+
+            // 活动指纹：只看前台窗口标题 + 进程名，不含窗口正文（那会频繁变化，
+            // 导致每次都算"变了"而疯狂搭话）
+            const fgTitle = (act.foreground && act.foreground.title) || '';
+            const procNames = (act.processes || []).slice(0, 8).map((p) => p.name).join(',');
+            const key = fgTitle + '|' + procNames;
+            if (!o.force && key === lastActivityKey) return { skipped: 'same-activity' };
+
+            // ⚠️ 必须先确认"有当前对话"：没有对话时 sendUserMessage 会返回 false
+            //    （它要求 conv 存在）。用户开着桌宠但还没建对话是常见状态，
+            //    调用方会据此给出明确提示。
+            const conv = host.getConversation();
+            if (!conv) {
+                lastActivityKey = key;
+                lastProactiveAt = now;
+                return { skipped: 'no-conversation' };
+            }
+
+            lastActivityKey = key;
+            lastProactiveAt = now;
+
+            // 交给主对话：让 AI 以角色身份自然地评论/关心一句。
+            // 走 sendUserMessage 而不是自己拼回复 —— 复用宿主整条链路
+            // （记忆、停止、语音都自动生效），这也是 host API 的设计意图。
+            const prompt = [
+                '（系统提示：以下是这台电脑当前的状态，请以伊蕾娜的身份**自然地**对用户说一句话，',
+                '就像她看到你在忙什么随口搭话。不要提及"系统提示""检测到"这类字眼，',
+                '也不要逐条复述这些信息。一句话，口语化，20 字以内。）',
+                '',
+                act.summary,
+            ].join('\n');
+            const sent = host.sendUserMessage(prompt);
+            if (sent) setEmotion(emotionFrom(fgTitle || 'calm'));
+            return { sent, key };
+        }
+
+        let proactiveTimer = null;
+
+        /**
+         * 开关主动搭话（默认关闭 —— 会主动发消息的功能必须用户明确开启）。
+         *
+         * @param {boolean} on
+         * @param {boolean} [immediate] 是否立刻执行一次（默认 true）。
+         *   用户**点开关**时该立即执行 —— 否则要等 10 分钟才有反应，会以为坏了。
+         *   但**恢复定时器**（打开桌宠/刷新页面时按上次设置恢复）不该立即执行，
+         *   否则每次刷新都会平白发一条消息。
+         * @returns {Promise|null} 执行了首次则返回其 Promise；否则 null
+         */
+        function setProactive(on, immediate) {
+            set('proactive', on ? '1' : '0');
+            if (proactiveTimer) { clearInterval(proactiveTimer); proactiveTimer = null; }
+            if (!on) return null;
+            const every = Number(get('proactiveEvery', 10 * 60 * 1000)) || 10 * 60 * 1000;
+            const runNow = immediate !== false;
+            // ★ 立即执行一次（仅用户主动开启时）。
+            //
+            //   否则用户开了开关后要等 10 分钟才有反应，会以为功能坏了
+            //   （实测踩过：端到端测试等 6 秒，什么都没发生）。
+            //   立即执行还有个好处：马上就能看到"它读到我在干什么了"，
+            //   用户能立刻判断这个功能有没有用、要不要留着。
+            //
+            //   用 `force: true` 绕过冷却：这是用户**刚开启**时的"试一下"，
+            //   冷却的本意是防止重复打扰，不该拦住这次明确的开启动作。
+            //
+            //   把 Promise 返回给调用方，让它根据结果给反馈 —— 这样"读活动"
+            //   只发生一次。早先的写法是调用方自己再探一次，既多花 4 秒
+            //   （服务端要跑 PowerShell），又会和 proactiveOnce 内部各说一句话，
+            //   用户看到**两条重复气泡**（实测踩过）。
+            const first = runNow ? proactiveOnce({ force: true }) : null;
+            proactiveTimer = setInterval(() => { void proactiveOnce(); }, Math.max(60_000, every));
+            return first;
+        }
+
+        function isProactive() { return get('proactive', '0') === '1'; }
+
         // ==================== 发送 / 语音 ====================
 
         function send() {
@@ -297,6 +482,10 @@
                 if (!root || root.style.display === 'none') return;
                 try { syncFromState(); } catch (e) { /* 忽略 */ }
             }, 700);
+            // 主动搭话：mod 打开时按用户设置恢复定时器。
+            // 传 immediate=false —— 恢复定时器是后台行为，不该在打开桌宠 /
+            // 刷新页面时立刻发一条消息（用户没点开关）。
+            if (isProactive()) setProactive(true, false);
         }
 
         function close() {
@@ -304,6 +493,8 @@
             if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
             if (typeTimer) { clearInterval(typeTimer); typeTimer = null; }
             if (emoTimer) { clearTimeout(emoTimer); emoTimer = null; }
+            // 关掉桌宠就停掉主动搭话 —— 看不见的宠物不该在后台发消息
+            if (proactiveTimer) { clearInterval(proactiveTimer); proactiveTimer = null; }
         }
 
         function setEnabled(on) {
@@ -336,6 +527,14 @@
                 addBubble(String(text || ''), 'ai');
             },
             setEmotion,
+            // ---- 看电脑在干什么（上游 UiTextReader / PetBrain 的等价物）----
+            /** 读一次当前活动（前台窗口 + 进程）。失败返回 null */
+            activity: () => fetchActivity(false),
+            /** 立即主动搭话一次（忽略冷却；用于用户点"现在说一句"） */
+            proactiveNow: () => proactiveOnce({ force: true }),
+            /** 开关主动搭话（默认关闭） */
+            setProactive,
+            isProactive,
         };
     });
 })();

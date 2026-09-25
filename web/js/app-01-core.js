@@ -659,6 +659,10 @@ const DEFAULT_SETTINGS = {
     mimoBaseUrl: 'https://api.xiaomimimo.com',
     mimoAsrModel: 'mimo-v2.5-asr',
     thinkingMode: false,
+    // 思考强度：'low' | 'medium' | 'high'。默认 medium = **不显式指定**，
+    // 交给服务商自己的默认值（DeepSeek 是 high，OpenAI 是 medium）。
+    // 默认值选"不指定"而不是"high"：我们不该替用户决定他要花多少思考 token。
+    thinkingEffort: 'medium',
     autoMemory: false,
     memoryEvery: 6,
     agentPermission: 'app',
@@ -733,7 +737,6 @@ const elements = {
     initialComposerMoreMenu: document.getElementById('initialComposerMoreMenu'),
     initialComposerImageBtn: document.getElementById('initialComposerImageBtn'),
     initialComposerImagePreview: document.getElementById('initialComposerImagePreview'),
-    initialComposerThinkingToggle: document.getElementById('initialComposerThinkingToggle'),
     initialComposerMemoryBtn: document.getElementById('initialComposerMemoryBtn'),
     initialComposerMemoryStatus: document.getElementById('initialComposerMemoryStatus'),
     initialComposerPromptBtn: document.getElementById('initialComposerPromptBtn'),
@@ -743,7 +746,6 @@ const elements = {
     composerImageBtn: document.getElementById('composerImageBtn'),
     composerImagePreview: document.getElementById('composerImagePreview'),
     composerImageInput: document.getElementById('composerImageInput'),
-    composerThinkingToggle: document.getElementById('composerThinkingToggle'),
     composerMemoryBtn: document.getElementById('composerMemoryBtn'),
     composerMemoryStatus: document.getElementById('composerMemoryStatus'),
     composerPromptBtn: document.getElementById('composerPromptBtn'),
@@ -839,6 +841,10 @@ const elements = {
     settingApiFormat: document.getElementById('settingApiFormat'),
     settingBaseUrl: document.getElementById('settingBaseUrl'),
     settingChatModel: document.getElementById('settingChatModel'),
+    // 思考模式：开关 + 强度。原来在输入框旁的 ⊕ 菜单里，已移到「设置 → 对话」。
+    settingThinkingMode: document.getElementById('settingThinkingMode'),
+    settingThinkingEffort: document.getElementById('settingThinkingEffort'),
+    thinkingModeHint: document.getElementById('thinkingModeHint'),
     settingApiKey: document.getElementById('settingApiKey'),
     testChatConnectionBtn: document.getElementById('testChatConnectionBtn'),
     testTtsConnectionBtn: document.getElementById('testTtsConnectionBtn'),
@@ -1102,6 +1108,134 @@ function getNativeByokHttpPlugin() {
     return window.Capacitor?.Plugins?.ByokHttp || null;
 }
 
+// ===== 思考模式（各家参数差异很大，全部收在这里） =====
+//
+// 这里的历史坑值得写清楚，因为它解释了为什么这段代码看起来"多此一举"：
+//
+//   最早的实现是「换模型名」—— DeepSeek 官方开了深度思考就把 `deepseek-chat`
+//   换成 `deepseek-reasoner`。在 2025 年那代接口上这是**唯一**的办法，
+//   因为当时没有独立的思考开关字段。
+//
+//   但现在的接口已经改成了显式参数（DeepSeek 官方文档《思考模式》2026-09 版）：
+//     OpenAI 格式   {"thinking": {"type": "enabled"|"disabled"}} + "reasoning_effort": "low|high|max"
+//     Anthropic 格式 {"reasoning": {"effort": "none|low|high|max"}} + {"output_config": {"effort": ...}}
+//     Responses 格式 "reasoning": {"effort": ...}
+//   而且 **思考模式现在是默认开启的** —— 也就是说，用户把开关关掉时我们必须
+//   **显式**发 `disabled`，否则模型照样思考：用户关了开关却还在等几十秒、
+//   还在被扣思考 token，而界面上什么都看不到。这是本次适配最要紧的一条。
+//
+//   所以现在两件事都做：既发新参数（对支持的服务商生效），
+//   也保留换名（对只认模型名的老中转站生效）。两者互不冲突 ——
+//   服务商不认识新字段时会忽略它，而认识的会照做。
+
+/**
+ * 思考强度档位。对外只有三档，映射到各家自己的取值：
+ *   low    → 快速思考，省 token
+ *   medium → 默认（不显式发送，用服务商默认值）
+ *   high   → 深思考，最慢但最准
+ *
+ * 为什么对外只给三档而不是把各家的取值原样暴露：
+ * 用户在设置里看到的应该是"我要想多深"，而不是"我要发 reasoning_effort 还是 output_config.effort"。
+ * 各家的合法取值并不一致（DeepSeek 有 max、OpenAI 有 minimal），
+ * 让用户去记这些差异没有意义，映射表放在这里一处维护。
+ */
+const THINKING_EFFORTS = Object.freeze(['low', 'medium', 'high']);
+
+/**
+ * 把一个"思考强度"档位映射成某个服务商能接受的取值。
+ *
+ * @param {string} effort 内部档位：low / medium / high
+ * @param {string} vendor 'deepseek' | 'anthropic' | 'openai' | 'generic'
+ * @returns {string|null} null = 不发这个字段（用服务商默认值）
+ */
+function mapThinkingEffort(effort, vendor) {
+    const level = String(effort || 'medium').trim().toLowerCase();
+    if (level === 'medium' || !THINKING_EFFORTS.includes(level)) return null;   // 默认档：交给服务商
+    if (vendor === 'deepseek') {
+        // DeepSeek 官方只认 low/high/max，没有 medium（文档里 medium 会被映射成 high）。
+        // 所以「默认档」用不发字段来表达，而不是发一个 medium 让它去映射。
+        return level === 'low' ? 'low' : 'high';
+    }
+    if (vendor === 'openai') {
+        // OpenAI 的 reasoning_effort 取值是 minimal/low/medium/high。
+        // 我们这两档正好都有对应，不需要翻译。
+        return level;
+    }
+    if (vendor === 'anthropic') {
+        // Anthropic 官方 extended thinking 用 budget_tokens（token 预算）而不是档位；
+        // 只有走了 DeepSeek 的 Anthropic 兼容端点时才认 effort（见上面文档）。
+        // 这里返回档位名，由调用方决定放在 reasoning.effort 还是 output_config.effort。
+        return level;
+    }
+    return level;
+}
+
+/**
+ * 判断一个端点/模型该按哪家的思考参数来发。
+ *
+ * 判据是"地址优先、模型名兜底"：
+ *   · 地址能认出来（DeepSeek 官方 / Anthropic 官方 / OpenAI 官方）→ 按那家发；
+ *   · 认不出来（自建中转、硅基流动、OneAPI…）→ 看模型名里有没有 claude / gpt / o1 之类；
+ *   · 都认不出来 → 'generic'，只发最通用的 reasoning_effort，让服务商自己决定认不认。
+ *
+ * 为什么不干脆全发一遍：请求体里塞满互不认识的字段，有些严格的网关会直接 400
+ * （"unknown parameter"）。宁可少发，也不要让用户看到一个莫名其妙的报错。
+ */
+function detectThinkingVendor(settings) {
+    const baseUrl = String(settings?.baseUrl || '');
+    const model = String(settings?.model || '').toLowerCase();
+    if (isDeepSeekOfficial(baseUrl)) return 'deepseek';
+    try {
+        const host = new URL(baseUrl).hostname.toLowerCase();
+        if (/(^|\.)anthropic\.com$/.test(host)) return 'anthropic';
+        if (/(^|\.)openai\.com$/.test(host)) return 'openai';
+    } catch { /* 地址不合法就靠模型名判断 */ }
+    if (/claude|anthropic/.test(model)) return 'anthropic';
+    if (/gpt-5|gpt-4\.1|o1|o3|o4|codex/.test(model)) return 'openai';
+    if (/deepseek|reasoner/.test(model)) return 'deepseek';
+    return 'generic';
+}
+
+/**
+ * 造出「思考相关」的请求字段。三种格式共用，避免同一份判据抄三遍
+ * （抄三遍就会有一处忘记更新，而那种 bug 表现为"某个格式关不掉思考"）。
+ *
+ * @param {boolean} enabled 用户的思考模式开关
+ * @param {string} effort 思考强度档位
+ * @param {string} format 对话格式：openai-compatible / anthropic / openai-responses
+ * @param {object} settings 当前设置（用来判厂商）
+ * @returns {object} 要合并进请求体的字段
+ */
+function buildThinkingParams(enabled, effort, format, settings) {
+    const vendor = detectThinkingVendor(settings);
+    const level = mapThinkingEffort(effort, vendor);
+    const on = Boolean(enabled);
+
+    if (format === 'anthropic') {
+        // Anthropic 原生格式：思考开关走 reasoning.effort（none = 关闭）。
+        // ★ 注意 `thinking` 这个字段在 Anthropic 里是**另一种东西**
+        //   （{type:'enabled', budget_tokens:N}，是 Claude 官方的 extended thinking），
+        //   两者同名但不同义，混用会让 Claude 官方端点报参数错，所以这里只发 reasoning。
+        const out = { reasoning: { effort: on ? (level || 'high') : 'none' } };
+        // 开了思考时再补一个强度（DeepSeek 的 Anthropic 兼容端点认这个字段）
+        if (on && level) out.output_config = { effort: level };
+        return out;
+    }
+
+    if (format === 'openai-responses') {
+        // Responses 格式：只认 reasoning.effort。它没有"关闭"这个取值
+        // （官方取值 minimal/low/medium/high），所以关闭时不发字段 ——
+        // 靠调用方把模型换成非思考模型来表达"不要思考"。
+        if (!on) return {};
+        return { reasoning: { effort: level || 'medium' } };
+    }
+
+    // openai-compatible：thinking.type 开关 + reasoning_effort 强度
+    const out = { thinking: { type: on ? 'enabled' : 'disabled' } };
+    if (on && level) out.reasoning_effort = level;
+    return out;
+}
+
 
 // ===== 本机中转 =====
 // 页面由 web/serve.mjs 提供时，同源的 /api/server-info 必定存在。
@@ -1268,6 +1402,122 @@ async function postJsonFromDevice(url, body, headers = {}, timeoutMs = 120000, s
     return { ok: response.ok, status: response.status, rawText, payload };
     })();
     return abortPromise ? Promise.race([run, abortPromise]) : run;
+}
+
+/**
+ * 流式请求一个对话接口，边收边回调，返回**与非流式同构**的结果。
+ *
+ * 与非流式的唯一区别是多了一个 onDelta 回调，返回值形状完全一样
+ * （{ ok, status, rawText, payload }）—— 这样 chat-providers.js 里那三个解析函数
+ * 一个字都不用改，流式和非流式共用同一段解析代码。
+ * 如果这里返回一个不同形状的结果，就会出现"流式能显示、非流式显示不了"
+ * 这种只在某一条路上才发作的 bug，非常难查。
+ *
+ * 三种情况会**静默退回非流式**（功能优先于观感）：
+ *   ① APK：原生 ByokHttpPlugin.post 一次性返回整个 body，根本没有流通道；
+ *   ② 上游不支持 stream：会立刻返回 400/404，这里当作普通错误响应交回调用方；
+ *   ③ 中转站把 SSE 缓冲了：content-type 不是 event-stream，按普通响应处理。
+ *
+ * @param {string} url 目标地址
+ * @param {object} body 请求体（本函数负责加 stream: true）
+ * @param {object} headers 请求头
+ * @param {object} options { format, timeoutMs, signal, onDelta }
+ */
+async function streamJsonFromDevice(url, body, headers = {}, options = {}) {
+    const { format = 'openai-compatible', timeoutMs = 120000, signal = null, onDelta = null } = options;
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    // ① 原生层没有流通道 → 直接走非流式，不尝试（试了也是白试，还会多一次请求）
+    if (getNativeByokHttpPlugin()?.post) {
+        return await postJsonFromDevice(url, body, headers, timeoutMs, signal);
+    }
+
+    const streamBody = window.ChatStream.withStreamFlag(body, format, true);
+    const useRelay = await detectLocalRelay();
+    let response;
+    if (useRelay) {
+        response = await fetchWithTimeout('/api/relay', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                url, method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...headers },
+                body: JSON.stringify(streamBody),
+                timeoutMs
+            })
+        }, timeoutMs + 10000, signal);
+    } else {
+        response = await fetchWithTimeout(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...headers },
+            body: JSON.stringify(streamBody)
+        }, timeoutMs, signal);
+    }
+
+    const contentType = String(response.headers.get('content-type') || '');
+    // ② / ③ 不是 SSE 就按普通响应处理：上游的错误体（400/401/429…）都是普通 JSON，
+    // 当成流去读会读不到任何 data 行，最后得到一个空回复 —— 那才是最糟的结果。
+    if (!response.ok || !/text\/event-stream/i.test(contentType)) {
+        const rawText = await response.text();
+        let payload = null;
+        if (rawText) {
+            try { payload = JSON.parse(rawText); } catch {}
+        }
+        // 和中转同一条错误归一化路径：relayError 表示"连目标都没连上"
+        if (payload && payload.relayError) {
+            throw new ClientApiError('UPSTREAM_UNAVAILABLE', String(payload.message || '本地中转请求失败'));
+        }
+        if (response.status === 401 || payload?.needLogin) {
+            throw new ClientApiError('LOCAL_SERVER_UNAUTHORIZED',
+                String(payload?.message || '本机服务的登录状态已失效，请刷新页面重新输入访问密码'));
+        }
+        return { ok: response.ok, status: response.status, rawText, payload };
+    }
+
+    const { payload } = await window.ChatStream.consumeStream(response, format, onDelta);
+    return { ok: true, status: response.status, rawText: JSON.stringify(payload), payload };
+}
+
+/**
+ * 对话请求的统一出口：**优先流式，失败退回非流式**。
+ *
+ * 为什么把"要不要流式"这个决定收在这里，而不是让三个 provider 各自判断：
+ * 三个 provider 各判一次就有三处会走样，而这类差异的表现是"某个格式不流式"，
+ * 属于用户很难描述、我们很难复现的那种问题。判据只有一处，就不会有分歧。
+ *
+ * @param {object} opts 至少含 { signal, onDelta }；`stream: false` 可强制非流式
+ * @param {string} format 该 provider 对应的协议（决定增量事件的解析方式）
+ */
+async function requestChatJson(endpoint, body, headers, opts = {}, format = 'openai-compatible') {
+    const wantStream = opts.stream !== false && typeof window.ChatStream !== 'undefined';
+    if (!wantStream) {
+        return await postJsonFromDevice(endpoint, body, headers, opts.timeoutMs, opts.signal);
+    }
+
+    // 记一下"流式有没有真的吐出过内容"。这决定了失败时能不能安全回退：
+    //   · 一个字都还没吐 → 回退非流式是安全的（用户什么都没看到）；
+    //   · 已经吐了半句   → 不能回退，否则那半句会被"从头再来"的完整回复顶掉，
+    //                      界面上表现为内容闪一下、重复一段。
+    let sawDelta = false;
+    const wrappedOnDelta = typeof opts.onDelta === 'function'
+        ? (chunk) => { sawDelta = true; opts.onDelta(chunk); }
+        : null;
+
+    try {
+        return await streamJsonFromDevice(endpoint, body, headers, {
+            format,
+            timeoutMs: opts.timeoutMs,
+            signal: opts.signal,
+            onDelta: wrappedOnDelta,
+        });
+    } catch (error) {
+        // 用户主动点「停止」不算失败，绝不能重试 —— 否则停止按钮会立刻又发一次请求
+        if (error?.name === 'AbortError') throw error;
+        // 已经吐出过内容就不回退，把错误原样抛给上层（半截回复留在界面上）
+        if (sawDelta) throw error;
+        console.warn(`[Chat] ${format} 流式不可用，退回非流式：${error?.message || error}`);
+        return await postJsonFromDevice(endpoint, body, headers, opts.timeoutMs, opts.signal);
+    }
 }
 
 /**
@@ -1487,6 +1737,12 @@ window.ChatDeps = {
     getChatBaseUrl,
     isDeepSeekOfficial,
     postJsonFromDevice,
+    // 流式出口：providers 用它发请求，内部自己决定走流式还是退回非流式。
+    // 三个 provider 都改用它之后，`要不要流式`这个判据就只有一处（requestChatJson）。
+    requestChatJson,
+    // 思考开关/强度 → 各协议的请求字段。放这里是因为三种格式都要用，
+    // 而"某家该发什么字段"的判据抄三遍必然有一处忘了更新。
+    buildThinkingParams,
     normalizeChatReply,
     throwProviderResponseError,
     extractTextContent,
@@ -1509,8 +1765,8 @@ async function callChatAPI(messages, opts = {}, settings = state.settings) {
     const normalized = mergeLeadingSystemMessages(messages);
     // 输出上限在这里统一算一次，三种格式都受益 —— 让「模型名后缀是否要求保底」这个判据
     // 只有一处，而不是散在三个格式函数里（见 resolveOutputTokenLimit 的说明）。
-    // 顺序无碍：openai-compatible 稍后可能把 deepseek-chat 换成 deepseek-reasoner，
-    // 但换出来的名字不含 `-thinking`，先算后算结果一样。
+    // 注意 providers 里那个老模型名 → deepseek-flash 的映射也**不含** `-thinking` 后缀，
+    // 所以先算后算结果一样（以前这里写的是"换成 deepseek-reasoner"，那个映射已经取消）。
     const resolvedOpts = Object.assign({}, opts, {
         maxTokens: resolveOutputTokenLimit(settings.model, opts.maxTokens, format === 'anthropic')
     });

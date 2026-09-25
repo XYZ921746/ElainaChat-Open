@@ -93,6 +93,9 @@ function fillSettingsForm() {
     elements.settingBaseUrl.value = state.settings.baseUrl || fillPreset.defaultBaseUrl;
     elements.settingChatModel.value = state.settings.model || fillPreset.defaultModel;
     elements.settingApiKey.value = state.settings.apiKey;
+    // 思考模式：开关 + 强度。用 syncThinkingModeControls() 统一回填，
+    // 不在这里各写一遍 —— 回填逻辑分散就会有一天忘记同步新增的档位。
+    syncThinkingModeControls();
     elements.settingTtsProvider.value = state.settings.ttsProvider || 'edge';
     document.getElementById('settingMinimaxApiKey').value = state.settings.minimaxApiKey || '';
     document.getElementById('settingMinimaxVoice').value = state.settings.minimaxVoice || '';
@@ -1123,7 +1126,15 @@ async function saveSettings() {
         memoryEvery: Math.max(3, Math.min(50, parseInt(elements.settingMemoryEvery.value, 10) || 6)),
         agentPermission: document.querySelector('input[name="agentPermission"]:checked')?.value || 'app',
         agentApproval: document.querySelector('input[name="agentApproval"]:checked')?.value || 'once',
-        agentPhoneEnabled: document.getElementById('settingAgentPhoneEnabled')?.checked !== false
+        agentPhoneEnabled: document.getElementById('settingAgentPhoneEnabled')?.checked !== false,
+        // 思考模式：以设置面板当前状态为准。
+        // 注意这两个控件是"改了立刻生效 + 立刻持久化"的（见 app-07-init.js），
+        // 这里再读一次是为了覆盖"用户改了控件但没点保存、又点了保存"的路径 ——
+        // 两条路径都要落到同一个值，否则会出现"保存后又变回旧值"。
+        thinkingMode: elements.settingThinkingMode.checked,
+        thinkingEffort: THINKING_EFFORTS.includes(elements.settingThinkingEffort.value)
+            ? elements.settingThinkingEffort.value
+            : 'medium'
     };
     try {
         await saveApiSecrets(state.settings);

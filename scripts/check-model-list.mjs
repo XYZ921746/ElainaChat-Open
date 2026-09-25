@@ -101,6 +101,10 @@ const rawCtxFactory = new Function('window', `
     ${extractFn('stripThinkTags')}
     ${extractFn('extractTextContent')}
     ${extractFn('normalizeChatReply')}
+    ${extractFn('mapThinkingEffort')}
+    ${extractFn('detectThinkingVendor')}
+    ${extractFn('buildThinkingParams')}
+    const THINKING_EFFORTS = Object.freeze(['low', 'medium', 'high']);
     // anthropicContentBlocks / convertOpenAIToAnthropicMessages / callAnthropicChat
     // 已迁到 web/js/chat-providers.js（见开发文档 8.33）—— 不再从 index.html 抠，
     // 改为在下面直接加载那个真模块（测的就是线上跑的那份）。
@@ -108,6 +112,9 @@ const rawCtxFactory = new Function('window', `
     ${extractFn('thinkingSuffixTokenFloor')}
     ${extractFn('resolveOutputTokenLimit')}
     ${extractFn('getChatBaseUrl')}
+    // detectThinkingVendor 会用它判断"是不是 DeepSeek 官方地址"，
+    // 所以本检查的上下文里必须有真身（不抠出来会 ReferenceError）
+    ${extractFn('isDeepSeekOfficial')}
     ${extractClass('ClientApiError')}
     ${extractFn('modelsEndpointFor')}
     ${extractFn('parseModelList')}
@@ -124,6 +131,7 @@ const rawCtxFactory = new Function('window', `
         //   · isDeepSeekOfficial 本检查用不到（callAnthropicChat 不依赖它），
         //     本环境也没定义 —— 所以不导出，否则会 ReferenceError。
         getChatBaseUrl, normalizeChatReply, postJsonFromDevice,
+        buildThinkingParams,
         throwProviderResponseError, extractTextContent, stripThinkTags,
         resolveOutputTokenLimit, ANTHROPIC_MIN_MAX_TOKENS,
         setGetResults, resetGetCalls, getCalls, postCalls, lastGet, lastPost,
@@ -140,6 +148,12 @@ fakeWindow.ChatDeps = {
     getChatBaseUrl: ctx.getChatBaseUrl,
     normalizeChatReply: ctx.normalizeChatReply,
     postJsonFromDevice: ctx.postJsonFromDevice,
+    // providers 现在走 requestChatJson（内部决定流式/非流式）。本检查只关心
+    // 模型列表与地址拼接，不验证流式，所以让它转发到同一个假出口。
+    requestChatJson: async (endpoint, body, headers, opts) =>
+        await ctx.postJsonFromDevice(endpoint, body, headers, opts?.timeoutMs, opts?.signal),
+    // 思考参数：真实实现（从 index.html 抠）。假的话就等于自己测自己。
+    buildThinkingParams: ctx.buildThinkingParams,
     throwProviderResponseError: ctx.throwProviderResponseError,
     extractTextContent: ctx.extractTextContent,
     stripThinkTags: ctx.stripThinkTags,

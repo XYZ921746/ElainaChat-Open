@@ -137,14 +137,52 @@
              * 以用户身份发一条消息。复用宿主 handleUserInput，
              * 保证"从插件发出的消息"和"从主输入框发出的"完全同一条链路
              * （记忆、续跑、停止、语音都自动生效）。
+             *
+             * ★ 必须自己构造消息**对象**并推进会话，不能只把字符串丢给
+             *   handleUserInput —— 它签名是 `(message, conversation)`，
+             *   内部读 `message.text` / `message.id`。早先这里传的是字符串，
+             *   于是 `message.text` 是 undefined → **发出去的是空消息**
+             *   （实测踩过：出站请求里 `role=user` 的内容长度是 0，
+             *   桌宠的"主动搭话"因此说了个空话，AI 完全看不到电脑状态）。
+             *
+             *   主输入框那条路（processVoiceInput / handleInitialTextSubmit）
+             *   也是这么构造的：id + role + text + timestamp，再 push 进
+             *   conversation.messages。这里照做，才叫"同一条链路"。
              */
             sendUserMessage(text) {
                 try {
                     const msg = String(text || '').trim();
                     if (!msg) return false;
                     const c = this.getConversation();
-                    if (typeof handleUserInput !== 'function' || !c) return false;
-                    handleUserInput(msg, c);
+                    if (!c || typeof handleUserInput !== 'function') return false;
+                    if (typeof generateId !== 'function') return false;
+
+                    const message = {
+                        id: generateId(),
+                        role: 'user',
+                        text: msg,
+                        timestamp: new Date().toLocaleTimeString(),
+                    };
+                    if (!Array.isArray(c.messages)) c.messages = [];
+                    c.messages.push(message);
+
+                    // 首条消息时给会话起个名（与主输入框一致），
+                    // 否则插件发出的第一条消息不会让会话标题变正常
+                    if (c.messages.length === 1) {
+                        try {
+                            if (typeof autoNameConversation === 'function') {
+                                c.title = autoNameConversation(c.messages);
+                            }
+                            if (typeof renderFolderList === 'function') renderFolderList();
+                            if (typeof updateCurrentConversationTitle === 'function') updateCurrentConversationTitle();
+                        } catch (e) { /* 命名失败不影响发送 */ }
+                    }
+                    // 让界面把新消息画出来（主输入框那条路也会 loadConversation）
+                    try {
+                        if (typeof loadConversation === 'function') loadConversation(c.id);
+                    } catch (e) { /* 忽略 */ }
+
+                    handleUserInput(message, c);
                     return true;
                 } catch (e) { log('error', 'sendUserMessage 失败', e); return false; }
             },

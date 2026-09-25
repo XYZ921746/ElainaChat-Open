@@ -68,16 +68,38 @@ ok(/scheduleAgentContinue\(\)/.test(insertFn),
 // **被拒绝**的结果。它们若也触发续跑，就变成"被拒绝 → 续跑 → 又试 → 又被拒绝"的
 // 无效循环，用户看到 AI 对着做不到的事反复尝试。所以必须是"选择加入"而非"选择退出"。
 // 统计**真实调用**（排除注释行与函数定义里的说明）
-const continueCallSites = html.split('\n')
+//
+// 判据是「**白名单**」而不是「数量等于 N」：
+// 数量断言会误伤新加的合法成功路径（例如 2026-09 新增的电脑命令成功处），
+// 而且它挡不住"把一处合法调用换成一处非法调用、数量不变"这种改动。
+// 白名单同时解决这两点：新路径必须显式登记（逼作者想清楚"这算不算做完了"），
+// 非法路径无论怎么换数量都过不了。
+const ALLOWED_CONTINUE_SITES = [
+    { re: /insertAgentResult\(resultText, \{ continueLoop: true \}\)/, label: '文件操作成功' },
+    { re: /insertAgentResult\(opResult, \{ continueLoop: true \}\)/, label: '手机操作成功' },
+    { re: /insertAgentResult\('命令执行结果：\\n' \+ text, \{ continueLoop: true \}\)/, label: '电脑命令成功' },
+];
+const continueLines = html.split('\n')
     .filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*'))
-    .filter((l) => /insertAgentResult\(.*continueLoop: true/.test(l))
-    .length;
-ok(continueCallSites === 2,
-    '只有"真的做完了"的两处开启续跑（文件成功 + 手机成功）',
-    `实际 ${continueCallSites} 处`);
+    .filter((l) => /insertAgentResult\(.*continueLoop: true/.test(l));
+const unregistered = continueLines.filter((l) => !ALLOWED_CONTINUE_SITES.some((s) => s.re.test(l)));
+ok(unregistered.length === 0,
+    '开启续跑的调用点全部在白名单内（新增成功路径需显式登记）',
+    unregistered.length ? '未登记：\n      ' + unregistered.map((l) => l.trim()).join('\n      ') : '');
+// 反向：白名单里每一条都必须真的还在（防止被删掉后白名单变成空保护）
+const missing = ALLOWED_CONTINUE_SITES.filter((s) => !continueLines.some((l) => s.re.test(l)));
+ok(missing.length === 0,
+    '白名单里的成功路径都还在（文件 / 手机 / 电脑命令）',
+    missing.length ? '缺失：' + missing.map((s) => s.label).join('、') : '');
+ok(continueLines.length === ALLOWED_CONTINUE_SITES.length,
+    `续跑调用点数量与白名单一致（${ALLOWED_CONTINUE_SITES.length} 处）`,
+    `实际 ${continueLines.length} 处`);
 ok(/insertAgentResult\(resultText, \{ continueLoop: true \}\)/.test(html),
     '文件操作成功处开启续跑');
-ok(/insertAgentResult\(await execPhoneOperation\(parsed\), \{ continueLoop: true \}\)/.test(html),
+// 手机操作成功处：结果先落进变量（为了同时记进「回合过程」的工具调用行），
+// 再插进对话并续跑 —— 断言语义（成功结果 + continueLoop）而不是某一种写法。
+ok(/const opResult = await execPhoneOperation\(parsed\);/.test(html)
+    && /insertAgentResult\(opResult, \{ continueLoop: true \}\)/.test(html),
     '手机操作成功处开启续跑');
 // 被拒绝/失败类的结果**不能**开启续跑
 ok(!/已跳过[^)]*continueLoop: true/.test(html), '「已跳过」类结果不续跑');

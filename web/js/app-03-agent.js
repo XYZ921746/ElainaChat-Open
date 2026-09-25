@@ -65,6 +65,19 @@ window.agentActions = {
     // 「停止检查 + 敏感操作授权」由 agentRuntime 统一处理（见 runAgentPhoneOperation）。
     agentPhoneOperation(raw) {
         void runAgentPhoneOperation(raw);
+    },
+    // 电脑命令：[操作:电脑命令 dir] 等（第二阶段 ④）。
+    // 只在「允许操作电脑」模式下可用；危险命令由服务端判定后再问用户
+    // （见 doAgentCommand 与 server/pc-command.mjs）。
+    agentCommandOperation(raw) {
+        const text = String(raw || '').trim();
+        // 剥掉触发前缀，剩下的就是命令原文
+        const command = text.replace(/^(?:电脑命令|执行命令|运行命令|电脑执行)\s*/, '').trim();
+        if (!command) {
+            insertAgentResult('没有给出要执行的命令。请用 [操作:电脑命令 <命令>] 的格式。');
+            return;
+        }
+        void doAgentCommand(command, state.settings.agentPermission || 'app');
     }
 };
 
@@ -85,7 +98,12 @@ const AGENT_RISK = {
     '手机输入': 'sensitive',
     '手机按键': 'sensitive',
     '手机打开': 'sensitive',
-    '手机命令': 'dangerous'
+    '手机命令': 'dangerous',
+    // 电脑命令：危险的那部分由**服务端**再判一次并强制授权（见 server/pc-command.mjs），
+    // 这里标 sensitive 是让"安全命令"不打扰用户、危险命令走同一条授权 UI。
+    // 为什么不在前端也标 dangerous：前端标了会把 `dir` 这种也变成每次必问，
+    // 而真正的危险判定要穷举命令语义，只有服务端那份规则表是权威。
+    '电脑命令': 'sensitive'
 };
 
 const agentRuntime = (function () {
@@ -212,14 +230,27 @@ const agentRuntime = (function () {
 
     function riskOf(action) { return AGENT_RISK[action] || 'sensitive'; }
 
-    /** 敏感操作授权。返回 true 表示可以执行。 */
-    async function requestApproval(action, detail) {
+    /**
+ * 敏感操作授权。返回 true 表示可以执行。
+ *
+ * @param {string} action 操作名（决定风险级别）
+ * @param {string} detail 给用户看的具体内容
+ * @param {object} [opts] { forceAsk: true } —— 无视"已确认豁免"，这一条必须问
+ */
+    async function requestApproval(action, detail, opts = {}) {
         const risk = riskOf(action);
         if (risk === 'safe') return true;
         if (stopRequested) return false;
         const policy = state.settings.agentApproval || 'once';
-        // dangerous（执行任意系统命令）在任何策略下都单独问，不进入"已确认"的豁免。
-        if (risk !== 'dangerous') {
+        // ★ forceAsk：调用方已经知道这一条**具体**是危险的（例如服务端判定某条
+        //   电脑命令为 dangerous）。操作名本身是 sensitive 不够 —— 因为
+        //   「电脑命令」这一类里既有 `dir` 也有 `del`，只有服务端知道这一次是哪一种。
+        //
+        //   为什么必须绕过豁免：豁免是按**操作名**记的（once 策略下"确认过一次就
+        //   全放行"）。若不绕过，用户确认过一次任意敏感操作之后，一条 `del` 就会
+        //   静默执行 —— 直接违背"危险系统命令执行前需授权"。
+        const mustAsk = opts.forceAsk === true;
+        if (risk !== 'dangerous' && !mustAsk) {
             if (policy === 'off') return true;
             // 「每次运行只确认一次」：只要这一轮里用户确认过**任何**敏感操作，
             // 后面的点击/滑动/输入都直接放行 —— 停止靠悬浮窗，不靠反复确认。
@@ -227,12 +258,13 @@ const agentRuntime = (function () {
             // 「每类操作各确认一次」：同名操作（手机点击/手机滑动/...）只问第一次
             if (policy === 'run' && approvedThisRun.has(action)) return true;
         }
+        const askRisk = mustAsk ? 'dangerous' : risk;
         const lines = ['AI 想执行：' + action];
         if (detail) lines.push('', detail);
-        lines.push('', risk === 'dangerous'
+        lines.push('', askRisk === 'dangerous'
             ? '这是可以执行任意系统命令的操作，风险很高，请确认你信任当前对话里出现的内容。'
             : '该操作会改变手机状态。拒绝后 AI 会收到通知并尝试别的方式，不会卡住。');
-        if (risk !== 'dangerous' && (policy === 'always' || policy === 'run')) {
+        if (askRisk !== 'dangerous' && (policy === 'always' || policy === 'run')) {
             lines.push('', '（想减少打扰：设置 → 能力 → 手机操作，把确认策略改为「每次运行只确认一次」）');
         }
 
@@ -254,7 +286,7 @@ const agentRuntime = (function () {
             // 悬浮窗这条路走不通 → 应用内弹窗
             try {
                 ok = await showCustomModal({
-                    title: risk === 'dangerous' ? '危险操作确认' : '敏感操作确认',
+                    title: askRisk === 'dangerous' ? '危险操作确认' : '敏感操作确认',
                     message: lines.join('\n'),
                     confirmText: '允许这次',
                     cancelText: '拒绝'
@@ -585,15 +617,28 @@ async function runAgentPhoneOperation(raw) {
     try {
         rt.assertNotStopped();
         rt.setStep(rt.getStep() + 1, parsed.action);
+        // 过程记录：把这一步记进回合过程区（对话里那条可折叠的"工具调用行"）。
+        // 记的是**用户能看懂的事实**：做了什么、参数是什么、结果如何。
+        // 这些记录与思考开关无关 —— 关掉思考也照样显示。
+        const traceItem = recordTurnTool({
+            kind: 'phone',
+            title: '手机 · ' + parsed.action,
+            summary: describePhoneOperation(parsed),
+            args: parsed.args ? JSON.stringify(parsed.args) : '',
+            state: 'running'
+        });
         // safe 直接放行；sensitive 按设置里的策略询问；dangerous 必问
         const allowed = await rt.requestApproval(parsed.action, describePhoneOperation(parsed));
         if (!allowed) {
+            updateTurnTool(traceItem, { state: 'stopped', result: '用户没有允许这一步' });
             insertAgentResult('已跳过「' + parsed.action + '」：用户没有允许这一步。请换一种方式，或先向用户说明为什么要这么做。');
             return;
         }
         rt.assertNotStopped();
         // 这一步真的执行了 → 让 AI 接着决定下一步（见 insertAgentResult 的说明）
-        insertAgentResult(await execPhoneOperation(parsed), { continueLoop: true });
+        const opResult = await execPhoneOperation(parsed);
+        updateTurnTool(traceItem, { state: 'ok', result: opResult });
+        insertAgentResult(opResult, { continueLoop: true });
     } catch (err) {
         if (err && err.agentAborted) {
             insertAgentResult('已停止：用户中止了操作，剩余步骤没有执行。');
@@ -786,6 +831,40 @@ function agentPhoneSkillText() {
         '   没有标签就是没执行，执行结果一律以系统回灌的「【AI 操作结果】」为准。'
     );
     return lines.join('\n');
+}
+
+/**
+ * 注入系统提示词的「电脑命令」能力说明（第二阶段 ④）。
+ *
+ * 为什么必须有这一段：和手机操作同一个坑 —— 执行链路早就通了，
+ * 但提示词里不告诉模型标签存在，它就永远不会输出，用户看到的现象是
+ * "AI 好像不能执行命令"。而**只在全权限模式下注入**：限制模式下能力被
+ * 服务端直接拒绝，说了只会让模型反复尝试然后失败。
+ *
+ * 提示词里必须写清「危险命令会先问用户」—— 否则模型会以为自己被静默拒绝，
+ * 或者反过来编造"命令已执行"。这是 agentPhoneSkillText 里同一条反幻觉约束。
+ */
+function agentCommandSkillText() {
+    if ((state.settings.agentPermission || 'app') !== 'computer') return '';
+    // APK 没有本机服务端（没有 /api/agent/exec），注入了也执行不了。
+    // 必须用 IS_NATIVE_APP 而不是看协议 —— Capacitor 的 androidScheme 是 https，
+    // 按协议判断会把 APK 当成网页版，于是注入一个用不了的能力（模型反复失败）。
+    if (IS_NATIVE_APP) return '';
+    return [
+        '# Agent Skill：电脑命令（当前：允许操作电脑）',
+        '你可以在这台电脑上执行 PowerShell / cmd 命令：',
+        '· [操作:电脑命令 <命令>] —— 例如 [操作:电脑命令 dir]、[操作:电脑命令 git status]',
+        '',
+        '【工作方式】',
+        '1. 普通命令（查看目录、读系统信息、跑 git / node 等）会**直接执行**，结果立刻回灌给你。',
+        '2. ⚠️ **危险命令会先弹窗问用户**（删除文件、改注册表、关机、下载并执行、提权等）。'
+            + '用户可能拒绝 —— 被拒绝时如实说明并换个更安全的思路，不要反复重试同一条命令。',
+        '3. 命令输出较长时会被截断，需要看别的部分就换一条更精确的命令（例如加过滤条件）。',
+        '4. ⚠️ 只有输出 [操作:电脑命令 …] 标签才会真正执行。**绝不编造**"我已经执行了/命令输出是…"；',
+        '   执行结果一律以系统回灌的「【AI 操作结果】」为准。',
+        '5. 不确定命令的写法时，先用 [操作:电脑命令 <命令> --help] 或 [操作:电脑命令 where <程序名>] 探一下，'
+            + '不要凭猜测拼一条可能破坏系统的命令。',
+    ].join('\n');
 }
 
 /**
@@ -1080,10 +1159,22 @@ function confirmAgentWrite(path, permission) {
 
 // 执行 Agent 文件操作并把结果回填对话（AI 能看到/用户能看到）
 async function doAgentFile(action, { path, content } = {}, permission) {
+    // 过程记录：文件操作是用户最关心的"AI 到底动了什么"。
+    // 记下路径与动作，结果出来后再回填（成功/失败 + 摘要）。
+    const kindMap = { ls: 'search', read: 'read', write: 'write' };
+    const titleMap = { ls: '列出文件', read: '读取文件', write: '写入文件' };
+    const traceItem = recordTurnTool({
+        kind: kindMap[action] || 'file',
+        title: titleMap[action] || ('文件 · ' + action),
+        summary: path || '（未提供路径）',
+        args: action === 'write' && content ? `路径：${path}\n内容长度：${String(content).length} 字` : (path || ''),
+        state: 'running'
+    });
     try {
         let result;
         if (action === 'write') {
             if (!confirmAgentWrite(path, permission)) {
+                updateTurnTool(traceItem, { state: 'stopped', result: '用户取消了这次写入' });
                 insertAgentResult('已取消写入：在「允许操作电脑」模式下没有确认这次操作。\n目标：' + (path || '（未提供路径）'));
                 return;
             }
@@ -1134,13 +1225,108 @@ async function doAgentFile(action, { path, content } = {}, permission) {
                 resultText = `✅ 已保存到：${result.path || path}`;
             }
             insertAgentResult(resultText, { continueLoop: true });
+            updateTurnTool(traceItem, {
+                state: 'ok',
+                // 结果摘要截断：过程行展开区有 max-height，但整篇文件内容塞进去
+                // 会让 DOM 变得很重（几万字的文件每次重绘都要 escape 一遍）
+                result: resultText.length > 4000 ? resultText.slice(0, 4000) + '\n…（已截断）' : resultText
+            });
             agentConsecutiveFailures = 0; // 成功了就把重试预算还回去
         } else {
             // 失败：把原因交给 AI，让它以角色口吻自然解释（不直接甩原始错误）
+            updateTurnTool(traceItem, { state: 'error', result: errMsg });
             agentConsecutiveFailures += 1;
             await explainAgentFailure(errMsg);
         }
     } catch (err) {
+        updateTurnTool(traceItem, { state: 'error', result: err.message || String(err) });
+        agentConsecutiveFailures += 1;
+        await explainAgentFailure(err.message || String(err));
+    }
+}
+
+/**
+ * 执行 AI 请求的电脑命令（[操作:电脑命令 …]）。
+ *
+ * 权限双模式在这里的落点：
+ *   · app（限制）      → 不发请求，直接回灌"限制模式不支持"，并告诉 AI 去哪开。
+ *   · computer（全权限）→ 发请求；服务端判为危险时回 needApproval，
+ *                          这时才弹确认框，用户同意后带 approved:true 重发。
+ *
+ * ★ 为什么危险判定要"先问服务端、再问用户"，而不是前端自己判：
+ *   前端判会把规则抄一份（两份规则必然走样），而且服务端无论如何都要再判一次
+ *   （前端可绕过）。让服务端当唯一权威，前端只负责"把服务端的判定转成一次点击"。
+ */
+async function doAgentCommand(command, permission) {
+    const traceItem = recordTurnTool({
+        kind: 'command',
+        title: '执行命令',
+        summary: command,
+        args: command,
+        state: 'running'
+    });
+
+    if (permission !== 'computer') {
+        const msg = '限制模式（仅应用文件夹）下不能执行电脑命令。如需执行，请在设置 → 能力 → '
+            + '「AI 操作电脑」里切换到「允许操作电脑」，并在本机（127.0.0.1）打开页面。';
+        updateTurnTool(traceItem, { state: 'stopped', result: msg });
+        insertAgentResult(msg);
+        return;
+    }
+    // APK 没有本机服务端，/api/agent/exec 不存在 —— 直接如实说明，不要去发一个必然失败的请求
+    if (IS_NATIVE_APP) {
+        const msg = '当前是安卓 App，没有本机服务端，无法执行电脑命令。'
+            + '请在电脑上运行本应用（node web/serve.mjs）后用浏览器打开。';
+        updateTurnTool(traceItem, { state: 'stopped', result: msg });
+        insertAgentResult(msg);
+        return;
+    }
+
+    try {
+        const send = (approved) => fetch('/api/agent/exec', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ permission, command, approved })
+        }).then(r => r.json());
+
+        let result = await send(false);
+
+        // 服务端判定为危险 → 现在才问用户（安全命令已经在上面执行完了，不打扰）
+        if (result && result.needApproval) {
+            const reasons = Array.isArray(result.reasons) && result.reasons.length
+                ? result.reasons.join('、')
+                : '可能改变系统状态';
+            const allowed = await agentRuntime.requestApproval('电脑命令',
+                '命令：' + command + '\n\n风险：' + reasons,
+                // ★ forceAsk：服务端已判定这一条**具体**命令是危险的。
+                //   必须无视"本轮已确认过敏感操作"的豁免 —— 否则用户确认过一次
+                //   任意敏感操作后，一条 del 就会静默执行（见 requestApproval 的说明）。
+                { forceAsk: true });
+            if (!allowed) {
+                updateTurnTool(traceItem, { state: 'stopped', result: '用户没有允许执行这条命令' });
+                insertAgentResult('已跳过这条命令：用户没有允许。请换一种更安全的方式，或先向用户说明为什么要执行它。');
+                return;
+            }
+            updateTurnTool(traceItem, { state: 'running', result: '用户已允许，正在执行…' });
+            result = await send(true);
+        }
+
+        if (result && result.ok) {
+            const text = String(result.text || '').trim() || '（命令已执行，没有输出）';
+            insertAgentResult('命令执行结果：\n' + text, { continueLoop: true });
+            updateTurnTool(traceItem, {
+                state: 'ok',
+                result: text.length > 4000 ? text.slice(0, 4000) + '\n…（已截断）' : text
+            });
+            agentConsecutiveFailures = 0;
+        } else {
+            const errMsg = String(result?.message || result?.text || result?.stderr || '命令执行失败');
+            updateTurnTool(traceItem, { state: 'error', result: errMsg });
+            agentConsecutiveFailures += 1;
+            await explainAgentFailure(errMsg);
+        }
+    } catch (err) {
+        updateTurnTool(traceItem, { state: 'error', result: err.message || String(err) });
         agentConsecutiveFailures += 1;
         await explainAgentFailure(err.message || String(err));
     }

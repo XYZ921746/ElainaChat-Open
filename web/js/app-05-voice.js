@@ -383,10 +383,15 @@ function isBadCloudFinalText(text, fallbackTranscript) {
     return false;
 }
 
-async function fetchWithTimeout(url, options, timeoutMs) {
+async function fetchWithTimeout(url, options, timeoutMs, signal = null) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const externalSignal = options?.signal;
+    // 两个中止来源要**都**接上：内部超时用 controller，
+    // 外部（用户点「停止」/ 流式回退）用调用方传进来的 signal。
+    // 以前只认 options.signal —— 而 options 里的 signal 会被下面
+    // `{ ...options, signal: controller.signal }` 覆盖掉，等于外部信号从来没生效过，
+    // 「停止」按钮按了请求还在跑。所以这里显式收第 4 个参数，不再从 options 里摸。
+    const externalSignal = signal || options?.signal;
     const abortFromExternal = () => controller.abort();
     if (externalSignal) {
         if (externalSignal.aborted) controller.abort();
@@ -990,21 +995,143 @@ function closeComposerToolsMenu() {
     });
 }
 
-function toggleComposerToolsMenu(button, menu, toggle) {
+// toggle 参数已经没用了：思考开关搬去「设置 → 对话」，这里不再需要
+// 打开菜单时回填勾选状态。保留参数是为了不改动两处调用点。
+function toggleComposerToolsMenu(button, menu) {
     const opening = menu.classList.contains('hidden');
     closeComposerToolsMenu();
     if (opening) {
         menu.classList.remove('hidden');
         button.setAttribute('aria-expanded', 'true');
-        toggle.checked = Boolean(state.settings.thinkingMode);
     }
 }
 
-function syncComposerThinkingToggles(value) {
-    elements.initialComposerThinkingToggle.checked = value;
-    elements.composerThinkingToggle.checked = value;
+/**
+ * 把「设置 → 对话」里的思考开关与强度同步成当前设置值。
+ *
+ * 以前这里同步的是输入框旁边那个 ⊕ 菜单里的勾选框。开关搬走之后，
+ * 仍然保留这个函数：设置面板每次打开都要按 state 回填，
+ * 而回填逻辑只该有一处 —— 散在各处必然有一天忘记同步新加的档位。
+ */
+function syncThinkingModeControls() {
+    const toggle = elements.settingThinkingMode;
+    if (toggle) toggle.checked = Boolean(state.settings.thinkingMode);
+    const effort = elements.settingThinkingEffort;
+    if (effort) effort.value = THINKING_EFFORTS.includes(state.settings.thinkingEffort)
+        ? state.settings.thinkingEffort
+        : 'medium';
+    updateThinkingModeHint();
 }
 
+/**
+ * 思考强度的说明文案：告诉用户**当前这个模型实际会收到什么**。
+ *
+ * 为什么要动态生成而不是写死一句：三种协议、四家厂商对"强度"的支持完全不同
+ * （DeepSeek 只有 low/high/max，OpenAI 的 Responses 根本没有"关闭"这个取值，
+ * Anthropic 的 reasoning.effort 又是另一套名字）。用户选了「中」却发现没有任何
+ * 变化时，会以为功能坏了 —— 把"这一档对当前服务商意味着什么"直接写出来，
+ * 比事后解释省事得多。
+ */
+function updateThinkingModeHint() {
+    const hint = elements.thinkingModeHint;
+    if (!hint) return;
+    if (!state.settings.thinkingMode) {
+        hint.textContent = '当前已关闭：请求会显式告诉服务商不要思考（DeepSeek 服务端默认是开启的，所以必须显式关闭）。';
+        return;
+    }
+    const effort = THINKING_EFFORTS.includes(state.settings.thinkingEffort) ? state.settings.thinkingEffort : 'medium';
+    if (effort === 'medium') {
+        hint.textContent = '「中」= 不指定强度，由服务商自己决定（DeepSeek 默认 high，OpenAI 默认 medium）。想固定行为就选低或高。';
+        return;
+    }
+    hint.textContent = `当前会向服务商请求「${effort === 'low' ? '低' : '高'}」强度；不支持该档位的服务商会忽略它。思考过程不影响工具调用记录，两者都会显示。`;
+}
+
+// ========================================================================
+//  流式正文预览
+// ========================================================================
+//
+// 为什么需要"预览"这一层，而不是边收边往最终气泡里写：
+// 回复完成后还要做几件事 —— Live2D 标签剥离、[任务:…] 抽取、
+// 日语朗读稿拆分。这些都必须作用在**完整文本**上。
+// 如果流式期间就把增量写进最终消息对象，那些处理会在"半截文本"上跑一遍，
+// 结果就是标签被切开、朗读稿只译了前半句。
+// 所以流式只负责"让用户先看见"，最终内容走原来的完整路径，两者不交叉。
+
+let streamedReplyText = '';
+let streamingPreviewEl = null;
+let streamingPreviewScheduled = false;
+
+function resetStreamingReplyPreview() {
+    streamedReplyText = '';
+    streamingPreviewEl = null;
+    streamingPreviewScheduled = false;
+}
+
+/** 每帧最多重绘一次：流式一次回复有上千个增量，逐个重排会明显卡顿 */
+function scheduleStreamingReplyRender() {
+    if (streamingPreviewScheduled) return;
+    streamingPreviewScheduled = true;
+    const run = () => {
+        streamingPreviewScheduled = false;
+        renderStreamingReplyPreview();
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+    else setTimeout(run, 16);
+}
+
+function renderStreamingReplyPreview() {
+    if (!elements.conversationHistory) return;
+    const text = streamedReplyText;
+    if (!text) return;
+    // 正文来了 → 收掉三点气泡。留着会变成"三点 + 正文"两个气泡。
+    removeThinkingMessage();
+    if (!streamingPreviewEl) {
+        streamingPreviewEl = document.createElement('div');
+        streamingPreviewEl.id = 'streaming-reply-preview';
+        streamingPreviewEl.className = 'flex gap-3 mb-4 animate-fade-in-up';
+        streamingPreviewEl.innerHTML = `
+            <div class="pixso-chat-avatar" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <circle cx="12" cy="12" r="2.7"/>
+                    <circle cx="5.5" cy="12" r="3.2"/>
+                    <circle cx="18.5" cy="12" r="3.2"/>
+                    <circle cx="12" cy="5.5" r="3.2"/>
+                    <circle cx="12" cy="18.5" r="3.2"/>
+                </svg>
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="bubble-ai rounded-2xl p-4">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="ai-speaker-name">${escapeHtml(state.characterCard?.name || '伊蕾娜')}</span>
+                        <span class="text-xs text-indigo-300">正在输入…</span>
+                    </div>
+                    <p class="text-indigo-950 text-sm leading-relaxed whitespace-pre-wrap" id="streaming-reply-text"></p>
+                </div>
+            </div>
+        `;
+        elements.conversationHistory.appendChild(streamingPreviewEl);
+    }
+    const target = streamingPreviewEl.querySelector('#streaming-reply-text');
+    if (target) target.innerHTML = renderMessageText(text);
+    elements.conversationHistory.scrollTop = elements.conversationHistory.scrollHeight;
+}
+
+function removeStreamingReplyPreview() {
+    const el = streamingPreviewEl || document.getElementById('streaming-reply-preview');
+    if (el) el.remove();
+    resetStreamingReplyPreview();
+}
+
+/**
+ * 把「停止」按钮的中断器接到 fetch 上。
+ *
+ * 这里原本有个真 bug：providers 用 6 个参数调 postJsonFromDevice
+ * （`..., undefined, undefined, opts.signal`），但那个函数只声明了 5 个形参
+ * （url, body, headers, timeoutMs, signal）—— 第 6 个实参被静默丢弃，
+ * 于是 signal 从来没生效过，「停止」按了请求还在跑。
+ * 现在请求统一走 requestChatJson，它显式收 opts.signal 并往下传。
+ */
 function processVoiceInput(text) {
     if (composerImageProcessing) return;
     if (!text.trim()) return;
@@ -1197,19 +1324,42 @@ async function handleUserInput(message, conversation) {
     const t0 = performance.now();
 
     state.thinkingMessageId = message.id;
+    // 先挂一个"正在想"的三点气泡：它覆盖"还没收到第一个增量"的空窗期
+    // （思考型模型这一步可能等十几秒，什么都不显示会让人以为卡死了）。
+    // 第一个正文增量到达时，renderStreamingReplyPreview 会把它收掉 ——
+    // 两个气泡同时留着会出现"上面三点、下面正文"的重复观感。
     renderThinkingMessage();
+    resetStreamingReplyPreview();
 
     try {
         const ttsConfigured = isTtsConfigured(state.settings);
         const wantsJp = ttsConfigured && state.settings.ttsLang === 'japanese';
+        // 本轮的过程记录（思考 + 工具调用）。锚点用用户消息的 id：
+        // AI 气泡要等回复完成才创建（内容长度、语音卡片都得先知道），
+        // 而过程区在流式期间就要显示，所以先挂在用户消息之后。
+        beginTurnTrace(message.id);
         const aiRequestOptions = {
             includeVoiceJp: wantsJp,
             imageDataUrl: message.imageRequestDataUrl || message.imageDataUrl || '',
-            signal: replyAbort.signal
+            signal: replyAbort.signal,
+            // 流式增量：正文累积进一个缓冲，每帧重绘一次气泡。
+            // 注意这里**不**直接把增量拼进 aiMessage —— aiMessage 还没建，
+            // 而且回复完成后还要做 Live2D 标签剥离、日语朗读稿拆分等处理，
+            // 那些处理必须作用在**完整**文本上，所以流式只负责"先让用户看见"。
+            onDelta: (chunk) => {
+                if (chunk.kind === 'reasoning') { appendTurnReasoning(chunk.text); return; }
+                if (chunk.kind !== 'text') return;
+                streamedReplyText += chunk.text;
+                scheduleStreamingReplyRender();
+            }
         };
         const rawResponse = await callAI(message.text, aiRequestOptions);
         const parsedReply = wantsJp ? splitVoiceReply(rawResponse) : { displayText: rawResponse, voiceJp: '' };
         const response = parsedReply.displayText;
+        // 正式内容就位 → 收掉流式预览气泡（正文交给下面统一的渲染路径，
+        // 两条路同时存在会出现"同一段话显示两遍"）
+        removeStreamingReplyPreview();
+        finishTurnTrace();
 
         const t1 = performance.now();
         console.log(`[TIMING] 文字模型完成: ${Math.round(t1 - t0)}ms`);
@@ -1387,6 +1537,10 @@ async function handleUserInput(message, conversation) {
         updateUI();
         showClientApiError(error);
     } finally {
+        // 收掉流式预览：成功路径上面已经收过一次（幂等），
+        // 但失败/停止路径只有这里能保证清干净 —— 漏掉的话会留下一个
+        // 半截正文的气泡，且它不在 state 里，切会话再回来就变成幽灵内容。
+        removeStreamingReplyPreview();
         if (Object.prototype.hasOwnProperty.call(message, 'imageRequestDataUrl')) delete message.imageRequestDataUrl;
         activeReplyTasks.delete(replyTaskKey);
         activeReplyAborts.delete(replyTaskKey);

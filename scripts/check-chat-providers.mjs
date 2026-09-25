@@ -105,15 +105,43 @@ for (const fn of ['callOpenAICompatibleChat', 'callAnthropicChat', 'callOpenAIRe
 // ============================================================ 4. 真跑一遍（假依赖）
 console.log('\n=== 4. 用假依赖实跑三个格式 ===');
 
+// 真实的「思考参数构造器」：从 index.html 抠出来，供假依赖使用。
+// 为什么要抠真的而不是写个假的：本检查要断言"关思考时请求体里到底有没有 disabled"，
+// 那是被测代码算出来的东西，用假实现就等于自己测自己。
+function extractFnForThinking(name) {
+    const start = html.indexOf('function ' + name + '(');
+    if (start < 0) throw new Error('在 index.html 里找不到函数: ' + name + '（重命名了？请同步更新本检查）');
+    let i = html.indexOf('(', start);
+    let paren = 0;
+    for (; i < html.length; i++) {
+        if (html[i] === '(') paren++;
+        else if (html[i] === ')') { paren--; if (paren === 0) { i++; break; } }
+    }
+    let depth = 0;
+    i = html.indexOf('{', i);
+    for (; i < html.length; i++) {
+        if (html[i] === '{') depth++;
+        else if (html[i] === '}') { depth--; if (depth === 0) { i++; break; } }
+    }
+    return html.slice(start, i);
+}
+const buildThinkingParamsReal = new Function('isDeepSeekOfficial', `
+    const THINKING_EFFORTS = Object.freeze(['low', 'medium', 'high']);
+    ${extractFnForThinking('mapThinkingEffort')}
+    ${extractFnForThinking('detectThinkingVendor')}
+    ${extractFnForThinking('buildThinkingParams')}
+    return buildThinkingParams;
+`)((url) => /api\.deepseek\.com/i.test(url));
+
 /** 造一份可控的假依赖，记录每次请求 */
 function makeFakeDeps() {
     const calls = [];
-    return {
-        calls,
-        deps: {
-            ClientApiError: class ClientApiError extends Error {
-                constructor(code, message) { super(message); this.code = code; this.name = 'ClientApiError'; }
-            },
+    // 先建容器，让 requestChatJson 能引用同一份假出口（保持"只有网络出口是假的"）
+    const depsRef = {};
+    Object.assign(depsRef, {
+        ClientApiError: class ClientApiError extends Error {
+            constructor(code, message) { super(message); this.code = code; this.name = 'ClientApiError'; }
+        },
             getChatBaseUrl: (settings) => settings.baseUrl,
             isDeepSeekOfficial: (url) => /api\.deepseek\.com/i.test(url),
             normalizeChatReply: (content, reasoning) => ({ content, reasoning: reasoning || '' }),
@@ -143,6 +171,18 @@ function makeFakeDeps() {
             stripThinkTags: (t) => String(t || '').replace(/<think>[\s\S]*?<\/think>/g, ''),
             resolveOutputTokenLimit: (model, maxTokens) => (Number.isFinite(maxTokens) ? maxTokens : 4096),
             ANTHROPIC_MIN_MAX_TOKENS: 4096,
+    });
+    return {
+        calls,
+        deps: {
+            ...depsRef,
+            // providers 现在走 requestChatJson（它内部才决定流式/非流式）。
+            // 本检查验证的是"发出去的请求体"，所以这里转发到同一个假出口。
+            requestChatJson: async (endpoint, body, headers, opts) =>
+                await depsRef.postJsonFromDevice(endpoint, body, headers, opts?.timeoutMs, opts?.signal),
+            // 真实的思考参数构造器（从 index.html 抠出来注入），
+            // 否则断言"关思考发了什么"就测不到真东西。
+            buildThinkingParams: buildThinkingParamsReal,
         },
     };
 }
@@ -182,6 +222,31 @@ if (CP) {
         ok(c && c.body.max_tokens === 100, 'openai: max_tokens 正确', c && String(c.body.max_tokens));
         ok(r.content === 'OPENAI_OK', 'openai: 回复解析正确', r.content);
         ok(r.reasoning === 'R1', 'openai: reasoning 解析正确', r.reasoning);
+        // 关思考必须**显式**发 disabled：DeepSeek 现在默认开思考，
+        // 不发这个字段用户会白等、白花钱，而界面上什么都看不到。
+        const cOff = await (async () => {
+            sandbox.calls.length = 0;
+            await CP.callOpenAICompatibleChat(msgs, { thinking: false }, { apiKey: 'k', model: 'deepseek-flash', baseUrl: 'https://api.deepseek.com/v1' });
+            return sandbox.calls[0];
+        })();
+        ok(cOff && cOff.body.thinking && cOff.body.thinking.type === 'disabled',
+            'openai: 关思考 → 显式 thinking.type = disabled', cOff && JSON.stringify(cOff.body.thinking));
+        // 老模型名映射到当前模型，而不是换成 reasoner
+        const cLegacy = await (async () => {
+            sandbox.calls.length = 0;
+            await CP.callOpenAICompatibleChat(msgs, {}, { apiKey: 'k', model: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1' });
+            return sandbox.calls[0];
+        })();
+        ok(cLegacy && cLegacy.body.model === 'deepseek-flash',
+            'openai: 老名字 deepseek-chat → 映射到 deepseek-flash', cLegacy && cLegacy.body.model);
+        // 用户明确选了 pro 就不能被降级（那是花他的钱还改他的选择）
+        const cPro = await (async () => {
+            sandbox.calls.length = 0;
+            await CP.callOpenAICompatibleChat(msgs, {}, { apiKey: 'k', model: 'deepseek-v4-pro', baseUrl: 'https://api.deepseek.com/v1' });
+            return sandbox.calls[0];
+        })();
+        ok(cPro && cPro.body.model === 'deepseek-v4-pro',
+            'openai: 用户选的 deepseek-v4-pro 不被降级', cPro && cPro.body.model);
     }
 
     // ---- anthropic ----

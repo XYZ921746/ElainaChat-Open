@@ -28,7 +28,7 @@ async function init() {
     document.getElementById('initialTextInput').value = '';
     elements.sidebarSearchInput.value = '';
     elements.notesSearch.value = '';
-    syncComposerThinkingToggles(Boolean(state.settings.thinkingMode));
+    syncThinkingModeControls();
     updateComposerSendVisibility();
 
     initSpeechRecognition();
@@ -481,11 +481,11 @@ document.getElementById('ccPresetDelete')?.addEventListener('click', () => { voi
     });
     elements.initialComposerMoreBtn.addEventListener('click', (event) => {
         event.stopPropagation();
-        toggleComposerToolsMenu(elements.initialComposerMoreBtn, elements.initialComposerMoreMenu, elements.initialComposerThinkingToggle);
+        toggleComposerToolsMenu(elements.initialComposerMoreBtn, elements.initialComposerMoreMenu);
     });
     elements.composerMoreBtn.addEventListener('click', (event) => {
         event.stopPropagation();
-        toggleComposerToolsMenu(elements.composerMoreBtn, elements.composerMoreMenu, elements.composerThinkingToggle);
+        toggleComposerToolsMenu(elements.composerMoreBtn, elements.composerMoreMenu);
     });
     elements.initialComposerImageBtn.addEventListener('click', openComposerImagePicker);
     elements.composerImageBtn.addEventListener('click', openComposerImagePicker);
@@ -509,13 +509,21 @@ document.getElementById('ccPresetDelete')?.addEventListener('click', () => { voi
             updateComposerSendVisibility();
         }
     });
-    const updateThinkingMode = (checked) => {
-        state.settings.thinkingMode = checked;
-        syncComposerThinkingToggles(checked);
+    // 思考开关与强度：现在住在「设置 → 对话」里，不在输入框的 ⊕ 菜单里。
+    // 直接写进 state 并持久化 —— 这两个是**模型参数**，改了立刻对下一次请求生效，
+    // 不需要点「保存设置」才生效（用户不会想到"改个开关还要再点保存"）。
+    elements.settingThinkingMode.addEventListener('change', () => {
+        state.settings.thinkingMode = elements.settingThinkingMode.checked;
+        updateThinkingModeHint();
         persistSettings();
-    };
-    elements.initialComposerThinkingToggle.addEventListener('change', () => updateThinkingMode(elements.initialComposerThinkingToggle.checked));
-    elements.composerThinkingToggle.addEventListener('change', () => updateThinkingMode(elements.composerThinkingToggle.checked));
+    });
+    elements.settingThinkingEffort.addEventListener('change', () => {
+        state.settings.thinkingEffort = THINKING_EFFORTS.includes(elements.settingThinkingEffort.value)
+            ? elements.settingThinkingEffort.value
+            : 'medium';
+        updateThinkingModeHint();
+        persistSettings();
+    });
     elements.initialComposerMemoryBtn.addEventListener('click', runManualMemorySummary);
     elements.composerMemoryBtn.addEventListener('click', runManualMemorySummary);
     elements.composerPromptBtn.addEventListener('click', openConversationPromptEditor);

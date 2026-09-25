@@ -31,8 +31,15 @@ console.log('=== 1. 授权策略：once 默认 ===');
     const fn = html.slice(html.indexOf('async function requestApproval('), html.indexOf('function requestApprovalViaOverlay('));
     ok(/policy === 'once' && approvedThisRun\.size > 0/.test(fn), 'once 策略：本轮确认过任意操作就放行');
     ok(/approvedThisRun\.add\(action\)/.test(fn), '确认后记录（once 也靠这个 Set）');
-    // dangerous 不受豁免
-    ok(/if \(risk !== 'dangerous'\) \{/.test(fn), 'dangerous 不进入任何豁免分支');
+    // dangerous 不受豁免。
+    //
+    // 2026-09 起判据从 `risk !== 'dangerous'` 变成 `risk !== 'dangerous' && !mustAsk` ——
+    // 因为新增了「电脑命令」：这一类在 AGENT_RISK 里是 sensitive（同类里既有 dir
+    // 也有 del），危险与否只有服务端知道，靠 forceAsk 传进来。豁免分支必须**同时**
+    // 排除 mustAsk，否则用户确认过一次任意敏感操作后，一条 del 会被静默执行。
+    ok(/if \(risk !== 'dangerous' && !mustAsk\) \{/.test(fn),
+        'dangerous / forceAsk 都不进入任何豁免分支');
+    ok(/const mustAsk = opts\.forceAsk === true;/.test(fn), 'mustAsk 来自调用方的 forceAsk');
 }
 
 // ============================================================ 2. Edge TTS

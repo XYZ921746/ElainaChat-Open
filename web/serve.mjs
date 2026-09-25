@@ -17,6 +17,12 @@ import dns from 'node:dns';
 import { createStore } from '../server/store.mjs';
 import { synthesizeEdge, probeEdge } from '../server/edge-tts.mjs';
 import { createModManager } from '../server/mods.mjs';
+// "看电脑在干什么"（前台窗口 + 进程）—— 供桌宠让 AI 知道用户在做什么。
+// 单独成模块：纯函数式便于测试，且以后"AI 操作电脑"要判断当前窗口时能直接复用。
+import { activitySummaryCached } from '../server/activity.mjs';
+// 电脑命令执行（全权限模式下 AI 跑 PowerShell / cmd）。危险命令的判定是纯函数，
+// 单独成模块便于穷举断言 —— 判定错了后面所有防护都是空的（见 pc-command.mjs）。
+import { classifyCommand, runCommand, formatCommandResult, availableShells } from '../server/pc-command.mjs';
 // zip 解压 / 危险扩展名判定：**服务端唯一的实现**在 server/zip.mjs。
 // 原先 serve.mjs 里还另有一份几乎相同的 unzip（含体积上限、危险类型拦截、GBK 解码、
 // zip64 回退），与 zip.mjs 的 readZip 逐段重复 —— 两份实现意味着安全修复要改两处，
@@ -1042,6 +1048,72 @@ async function agentWrite(request, res, isLocal) {
         jsonResponse(res, 200, { ok: true, path: target });
     } catch (err) {
         jsonResponse(res, 500, { ok: false, message: err.message });
+    }
+}
+
+/**
+ * AI 执行电脑命令（PowerShell / cmd）。
+ *
+ * 权限双模式在这里的落点：
+ *   · app（限制）      → **直接拒绝**。命令能做的事远超文件读写，
+ *                        在"仅应用文件夹"语义下没有安全的执行子集可给。
+ *   · computer（全权限）→ 放行，但**危险命令仍强制要求 approved**。
+ *
+ * ★ 为什么危险判定必须在服务端再做一次：
+ *   前端已经问过用户了，但前端可以被绕过（直接 POST 这个接口）。
+ *   如果服务端只看 `approved` 字段，那"授权"就只是客户端的一个礼貌动作，
+ *   攻击者传 approved:true 即可执行任意命令。所以服务端**自己判**，
+ *   并且在前端没带 approved 时拒绝 —— 这样绕过前端也拿不到危险命令。
+ */
+async function agentExec(request, res, isLocal) {
+    try {
+        let body;
+        try { body = await readJsonBody(request, 256 * 1024); } catch { return jsonResponse(res, 400, { ok: false, message: '请求体无效' }); }
+
+        const permission = String(body.permission || 'app');
+        // 限制模式：命令执行整体不可用（见上）
+        if (!(isLocal && permission === 'computer')) {
+            return jsonResponse(res, 403, { ok: false, message: PERM_DENIED_MSG });
+        }
+        const command = String(body.command || '').trim();
+        if (!command) return jsonResponse(res, 400, { ok: false, message: '命令为空' });
+        if (command.length > 8000) return jsonResponse(res, 400, { ok: false, message: '命令过长（上限 8000 字符）' });
+
+        // 服务端权威判定：不信前端传来的 risk
+        const verdict = classifyCommand(command);
+        if (verdict.risk === 'dangerous' && body.approved !== true) {
+            return jsonResponse(res, 403, {
+                ok: false,
+                needApproval: true,
+                risk: 'dangerous',
+                reasons: verdict.reasons,
+                message: '这是危险命令，需要用户确认后才能执行。',
+            });
+        }
+
+        // cwd 仍受权限约束：app 模式到不了这里，computer 模式允许指定目录
+        let cwd;
+        if (body.cwd) {
+            const target = resolveAgentPath(body.cwd, permission, isLocal);
+            if (!target) return jsonResponse(res, 403, { ok: false, message: '工作目录无效' });
+            cwd = target;
+        }
+
+        const result = await runCommand(command, { shell: body.shell, cwd });
+        return jsonResponse(res, 200, {
+            ok: result.ok,
+            risk: verdict.risk,
+            reasons: verdict.reasons,
+            shell: result.shell,
+            code: result.code,
+            timedOut: result.timedOut,
+            truncated: result.truncated,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            text: formatCommandResult(result),
+        });
+    } catch (err) {
+        jsonResponse(res, 500, { ok: false, message: String(err?.message || err) });
     }
 }
 
@@ -2516,6 +2588,22 @@ const requestHandler = async (request, response) => {
         }
         if (pathname === '/api/agent/write' && request.method === 'POST') {
             return await agentWrite(request, response, isLocal);
+        }
+        // 电脑命令执行（全权限模式）。危险命令由服务端强制要求 approved（见 agentExec）。
+        if (pathname === '/api/agent/exec' && request.method === 'POST') {
+            return await agentExec(request, response, isLocal);
+        }
+        // 看电脑在干什么（前台窗口 + 进程）—— 供桌宠让 AI"知道你在做什么"并主动搭话。
+        //
+        // ★ 仅本机：这是"用户在看什么"的隐私数据，绝不能经局域网泄露。
+        //   即使对方有访问密码也不该给 —— 密码保护的是"能聊天"，
+        //   不是"能窥探宿主机在跑什么"。
+        if (pathname === '/api/agent/activity' && request.method === 'GET') {
+            if (!isLocal) {
+                return jsonResponse(response, 403, { ok: false, message: '只有本机可以读取电脑活动状态' });
+            }
+            const force = url.searchParams.get('force') === '1';
+            return jsonResponse(response, 200, activitySummaryCached(force));
         }
 
         // 浏览器会自己请求 /favicon.ico，没这个文件就每开一次页面刷一条 404，淹没真正的日志。

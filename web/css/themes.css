@@ -379,18 +379,35 @@ html[data-theme-template] body .bubble-user {
  *  ── 修法 ──────────────────────────────────────────────────────────────
  *
  *  恢复"边框 + 阴影"这两条边界线索（不强行拉大底色差 —— 那会破坏
- *  上游调好的柔和观感）。边框用主色的低透明度版，既清晰又不抢眼。
+ *  上游调好的柔和观感）。边框用半透明深色，既清晰又不抢眼。
+ *
+ *  ★ 这里**只加边框和阴影，不动背景色**，而且选择器**不带**
+ *    `html[data-theme-template]` 前缀。两个决定都是刻意的：
+ *
+ *    ① 不带主题前缀：气泡边界是**通用需求**，不是主题功能。默认主题
+ *       （粉紫）不设 data-theme-template 属性，规则若挂在该属性下就没有
+ *       边框，仍然"糊成一片"（实测踩过：思考框内层气泡 border 是 0px）。
+ *
+ *    ② 不动背景：宿主给 `.bubble-ai` 的背景是 `var(--pixso-panel-soft)`，
+ *       而主题里另有自己的取值。这里若一并改背景，**默认主题的外观就会变**
+ *       —— 那违反"不选主题 = 与改动前逐像素一致"。背景交给下面各主题的
+ *       规则去管，这条只管"边界"。
  * ========================================================================== */
-html[data-theme-template] body .bubble-ai {
-    background: var(--pixso-cream) !important;
+body .bubble-ai {
     /* 边框用半透明深色（不用 color-mix —— 旧版 Android WebView 不支持，
        项目 minSdk 29，不能赌 WebView 版本）。浅底上一条淡深边就够分开了。 */
     border: 1px solid rgba(18, 30, 50, 0.10) !important;
     box-shadow: 0 2px 10px rgba(18, 30, 50, 0.07), 0 1px 2px rgba(18, 30, 50, 0.05) !important;
 }
-html[data-theme-template] body .bubble-user {
+body .bubble-user {
     border: 1px solid rgba(255, 255, 255, 0.35) !important;
     box-shadow: 0 2px 10px rgba(18, 30, 50, 0.12) !important;
+}
+
+/* 主题下的气泡底色（默认主题不吃这条，保持宿主原样）。
+   边框与阴影已在上面那条通用规则里处理，这里不重复。 */
+html[data-theme-template] body .bubble-ai {
+    background: var(--pixso-cream) !important;
 }
 /* 气泡尾巴要跟着气泡底色走 —— 宿主里尾巴写死 var(--pixso-brown)/var(--pixso-panel-soft)，
    我把用户气泡改成主色渐变后，尾巴颜色就对不上了（一个蓝色气泡配深色尾巴）。 */
@@ -403,9 +420,17 @@ html[data-theme-template] body .bubble-user::after {
     box-shadow: 0 -3px 0 var(--pixso-green-dark) !important;
 }
 
-/* 深色下的气泡边界：底色接近，同样靠边框分开 */
-html[data-theme="dark"] body .bubble-ai,
-html[data-theme="dark"] body .thinking-bubble {
+/* 深色下的气泡边界：底色接近，同样靠边框分开。
+ *
+ * ★ 注意选择器只到 `.bubble-ai` —— **不要**把 `.thinking-bubble` 也写进来。
+ *
+ *   `.thinking-bubble` 是"伊蕾娜正在想…"的**外层容器**
+ *   （`flex gap-3 mb-4`，撑满整行，里面还包着头像和气泡两层）。
+ *   给它加背景/边框会把整行变成一条宽带子，而且把头像也框进去 ——
+ *   实测就是这个效果（用户截图里那条异常横条）。
+ *   真正的气泡是它内部的 `.bubble-ai`，上面这条规则已经覆盖到了。
+ */
+html[data-theme="dark"] body .bubble-ai {
     background: linear-gradient(150deg, rgba(30, 46, 80, 0.55), rgba(18, 28, 48, 0.55)) !important;
     border: 1px solid rgba(255, 255, 255, 0.16) !important;
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35) !important;
@@ -535,8 +560,8 @@ html[data-theme="dark"] .bubble-user {
     border-color: rgba(255, 255, 255, 0.18) !important;
     color: var(--pixso-brown) !important;
 }
-html[data-theme="dark"] .bubble-ai,
-html[data-theme="dark"] .thinking-bubble {
+/* 同前：只到 .bubble-ai，不含 .thinking-bubble（那是外层容器，见上面的说明） */
+html[data-theme="dark"] .bubble-ai {
     background: linear-gradient(150deg, rgba(30, 46, 80, 0.55), rgba(18, 28, 48, 0.55)) !important;
     border-color: rgba(255, 255, 255, 0.14) !important;
     color: var(--pixso-brown) !important;

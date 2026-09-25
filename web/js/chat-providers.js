@@ -45,23 +45,59 @@
     // ========================================================================
     //  1. OpenAI 兼容（/v1/chat/completions）
     // ========================================================================
+
+    /**
+     * 把已废弃的 DeepSeek 模型名映射到现在的名字。
+     *
+     * 为什么要留这一层：DeepSeek 官方文档明确写了 `deepseek-chat` 这类老名字
+     * **仍然被接受**，但请求其实由 deepseek-flash 服务（按 flash 计费）。
+     * 用户设置里存着老名字时，如果我们直接原样发，行为其实是对的；
+     * 唯一需要处理的是 `deepseek-reasoner` —— 它是"思考专用模型"时代的产物，
+     * 现在思考由 thinking 字段控制，模型名统一了。
+     *
+     * 所以规则是：
+     *   · 老名字 → 换成当前名字（deepseek-flash），让计费和能力都符合预期；
+     *   · 已经填了新名字（deepseek-flash / deepseek-v4-pro）→ 一个字都不动，
+     *     绝不擅自把用户明确选择的 pro 降成 flash（那是花用户的钱还改他的选择）。
+     *
+     * @param {string} model 用户填的模型名
+     * @param {boolean} thinking 是否开了思考（老 reasoner 名字隐含"要思考"）
+     */
+    function legacyDeepSeekModel(model, thinking) {
+        const name = String(model || '').trim().toLowerCase();
+        if (name === 'deepseek-chat' || name === 'deepseek-reasoner' || name === 'deepseek-coder') {
+            return 'deepseek-flash';
+        }
+        return String(model || '').trim() || 'deepseek-flash';
+    }
+
     async function callOpenAICompatibleChat(messages, opts, settings) {
-        const { ClientApiError, getChatBaseUrl, isDeepSeekOfficial, postJsonFromDevice, normalizeChatReply, throwProviderResponseError } = deps();
+        const { ClientApiError, getChatBaseUrl, isDeepSeekOfficial, requestChatJson, buildThinkingParams, normalizeChatReply, throwProviderResponseError } = deps();
         const { apiKey, model } = settings;
         if (!apiKey) {
             throw new ClientApiError('APP_KEY_MISSING', '请先在设置中填写 API Key');
         }
         const baseUrl = getChatBaseUrl(settings);
         const endpoint = /\/chat\/completions$/i.test(baseUrl) ? baseUrl : `${baseUrl}/chat/completions`;
-        const requestModel = isDeepSeekOfficial(baseUrl) && opts.thinking === true && String(model).trim() === 'deepseek-chat'
-            ? 'deepseek-reasoner'
-            : String(model || 'deepseek-chat').trim();
-        const result = await postJsonFromDevice(endpoint, {
+        // 换模型名这条老路保留，但**只在用户填的就是那个已废弃的名字时**才换：
+        // DeepSeek 现在的模型是 deepseek-flash / deepseek-v4-pro，思考由 thinking 字段控制，
+        // 不再需要 reasoner 这个模型。可老用户设置里存着 deepseek-chat / deepseek-reasoner，
+        // 直接不管会让他们的配置一夜之间失效，所以这里做一次兼容映射。
+        const rawModel = String(model || 'deepseek-chat').trim();
+        const requestModel = isDeepSeekOfficial(baseUrl)
+            ? legacyDeepSeekModel(rawModel, opts.thinking === true)
+            : rawModel;
+        const result = await requestChatJson(endpoint, {
             model: requestModel,
             messages,
             ...(opts.temperature !== undefined && { temperature: opts.temperature }),
-            ...(Number.isFinite(opts.maxTokens) && { max_tokens: Math.max(1, Math.floor(opts.maxTokens)) })
-        }, { Authorization: 'Bearer ' + apiKey }, undefined, undefined, opts.signal);
+            ...(Number.isFinite(opts.maxTokens) && { max_tokens: Math.max(1, Math.floor(opts.maxTokens)) }),
+            // 思考开关与强度：显式发 disabled 很重要 —— DeepSeek 现在**默认开启**思考，
+            // 不发这个字段的话，用户明明关了开关，模型照样思考（慢且费 token）。
+            ...buildThinkingParams(opts.thinking, opts.thinkingEffort, 'openai-compatible', settings)
+        }, { Authorization: 'Bearer ' + apiKey }, {
+            signal: opts.signal, onDelta: opts.onDelta, stream: opts.stream,
+        }, 'openai-compatible');
         if (!result.ok) await throwProviderResponseError(result, '对话服务请求失败');
         if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', '对话服务返回格式异常');
         const message = result.payload.choices?.[0]?.message || {};
@@ -128,7 +164,7 @@
     }
 
     async function callAnthropicChat(messages, opts, settings) {
-        const { ClientApiError, getChatBaseUrl, postJsonFromDevice, normalizeChatReply, throwProviderResponseError, ANTHROPIC_MIN_MAX_TOKENS } = deps();
+        const { ClientApiError, getChatBaseUrl, requestChatJson, buildThinkingParams, normalizeChatReply, throwProviderResponseError, ANTHROPIC_MIN_MAX_TOKENS } = deps();
         const { apiKey, model } = settings;
         if (!apiKey) {
             throw new ClientApiError('APP_KEY_MISSING', '请先在设置中填写 Anthropic API Key');
@@ -145,13 +181,23 @@
         const maxTokens = Number.isFinite(opts.maxTokens)
             ? Math.max(1, Math.floor(opts.maxTokens))
             : ANTHROPIC_MIN_MAX_TOKENS;
-        const result = await postJsonFromDevice(endpoint, {
+        const result = await requestChatJson(endpoint, {
             model: modelName,
             system: payload.system || undefined,
             messages: payload.messages,
             max_tokens: maxTokens,
-            ...(opts.temperature !== undefined && { temperature: opts.temperature })
-        }, { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }, undefined, undefined, opts.signal);
+            // ★ 开了思考就**不能**带 temperature：Anthropic 官方明确禁止
+            //   （"temperature may only be set to 1 when thinking is enabled"），
+            //   带了会直接 400。宁可让用户少一个采样参数，也不能让请求失败。
+            //   DeepSeek 那边同样是"思考模式不支持 temperature"（发了不报错但也不生效）。
+            ...(opts.temperature !== undefined && !opts.thinking && { temperature: opts.temperature }),
+            // 思考开关：Anthropic 侧走 reasoning.effort（none = 关闭）。
+            // ★ 这里**不用** `thinking` 字段：那是 Claude 官方 extended thinking 的
+            //   {type, budget_tokens} 结构，和这里的开关同名不同义，发错会 400。
+            ...buildThinkingParams(opts.thinking, opts.thinkingEffort, 'anthropic', settings)
+        }, { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }, {
+            signal: opts.signal, onDelta: opts.onDelta, stream: opts.stream,
+        }, 'anthropic');
         if (!result.ok) await throwProviderResponseError(result, 'Anthropic 请求失败');
         if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', 'Anthropic 返回格式异常');
         const blocks = Array.isArray(result.payload.content) ? result.payload.content : [];
@@ -208,7 +254,7 @@
     }
 
     async function callOpenAIResponsesChat(messages, opts, settings) {
-        const { ClientApiError, getChatBaseUrl, postJsonFromDevice, normalizeChatReply, throwProviderResponseError } = deps();
+        const { ClientApiError, getChatBaseUrl, requestChatJson, buildThinkingParams, normalizeChatReply, throwProviderResponseError } = deps();
         const { apiKey, model } = settings;
         if (!apiKey) {
             throw new ClientApiError('APP_KEY_MISSING', '请先在设置中填写 OpenAI API Key');
@@ -216,13 +262,18 @@
         const baseUrl = getChatBaseUrl(settings).replace(/\/+$/, '');
         const endpoint = /\/responses$/i.test(baseUrl) ? baseUrl : `${baseUrl}/responses`;
         const payload = convertOpenAIToResponsesInput(messages);
-        const result = await postJsonFromDevice(endpoint, {
+        const result = await requestChatJson(endpoint, {
             model: String(model || '').trim() || 'gpt-4.1-mini',
             ...(payload.instructions ? { instructions: payload.instructions } : {}),
             input: payload.input,
             ...(opts.temperature !== undefined && { temperature: opts.temperature }),
-            ...(Number.isFinite(opts.maxTokens) && { max_output_tokens: Math.max(1, Math.floor(opts.maxTokens)) })
-        }, { Authorization: 'Bearer ' + apiKey }, undefined, undefined, opts.signal);
+            ...(Number.isFinite(opts.maxTokens) && { max_output_tokens: Math.max(1, Math.floor(opts.maxTokens)) }),
+            // Responses 格式只有 reasoning.effort，没有"关闭"这个取值，
+            // 所以关思考时这里不发字段（buildThinkingParams 里说明了原因）。
+            ...buildThinkingParams(opts.thinking, opts.thinkingEffort, 'openai-responses', settings)
+        }, { Authorization: 'Bearer ' + apiKey }, {
+            signal: opts.signal, onDelta: opts.onDelta, stream: opts.stream,
+        }, 'openai-responses');
         if (!result.ok) await throwProviderResponseError(result, 'OpenAI 请求失败');
         if (!result.payload) throw new ClientApiError('UPSTREAM_UNAVAILABLE', 'OpenAI 返回格式异常');
         // 部分兼容实现会把全文直接放在顶层 output_text，先认这个，省得再遍历一遍

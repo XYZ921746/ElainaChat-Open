@@ -346,6 +346,121 @@
             50% { transform: translateY(-5px); opacity: 1; }
         }
 
+        /* ==================== 回合过程（思考 / 工具调用） ====================
+           参考 DSH 的做法：每一条过程记录都是"一行摘要 + 可展开详情"，
+           默认**折叠**。折叠是刻意的：
+             · 这是聊天应用，正文才是主角，过程不该抢视线；
+             · 思考内容动辄上千字，默认展开会把对话顶到屏幕外；
+             · 但"折叠"不等于"藏起来"—— 摘要行始终在，用户一眼能看到
+               "这一步调用了什么、成没成功"，需要细节再点开。
+           工具调用行**不受思考开关影响**：它是事实记录（改了什么文件、
+           执行了什么命令），关掉思考不代表可以不给用户看 AI 干了什么。 */
+        .turn-process {
+            margin-bottom: 10px;
+            font-size: 12.5px;
+            line-height: 1.5;
+        }
+        .process-row {
+            border: 1px solid var(--color-border-soft, rgba(120, 100, 90, 0.18));
+            border-radius: 10px;
+            background: var(--color-surface-muted, rgba(255, 252, 248, 0.7));
+            margin-bottom: 6px;
+            overflow: hidden;
+        }
+        .process-row-head {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            width: 100%;
+            padding: 6px 9px;
+            background: none;
+            border: 0;
+            cursor: pointer;
+            text-align: left;
+            color: var(--pixso-brown-soft, #6b5a4e);
+            font: inherit;
+        }
+        .process-row-head:hover { background: rgba(0, 0, 0, 0.03); }
+        .process-row-icon { flex: 0 0 auto; display: inline-flex; width: 14px; height: 14px; opacity: 0.75; }
+        .process-row-icon svg { width: 14px; height: 14px; display: block; }
+        .process-row-title { flex: 0 0 auto; font-weight: 600; }
+        .process-row-summary {
+            flex: 1 1 auto;
+            min-width: 0;
+            /* 摘要只占一行并省略 —— 多行摘要会让折叠失去意义 */
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            opacity: 0.7;
+        }
+        .process-row-status { flex: 0 0 auto; font-size: 11px; opacity: 0.65; }
+        .process-row-chevron { flex: 0 0 auto; opacity: 0.45; transition: transform 0.15s ease; }
+        .process-row.is-open .process-row-chevron { transform: rotate(90deg); }
+        .process-row-body {
+            display: none;
+            padding: 2px 10px 9px 30px;
+            border-top: 1px dashed var(--color-border-soft, rgba(120, 100, 90, 0.18));
+        }
+        .process-row.is-open .process-row-body { display: block; }
+        .process-row-body pre {
+            margin: 6px 0 0;
+            padding: 7px 8px;
+            border-radius: 7px;
+            background: rgba(0, 0, 0, 0.045);
+            font-size: 11.5px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 300px;
+            overflow: auto;
+        }
+        .process-row-label {
+            display: block;
+            margin-top: 7px;
+            font-size: 11px;
+            font-weight: 600;
+            opacity: 0.6;
+        }
+        /* 状态点：运行中 / 成功 / 失败 / 已停止。
+           颜色之外还给形状差异（动画），不只靠颜色区分 —— 色盲用户同样能分辨。 */
+        .process-state {
+            flex: 0 0 auto;
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: currentColor;
+            opacity: 0.45;
+        }
+        .process-row[data-state="running"] .process-state {
+            opacity: 1;
+            animation: dot-bounce 1.2s ease-in-out infinite;
+        }
+        .process-row[data-state="ok"] .process-state { background: #3f9d5a; opacity: 1; }
+        .process-row[data-state="error"] .process-state { background: #d0523f; opacity: 1; }
+        .process-row[data-state="stopped"] .process-state { background: #b08a3f; opacity: 1; }
+        .process-row[data-state="error"] .process-row-status { color: #c0452f; opacity: 1; }
+        /* 思考正文：等宽、低对比，和正文明确区分开 */
+        .process-reasoning {
+            white-space: pre-wrap;
+            word-break: break-word;
+            opacity: 0.8;
+            font-size: 12px;
+            line-height: 1.6;
+            max-height: 320px;
+            overflow: auto;
+        }
+        /* 每回合总览：把这一轮做过的事压成一行，折叠状态下也能看清全貌 */
+        .turn-summary {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 2px 6px;
+            font-size: 11.5px;
+            opacity: 0.6;
+            flex-wrap: wrap;
+        }
+        .turn-summary-sep { opacity: 0.5; }
+        .turn-summary-empty { font-style: italic; }
+
         .typing-cursor::after {
             content: "|";
             color: var(--color-primary);
@@ -2855,17 +2970,6 @@
                                         <span class="composer-menu-hint">拍照或从相册选择，支持图片+文字</span>
                                     </span>
                                 </button>
-                                <label class="composer-menu-row composer-thinking-row">
-                                    <span class="composer-menu-icon">
-                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3a6 6 0 00-3.6 10.8c.684.513 1.1 1.303 1.1 2.158V16h5v-.042c0-.855.416-1.645 1.1-2.158A6 6 0 0012 3zM9.75 21h4.5"/></svg>
-                                    </span>
-                                    <span class="composer-menu-copy">
-                                        <span class="composer-menu-title">思考模式</span>
-                                        <span class="composer-menu-hint">MiniMax 请求，默认关闭</span>
-                                    </span>
-                                    <input id="initialComposerThinkingToggle" type="checkbox" class="composer-switch-input">
-                                    <span class="composer-switch" aria-hidden="true"><span></span></span>
-                                </label>
                                 <button id="initialComposerMemoryBtn" type="button" class="composer-menu-row" role="menuitem">
                                     <span class="composer-menu-icon">
                                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h7"/></svg>
@@ -3008,18 +3112,7 @@
                                     <span class="composer-menu-hint">拍照或从相册选择，支持图片+文字</span>
                                 </span>
                             </button>
-                            <label class="composer-menu-row composer-thinking-row">
-                                <span class="composer-menu-icon">
-                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3a6 6 0 00-3.6 10.8c.684.513 1.1 1.303 1.1 2.158V16h5v-.042c0-.855.416-1.645 1.1-2.158A6 6 0 0012 3zM9.75 21h4.5"/></svg>
-                                </span>
-                                <span class="composer-menu-copy">
-                                    <span class="composer-menu-title">思考模式</span>
-                                    <span class="composer-menu-hint">MiniMax 请求，默认关闭</span>
-                                </span>
-                                <input id="composerThinkingToggle" type="checkbox" class="composer-switch-input">
-                                <span class="composer-switch" aria-hidden="true"><span></span></span>
-                            </label>
-                                <button id="composerMemoryBtn" type="button" class="composer-menu-row" role="menuitem">
+                            <button id="composerMemoryBtn" type="button" class="composer-menu-row" role="menuitem">
                                 <span class="composer-menu-icon">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h7"/></svg>
                                 </span>
@@ -3280,6 +3373,38 @@
                         <button id="clearApiKeysBtn" type="button" class="btn-secondary text-xs">清除全部 API Key</button>
                     </div>
                     <p id="chatFormatHint" class="text-[11px] text-indigo-300 leading-relaxed mt-2">请求从当前设备直接发给所选服务商，不经过作者服务器。Android Key 使用系统 Keystore 加密；Web Key 仅保存在当前标签页会话。</p>
+                </section>
+
+                <!-- ============ 思考模式 ============
+                     从「对话工具」菜单移过来的（原来在输入框旁边的 ⊕ 里）。
+                     移过来的原因：它是**模型参数**，不是"这一次对话的工具"——
+                     和模型名、输出上限是同一类东西，用户找它时会去设置里找，
+                     而不是去输入框旁边的加号里翻。而且它现在有强度档位，
+                     挤在那个小菜单里放不下。
+
+                     默认**关闭**：思考模式会让首字延迟从 1 秒变成十几秒，
+                     对一个角色扮演聊天应用来说默认开着是负体验。
+                     但要注意 DeepSeek 现在服务端默认是**开**的，
+                     所以"关闭"必须由我们显式发 disabled（见 buildThinkingParams）。 -->
+                <section class="mt-4 pt-3 border-t border-indigo-100">
+                    <div class="modal-label flex items-center gap-2"><span class="text-amber-500">✦</span> 思考模式</div>
+                    <div class="flex items-center justify-between mb-3">
+                        <label class="text-xs text-indigo-700 cursor-pointer flex items-center gap-1.5">
+                            <input id="settingThinkingMode" type="checkbox" class="accent-amber-500"> 让模型先思考再回答
+                        </label>
+                    </div>
+                    <div class="space-y-3">
+                        <div>
+                            <label class="text-xs text-indigo-500 mb-1 block">思考强度</label>
+                            <select id="settingThinkingEffort" class="modal-input text-sm">
+                                <option value="low">低（更快，适合日常闲聊）</option>
+                                <option value="medium">中（默认，由服务商决定）</option>
+                                <option value="high">高（更慢，适合难题与推理）</option>
+                            </select>
+                            <p id="thinkingModeHint" class="text-[11px] text-indigo-300 leading-relaxed mt-1"></p>
+                        </div>
+                    </div>
+                    <p class="text-[11px] text-indigo-300 leading-relaxed mt-2">思考过程会在回复上方以可折叠的「思考」一栏展示；工具调用记录不受此开关影响，始终显示。开思考时部分服务商不支持自定义温度，我们会自动省略该参数。</p>
                 </section>
                 </div><!-- /tab-chat -->
 
@@ -3630,10 +3755,10 @@
                                 <input type="radio" name="agentPermission" value="app" class="accent-pink-500"> 🔒 限制：仅应用文件夹内操作
                             </label>
                             <label class="flex items-center gap-1.5 text-xs text-indigo-700 cursor-pointer">
-                                <input type="radio" name="agentPermission" value="computer" class="accent-pink-500"> 💻 允许操作电脑（文件读写，风险自担）
+                                <input type="radio" name="agentPermission" value="computer" class="accent-pink-500"> 💻 允许操作电脑（文件读写 + 执行命令，风险自担）
                             </label>
                         </div>
-                        <p class="text-[11px] text-indigo-300 leading-relaxed">限制模式：AI 只能读取/写入本应用文件夹（web/）内的文件。允许模式：AI 可读写电脑上的任意路径（通过本地服务执行），请仅在可信环境开启。</p>
+                        <p class="text-[11px] text-indigo-300 leading-relaxed">限制模式：AI 只能读取/写入本应用文件夹（web/）内的文件，<b>不能执行任何命令</b>。允许模式：AI 可读写电脑上的任意路径，并可执行 PowerShell / cmd 命令（通过本地服务执行）——<b>危险命令（删除、改注册表、关机、下载并执行等）会在执行前弹窗请你确认，普通命令直接执行</b>。请仅在可信环境开启。</p>
                     </div>
 
                     <!-- 手机操作也从「高级」移到这里 —— 它同样属于"给 AI 开权限"，
@@ -3987,6 +4112,12 @@
          ⚠️ 不要在本注释里书写脚本标签字面量 —— HTML 注释中出现脚本开标签会让
             「内联脚本语法检查」把注释内容当成代码解析，报出假的 SyntaxError。 -->
     <script src="/js/app-01-core.js"></script>
+    <!-- 流式输出（SSE 增量解析）。
+         必须排在 app-01-core.js **之后**：core 里的 requestChatJson 会调用
+         window.ChatStream.withStreamFlag()，而这个调用发生在"用户发消息"时，
+         不是加载时，所以顺序其实不敏感；但放在 core 之后更符合"core 定义出口、
+         本文件提供能力"的依赖方向，也方便以后有人把它改成加载时就取。 -->
+    <script src="/js/chat-stream.js"></script>
     <script src="/js/app-02-data.js"></script>
     <script src="/js/app-03-agent.js"></script>
     <script src="/js/app-04-ui.js"></script>

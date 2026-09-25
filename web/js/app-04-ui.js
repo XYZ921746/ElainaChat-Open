@@ -1228,6 +1228,237 @@ function renderThinkingMessage() {
     elements.conversationHistory.scrollTop = elements.conversationHistory.scrollHeight;
 }
 
+// ========================================================================
+//  回合过程渲染：思考行 + 工具调用行 + 每回合总览
+// ========================================================================
+//
+// 为什么要有这一整块，而不是"把 reasoning 拼到气泡里"：
+//   ① 角色扮演应用里，模型思考内容经常包含"我不该直接回答这个"这类
+//      出戏的元叙述，混进正文会破坏体验 —— 必须分开展示；
+//   ② 关掉思考开关时，工具调用记录**仍然要显示**（用户的原话：
+//      "思考模式关闭的情况下思维链还是要显示工具调用的"）——
+//      因为那是"AI 干了什么"的事实记录，不是思考过程；
+//   ③ 需要"每回合总览"：用户想知道这一轮 AI 到底做了什么，
+//      而不是逐行读每一条调用。
+//
+// 折叠策略（参考 DSH）：全部默认折叠，摘要行常驻。
+// 理由：这是聊天应用，正文才是主角；思考动辄上千字，默认展开会把对话顶走。
+
+/** 一次回合（= 一条 AI 回复的处理过程）的记录容器 */
+function createTurnTrace() {
+    return { reasoning: '', tools: [], startedAt: Date.now() };
+}
+
+/** 当前正在进行的回合记录。一条 AI 回复对应一个，回复完成后清空。 */
+let activeTurnTrace = null;
+
+/** 本轮过程区要插到哪个消息前面（AI 气泡的 id） */
+let activeTurnAnchorId = null;
+
+function beginTurnTrace(anchorMessageId) {
+    activeTurnTrace = createTurnTrace();
+    activeTurnAnchorId = anchorMessageId ? String(anchorMessageId) : null;
+    return activeTurnTrace;
+}
+
+/**
+ * 追加思考增量。思考开关关着时也允许调用 —— 由渲染层决定显不显示，
+ * 而不是由收集层决定收不收：万一用户中途打开开关，已经收到的内容不该是空的。
+ */
+function appendTurnReasoning(delta) {
+    if (!activeTurnTrace || !delta) return;
+    activeTurnTrace.reasoning += String(delta);
+    scheduleTurnProcessRender();
+}
+
+/**
+ * 记录一次工具/操作调用。
+ *
+ * @param {object} entry { kind, title, summary, args, result, state }
+ *   kind    用于选图标与配色：read/write/search/command/phone/file/others
+ *   state   running | ok | error | stopped
+ *   args    调用参数（展开后显示）
+ *   result  执行结果（展开后显示）
+ */
+function recordTurnTool(entry) {
+    if (!activeTurnTrace) return null;
+    const item = {
+        kind: String(entry?.kind || 'others'),
+        title: String(entry?.title || '操作'),
+        summary: String(entry?.summary || ''),
+        args: entry?.args === undefined ? '' : String(entry.args),
+        result: entry?.result === undefined ? '' : String(entry.result),
+        state: String(entry?.state || 'ok'),
+        at: Date.now()
+    };
+    activeTurnTrace.tools.push(item);
+    scheduleTurnProcessRender();
+    return item;
+}
+
+/** 更新最近一条工具记录的状态/结果（执行完成时回填） */
+function updateTurnTool(item, patch = {}) {
+    if (!item || !activeTurnTrace) return;
+    if (patch.state !== undefined) item.state = String(patch.state);
+    if (patch.result !== undefined) item.result = String(patch.result);
+    if (patch.summary !== undefined) item.summary = String(patch.summary);
+    scheduleTurnProcessRender();
+}
+
+/**
+ * 增量渲染用 requestAnimationFrame 合并。
+ *
+ * 不合并的话，流式每来一个 token 就重建一次 DOM —— 一次长回复有上千个增量，
+ * 每个都重排一次会让页面明显卡顿（而且越到后面越卡，因为内容越长）。
+ * 合并到每帧一次，视觉上完全看不出差别，开销却降了两个数量级。
+ */
+let turnProcessRenderScheduled = false;
+function scheduleTurnProcessRender() {
+    if (turnProcessRenderScheduled) return;
+    turnProcessRenderScheduled = true;
+    const run = () => { turnProcessRenderScheduled = false; renderTurnProcess(); };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+    else setTimeout(run, 16);
+}
+
+/** 工具类型 → 图标 SVG（内联，避免依赖图标库） */
+function processIconSvg(kind) {
+    const paths = {
+        read: '<path stroke-linecap="round" stroke-linejoin="round" d="M4 5.5A2.5 2.5 0 016.5 3H20v15H6.5A2.5 2.5 0 004 20.5z"/><path stroke-linecap="round" d="M4 5.5v15"/>',
+        write: '<path stroke-linecap="round" stroke-linejoin="round" d="M4 20h4L19 9a2.1 2.1 0 10-3-3L5 17v3z"/>',
+        search: '<circle cx="11" cy="11" r="6"/><path stroke-linecap="round" d="M20 20l-4.3-4.3"/>',
+        command: '<rect x="3" y="4" width="18" height="16" rx="2"/><path stroke-linecap="round" d="M7 9l3 3-3 3M13 15h4"/>',
+        phone: '<rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path stroke-linecap="round" d="M10.5 18.5h3"/>',
+        file: '<path stroke-linecap="round" stroke-linejoin="round" d="M13 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V9z"/><path stroke-linecap="round" d="M13 3v6h6"/>',
+        think: '<path stroke-linecap="round" stroke-linejoin="round" d="M9.7 17h4.6M12 3a6 6 0 00-3.6 10.8c.7.5 1.1 1.3 1.1 2.2V16h5v-.1c0-.9.4-1.6 1.1-2.2A6 6 0 0012 3z"/>',
+        others: '<circle cx="12" cy="12" r="8"/><path stroke-linecap="round" d="M12 8v4.5l2.5 1.5"/>'
+    };
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">${paths[kind] || paths.others}</svg>`;
+}
+
+/** 状态 → 中文文案 */
+function processStateLabel(state) {
+    if (state === 'running') return '运行中';
+    if (state === 'error') return '失败';
+    if (state === 'stopped') return '已停止';
+    return '完成';
+}
+
+/** 生成一条过程行的 HTML（思考行 / 工具行通用） */
+function processRowHtml({ kind, title, summary, state, bodyHtml }) {
+    return `
+        <div class="process-row" data-state="${escapeHtml(state || 'ok')}" data-kind="${escapeHtml(kind)}">
+            <button type="button" class="process-row-head" onclick="toggleProcessRow(this)" aria-expanded="false">
+                <span class="process-row-icon" aria-hidden="true">${processIconSvg(kind)}</span>
+                <span class="process-state" aria-hidden="true"></span>
+                <span class="process-row-title">${escapeHtml(title)}</span>
+                ${summary ? `<span class="process-row-summary">${escapeHtml(summary)}</span>` : '<span class="process-row-summary"></span>'}
+                <span class="process-row-status">${escapeHtml(processStateLabel(state))}</span>
+                <span class="process-row-chevron" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 6l6 6-6 6"/></svg>
+                </span>
+            </button>
+            <div class="process-row-body">${bodyHtml || ''}</div>
+        </div>`;
+}
+
+/** 展开/收起一条过程行（内联 onclick，与项目其它地方一致） */
+function toggleProcessRow(button) {
+    const row = button?.closest?.('.process-row');
+    if (!row) return;
+    const open = row.classList.toggle('is-open');
+    button.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+/**
+ * 把当前回合的过程渲染到界面上。
+ *
+ * 渲染目标：`#turn-process-<锚点消息 id>`。锚点就是 AI 气泡的 id，
+ * 过程区插在它**前面** —— 这样用户先看到"AI 做了什么/想了什么"，
+ * 再看到正文，符合阅读顺序（DSH 也是这个顺序）。
+ */
+function renderTurnProcess() {
+    if (!elements.conversationHistory) return;
+    const trace = activeTurnTrace;
+    if (!trace) return;
+
+    // 思考开关：只控制**思考行**是否显示。
+    // 工具调用行无条件显示 —— 那是"AI 干了什么"的事实记录，
+    // 关掉思考不代表用户可以不知道 AI 动了哪些文件。
+    const showReasoning = Boolean(state.settings.thinkingMode);
+    const hasReasoning = showReasoning && trace.reasoning.trim().length > 0;
+    const hasTools = trace.tools.length > 0;
+    if (!hasReasoning && !hasTools) return;
+
+    const anchorId = activeTurnAnchorId ? `turn-process-${safeAttrId(activeTurnAnchorId)}` : 'turn-process-active';
+    let host = document.getElementById(anchorId);
+    if (!host) {
+        host = document.createElement('div');
+        host.id = anchorId;
+        host.className = 'turn-process';
+        // 插到 AI 气泡前面；找不到就追加到末尾（例如自动语音那条路径）
+        const anchor = activeTurnAnchorId ? document.getElementById(`msg-${safeAttrId(activeTurnAnchorId)}`) : null;
+        if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(host, anchor);
+        else elements.conversationHistory.appendChild(host);
+    }
+
+    const parts = [];
+
+    // ---- 每回合总览（放最前面，折叠状态下也能看清这一轮做了什么）----
+    const counts = { ok: 0, error: 0, running: 0, stopped: 0 };
+    for (const t of trace.tools) counts[t.state] = (counts[t.state] || 0) + 1;
+    const summaryBits = [];
+    if (hasReasoning) summaryBits.push('已思考');
+    if (counts.ok) summaryBits.push(`${counts.ok} 个操作完成`);
+    if (counts.error) summaryBits.push(`${counts.error} 个失败`);
+    if (counts.running) summaryBits.push(`${counts.running} 个进行中`);
+    if (counts.stopped) summaryBits.push(`${counts.stopped} 个已停止`);
+    if (summaryBits.length) {
+        parts.push(`<div class="turn-summary">${summaryBits
+            .map((b) => escapeHtml(b))
+            .join('<span class="turn-summary-sep">·</span>')}</div>`);
+    }
+
+    // ---- 思考行（只有开关打开时才有）----
+    if (hasReasoning) {
+        const text = trace.reasoning.trim();
+        const firstLine = text.split('\n').map((l) => l.trim()).find(Boolean) || '思考中';
+        parts.push(processRowHtml({
+            kind: 'think',
+            title: '思考',
+            // 摘要用首行并截断 —— 一行摘要 + 省略号，是折叠态的全部信息量
+            summary: firstLine.length > 80 ? firstLine.slice(0, 80) + '…' : firstLine,
+            state: trace.done ? 'ok' : 'running',
+            bodyHtml: `<div class="process-reasoning">${escapeHtml(text)}</div>`
+        }));
+    }
+
+    // ---- 工具调用行 ----
+    for (const t of trace.tools) {
+        const body = [];
+        if (t.args) body.push(`<span class="process-row-label">参数</span><pre>${escapeHtml(t.args)}</pre>`);
+        if (t.result) body.push(`<span class="process-row-label">结果</span><pre>${escapeHtml(t.result)}</pre>`);
+        parts.push(processRowHtml({
+            kind: t.kind,
+            title: t.title,
+            summary: t.summary,
+            state: t.state,
+            bodyHtml: body.join('')
+        }));
+    }
+
+    host.innerHTML = parts.join('');
+    // 自动滚到底：流式输出时用户视线在底部，不滚的话新内容会出现在屏幕外
+    elements.conversationHistory.scrollTop = elements.conversationHistory.scrollHeight;
+}
+
+/** 回合结束：把思考行标成完成，并保留过程区（历史消息回看时还要看得到） */
+function finishTurnTrace() {
+    if (!activeTurnTrace) return;
+    activeTurnTrace.done = true;
+    renderTurnProcess();
+}
+
 function removeThinkingMessage() {
     const el = document.getElementById('thinking-bubble');
     if (el) {

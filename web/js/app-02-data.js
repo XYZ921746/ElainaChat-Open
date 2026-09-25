@@ -175,6 +175,12 @@ ${lines.join('\n')}
             ? '# Agent Skill：文件操作（当前：允许操作电脑）\n可用 [操作:列出文件 路径] 查看目录、[操作:查看文件 路径] 读取文件、[操作:保存文件 路径|内容] 写入（新建）文件。当前模式允许读写电脑上的任意路径（用户已授权）。\n⚠️ 重要：只有输出 [操作:...] 标签，文件操作才会真正执行；仅仅在对话里说"我写好了/我已经保存"不会写入任何文件。当用户要求写/读文件时，你必须在回复正文中带上对应的 [操作:...] 标签（标签不会显示给用户）。写文件前先确认路径合理。\n🚫 你没有任何删除、修改、重命名、移动文件的权限（仅可查看、读取、新建文件）。当用户要求删除或改动已有文件时，请礼貌地拒绝并说明你没有删除权限，建议用户自己手动操作。\n🚫 绝对不要编造"已保存/已新建/已删除/已读取/操作成功"之类的操作结果——你没有实际执行就是没执行，未执行的操作必须如实说明没有执行。你不可以假装创建、写入或删除文件。' + agentRootsText()
             : '# Agent Skill：文件操作（当前：应用内限制）\n可用 [操作:列出文件 路径] 查看目录、[操作:查看文件 路径] 读取文件、[操作:保存文件 路径|内容] 写入（新建）文件。当前模式仅可操作本应用文件夹（web/）内的文件，不要访问其他路径。\n⚠️ 重要：只有输出 [操作:...] 标签，文件操作才会真正执行；仅仅在对话里说"我写好了"不会写入任何文件。当用户要求写/读文件时，你必须在回复正文中带上对应的 [操作:...] 标签（标签不会显示给用户）。\n🚫 你没有任何删除、修改、重命名、移动文件的权限（仅可查看、读取、新建文件）。当用户要求删除或改动已有文件时，请礼貌地拒绝并说明你没有删除权限，建议用户自己手动操作。\n🚫 绝对不要编造"已保存/已新建/已删除/已读取/操作成功"之类的操作结果——你没有实际执行就是没执行，未执行的操作必须如实说明没有执行。你不可以假装创建、写入或删除文件。' });
     } catch (e) { /* ignore */ }
+    // 电脑命令能力（第二阶段 ④）：只在「允许操作电脑」模式下注入。
+    // 与文件操作同一条理由 —— 限制模式下说了也做不到，模型会反复撞墙。
+    try {
+        const cmdSkill = agentCommandSkillText();
+        if (cmdSkill) messages.push({ role: 'system', content: cmdSkill });
+    } catch (e) { /* ignore */ }
     // mod（插件）注入的 system 提示词。
     //
     // 这是 mod 影响模型行为的**唯一入口**：mod 不直接改这里的拼接逻辑
@@ -239,6 +245,12 @@ function buildLegacyRoleplayMessages(text, options = {}) {
     try {
         const phoneSkill = agentPhoneSkillText();
         if (phoneSkill) systemParts.push(phoneSkill);
+    } catch (e) { /* ignore */ }
+    // 电脑命令能力：与分层版保持一致（回滚路径两边都要有，否则切回 legacy
+    // 就会出现"AI 又不能执行命令了"的诡异差异）
+    try {
+        const cmdSkill = agentCommandSkillText();
+        if (cmdSkill) systemParts.push(cmdSkill);
     } catch (e) { /* ignore */ }
     systemParts.push(ROLEPLAY_TURN_ANCHOR);
     const messages = [{ role: 'system', content: systemParts.join('\n\n') }];
@@ -314,11 +326,18 @@ async function callAI(text, options = {}) {
     try {
         return await callChatAPI(messages, {
             thinking: Boolean(state.settings.thinkingMode),
+            // 思考强度：只在开思考时有意义（关着的时候 provider 会发 disabled，
+            // 带上档位也无害，但不传更干净）。
+            thinkingEffort: state.settings.thinkingEffort || 'medium',
             maxTokens: options.includeVoiceJp
                 ? ROLEPLAY_OUTPUT_TOKEN_LIMITS.withVoice
                 : ROLEPLAY_OUTPUT_TOKEN_LIMITS.text,
             // 「停止」按钮的中断器 —— 穿过 callChatAPI 进到 postJsonFromDevice
-            signal: options.signal
+            signal: options.signal,
+            // 流式：每收到一段增量就回调一次，由调用方（app-05-voice.js）
+            // 负责把它增量渲染进气泡。传 null 表示调用方不需要增量（例如
+            // 后台的记忆整理、定时任务），那就照旧等完整结果。
+            onDelta: options.onDelta || null
         });
     } catch (err) {
         if (hasImage && err instanceof ClientApiError) err.imageHint = true;

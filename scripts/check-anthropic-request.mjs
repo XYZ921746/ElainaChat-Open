@@ -106,6 +106,12 @@ const ctx = new Function('window', `
     ${extractFn('resolveOutputTokenLimit')}
     ${extractFn('getChatBaseUrl')}
     ${extractFn('isDeepSeekOfficial')}
+    // 思考开关/强度 → 各协议请求字段。这是真实实现，不是假的：
+    // 本检查要断言"关思考时到底发了什么"，那必须是被测代码自己算出来的。
+    ${extractFn('mapThinkingEffort')}
+    ${extractFn('detectThinkingVendor')}
+    ${extractFn('buildThinkingParams')}
+    const THINKING_EFFORTS = Object.freeze(['low', 'medium', 'high']);
     // CHAT_API_FORMATS 只是格式白名单表，这里按真实定义给一份骨架（**新增格式时要同步**）
     const CHAT_API_FORMATS = Object.freeze({ 'openai-compatible': {}, 'openai-responses': {}, anthropic: {} });
     ${extractFn('getChatApiFormat')}
@@ -119,7 +125,7 @@ const ctx = new Function('window', `
         callChatAPI, calls, setPayload, normalizeCalls, getClientErrorPresentation, ClientApiError,
         getChatBaseUrl, isDeepSeekOfficial, normalizeChatReply, postJsonFromDevice,
         throwProviderResponseError, extractTextContent, stripThinkTags, resolveOutputTokenLimit,
-        ANTHROPIC_MIN_MAX_TOKENS,
+        ANTHROPIC_MIN_MAX_TOKENS, buildThinkingParams,
         last: () => calls[calls.length - 1],
         lastNormalize: () => normalizeCalls[normalizeCalls.length - 1],
     };
@@ -147,6 +153,12 @@ fakeWindow.ChatDeps = {
     isDeepSeekOfficial: raw.isDeepSeekOfficial,
     normalizeChatReply: raw.normalizeChatReply,
     postJsonFromDevice: raw.postJsonFromDevice,
+    // providers 现在走 requestChatJson 而不是直接 postJsonFromDevice。
+    // 本检查只验证"发出去的请求体形状"，不验证流式 —— 所以这里让 requestChatJson
+    // 直接转发到那个假的 postJsonFromDevice，保持"只有网络出口是假的"这个性质。
+    requestChatJson: async (endpoint, body, headers, opts) =>
+        await raw.postJsonFromDevice(endpoint, body, headers, opts?.timeoutMs, opts?.signal),
+    buildThinkingParams: raw.buildThinkingParams,
     throwProviderResponseError: raw.throwProviderResponseError,
     extractTextContent: raw.extractTextContent,
     stripThinkTags: raw.stripThinkTags,
@@ -258,11 +270,55 @@ check('-nothinking 不触发下限（它不是 -thinking）', nothinking.body.ma
 // 大小写：判据故意放宽（多抬一个上限是无害的），命中时不能漏
 const upper = await send({ maxTokens: 900 }, { model: 'claude-sonnet-4-5-THINKING' }, 'openai-compatible');
 atLeast('后缀大小写混写也认（宁可多抬，不能漏）', upper.body.max_tokens, 1025);
-// DeepSeek 官方的「深度思考」是换成 deepseek-reasoner，跟后缀无关，不该被抬
+// DeepSeek 官方的老模型名会映射到当前模型（deepseek-chat 已由 deepseek-flash 承接），
+// 但**不能**再换成 deepseek-reasoner —— 那个模型名属于"思考专用模型"时代，
+// 现在思考由 thinking 字段控制。这条断言以前写的是"换成 reasoner"，是过时契约。
 const ds = await send({ maxTokens: 900, thinking: true },
     { baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat' }, 'openai-compatible');
-check('DeepSeek 官方 + 深度思考 → 换成 reasoner', ds.body.model, 'deepseek-reasoner');
-check('  且 max_tokens 不被抬（deepseek-chat 没有 -thinking 后缀）', ds.body.max_tokens, 900);
+check('DeepSeek 官方 + 老模型名 → 映射到当前模型', ds.body.model, 'deepseek-flash');
+check('  且 max_tokens 不被抬（模型名没有 -thinking 后缀）', ds.body.max_tokens, 900);
+
+// ---------- 二之二、思考开关与强度（本次适配的核心） ----------
+//
+// 背景：DeepSeek 现在的接口**默认开启思考**（官方《思考模式》文档：thinking mode
+// is enabled by default, effort 默认 high）。这意味着"关掉开关"必须**显式**发
+// disabled —— 不发字段不等于关，用户会白等几十秒、白花思考 token，
+// 而界面上什么都看不到。这条是本次最容易漏、后果最隐蔽的一条。
+console.log('\n— 思考开关与强度 —');
+const dsOff = await send({ thinking: false }, { baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' }, 'openai-compatible');
+check('DeepSeek 关思考 → 显式发 disabled（默认是开的，不发等于没关）',
+    dsOff.body.thinking, { type: 'disabled' });
+const dsOn = await send({ thinking: true }, { baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' }, 'openai-compatible');
+check('DeepSeek 开思考 → 发 enabled', dsOn.body.thinking, { type: 'enabled' });
+check('  medium 档不显式发 effort（用服务商默认）', 'reasoning_effort' in dsOn.body, false);
+const dsLow = await send({ thinking: true, thinkingEffort: 'low' },
+    { baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' }, 'openai-compatible');
+check('DeepSeek 低强度 → reasoning_effort: low', dsLow.body.reasoning_effort, 'low');
+const dsHigh = await send({ thinking: true, thinkingEffort: 'high' },
+    { baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' }, 'openai-compatible');
+check('DeepSeek 高强度 → reasoning_effort: high', dsHigh.body.reasoning_effort, 'high');
+
+// Anthropic：用 reasoning.effort，**不能**用 thinking 字段
+// （那个字段在 Claude 官方是 {type, budget_tokens}，同名不同义，发错会 400）
+const anOff = await send({ thinking: false }, { baseUrl: 'https://api.anthropic.com' }, 'anthropic');
+check('Anthropic 关思考 → reasoning.effort: none', anOff.body.reasoning, { effort: 'none' });
+check('  ★ 且不发 thinking 字段（那是 Claude 官方 extended thinking，同名不同义）',
+    'thinking' in anOff.body, false);
+const anOn = await send({ thinking: true, thinkingEffort: 'low' }, { baseUrl: 'https://api.anthropic.com' }, 'anthropic');
+check('Anthropic 开思考 → reasoning.effort 是档位名', anOn.body.reasoning, { effort: 'low' });
+check('  低/高强度时补 output_config.effort', anOn.body.output_config, { effort: 'low' });
+
+// ★ 开了思考就不能带 temperature：Anthropic 官方禁止（会 400）
+const anTemp = await send({ thinking: true, temperature: 0.7 }, { baseUrl: 'https://api.anthropic.com' }, 'anthropic');
+check('★ Anthropic 开思考时不带 temperature（带了会 400）', 'temperature' in anTemp.body, false);
+const anTempOff = await send({ thinking: false, temperature: 0.7 }, { baseUrl: 'https://api.anthropic.com' }, 'anthropic');
+check('  关思考时 temperature 照常带上', anTempOff.body.temperature, 0.7);
+
+// Responses：只有 reasoning.effort，没有"关闭"取值
+const rpOn = await send({ thinking: true, thinkingEffort: 'high' }, { baseUrl: 'https://api.openai.com/v1' }, 'openai-responses');
+check('Responses 开思考 → reasoning.effort', rpOn.body.reasoning, { effort: 'high' });
+const rpOff = await send({ thinking: false }, { baseUrl: 'https://api.openai.com/v1' }, 'openai-responses');
+check('Responses 关思考 → 不发 reasoning（它没有 none 取值）', 'reasoning' in rpOff.body, false);
 
 // ---------- 三、端点拼接 ----------
 console.log('\n— 端点 —');
@@ -300,7 +356,7 @@ console.log('\n— 请求体 —');
 check('system 提到顶层，且拼成一条', main.body.system, '你是伊蕾娜。\n\n# 世界观\n魔法世界');
 check('messages 里不再有 system', main.body.messages.some((m) => m.role === 'system'), false);
 check('messages 只有 user/assistant', main.body.messages.map((m) => m.role), ['user', 'assistant', 'user']);
-check('不带 thinking 字段（应用没有主动开思考）', 'thinking' in main.body, false);
+check('不带 thinking 字段（Anthropic 用 reasoning.effort，不是 Claude 的 thinking）', 'thinking' in main.body, false);
 check('模型名原样传给上游', main.body.model, 'claude-sonnet-4-5');
 check('带 -thinking 后缀时模型名原样传（由中转站解析）', thinkingSuffix.body.model, 'claude-sonnet-4-5-thinking');
 check('没传 temperature 时不带上这个键', 'temperature' in main.body, false);
