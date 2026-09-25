@@ -148,6 +148,11 @@ ElainaMods.register('my-mod', (host) => {
     // 读当前对话 / 发消息（走宿主既有链路，记忆、续跑、停止都自动生效）
     host.on('reply-done', (text) => host.log('AI 回复了', String(text).slice(0, 40)));
 
+    // ★ 取自己的资源要用 host.assetUrl()，**不要**自己拼 '/mods/my-mod/…'
+    //   插件声明的 id 与它被安装成的目录名**可能不同**（打包产物名带版本号，
+    //   历史上装出过 elaina-avatar-1.0.0/ 这种目录）。自己拼路径会在那时 404。
+    const img = host.assetUrl('img/icon.png');   // → 永远指向真实位置
+
     return {
         // 用户在插件列表里关掉它时调用 —— 把界面收起来
         setEnabled(on) { /* ... */ },
@@ -158,7 +163,11 @@ ElainaMods.register('my-mod', (host) => {
 宿主 API 是一张**收窄的清单**（不是把 `window` 丢给插件）—— 这样宿主才能重构内部实现
 而不弄坏插件。完整清单见 `web/js/mods.js` 的 `createHostApi()`：
 `getConversation` / `getMessages` / `getUiMode` / `sendUserMessage` / `renderText` /
-`injectStyle` / `setPromptHint` / `on` / `emit` / `has`。
+`assetUrl` / `assetBase` / `injectStyle` / `setPromptHint` / `on` / `emit` / `has`。
+
+> **`manifest.json` 里请显式写 `id`。** 它是插件的**身份**：依赖它的 `after`
+> 按这个名字匹配，你的资源 URL 也以它为准。不写时才会回落到目录名。
+> 用 `host.assetUrl()` 取资源，即使目录名与 id 不一致也不会 404。
 
 > **安装插件 = 信任它的代码**（它在页面同源环境里运行）。请只装自己信得过的。
 
@@ -214,6 +223,29 @@ node scripts/pack-assets.mjs --list   # 先看看会打什么
 ---
 
 ## 更新日志
+
+### v1.3.1-mod
+
+**修掉「扩展包装了等于没装」：id 与目录名不一致**
+
+- 用户报的现象：桌宠与 Galgame 都启用了，但**立绘显示不出来**，设置里还报
+  **缺依赖 `elaina-avatar`** —— 明明已经装了
+- 根因是**一个错误、两个症状**：打包产物名带版本号（`elaina-avatar-1.0.0.zip`），
+  而安装时**直接拿 zip 文件名当插件 id** → 装进 `mods/elaina-avatar-1.0.0/`。
+  于是插件内部写死的资源 URL（`/mods/elaina-avatar/img/…`）404，
+  同时 `after: ["elaina-avatar"]` 也匹配不上实际 id → 依赖解析一并失效
+- 为什么测试没抓到：`check-mods.mjs` 测的是"目录已存在"的场景，而
+  **打包 → 安装**这条链是两个模块各自的假设拼起来的 —— 打包脚本认为
+  "产物名带版本号没问题"（对，Releases 需要它），安装逻辑认为"文件名就是 id"
+  （只考虑手工放目录时也对）。**各自都对，合起来就错**
+- 修法三件一起：① 安装端归一化 id（剥多段版本号尾，但**不**剥 `my-mod-2`
+  这种单段数字，否则误伤用户自建插件）；② `manifest.id` 成为**权威来源**
+  （旧实现反过来用目录名覆盖它 —— 而这次目录名才是错的那个）；
+  ③ 清单同时给出 `id`（身份：依赖与资源引用）与 `dir`（磁盘目录：脚本加载），
+  并新增 `host.assetUrl()` / `host.assetBase()`，插件不必自己拼路径
+- **已装坏的用户不用重装**：`elaina-avatar-1.0.0/` 这类目录会被识别并归一化 id，
+  目录本身不删（设置在里面）
+- 新增两个回归检查：`check-mod-id.mjs`（19 项）+ `check-mod-e2e.mjs`（17 项，真实 HTTP）
 
 ### v1.3.0-mod
 

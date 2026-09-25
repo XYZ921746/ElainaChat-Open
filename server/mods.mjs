@@ -36,6 +36,38 @@ import path from 'node:path';
 /** 插件目录名合法性：只允许字母数字、连字符、下划线、点（且不能是 . / ..） */
 const MOD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
+/**
+ * 把 zip 文件名归一化成插件 id：剥掉尾部的版本号。
+ *
+ * ★ 这是修「资源包装了等于没装」的核心（2026-09 实测踩到）：
+ *
+ *   pack-assets.mjs 的产物名带版本号（`elaina-avatar-1.0.0.zip`），
+ *   而旧逻辑直接拿 zip 文件名当插件 id —— 于是插件装进了
+ *   `mods/elaina-avatar-1.0.0/`，后果是**两条**同时发生：
+ *     ① 插件内部写死的资源 URL（`/mods/elaina-avatar/img/…`）404
+ *        → 桌宠 / Galgame 显示不出人物；
+ *     ② 依赖它的 mod 声明 `after: ["elaina-avatar"]`，匹配不上实际 id
+ *        → 依赖解析失效，加载顺序失去保证。
+ *
+ *   为什么在**安装端**归一化、而不是让打包去掉版本号：版本号在
+ *   Releases 文件名上有用（区分版本、避免浏览器缓存旧包），
+ *   该保留的是产物名，该修的是"id 不能等于文件名"。
+ *
+ *   剥法**只认多段版本号**（`-1.0.0` / `-1.0`），不认单段（`-2`）。
+ *   为什么这样划界：`my-mod-2`、`mod-2` 这类"名字里带个序号"的插件很常见，
+ *   把 `-2` 当版本号剥掉会把 `my-mod-2` 变成 `my-mod` —— 误伤真实名字。
+ *   而打包产物永远是 `x.y.z`（见 pack-assets 的 `${id}-${version}`，
+ *   version 来自 manifest，本仓库三个包都是 `1.0.0`），所以只剥带点的形式
+ *   既够用、又不会伤到用户自建的插件。
+ *   若剥完不合法（比如剥成空串）则原样返回，交由调用方的白名单报错。
+ */
+function normalizeModId(rawName) {
+    const base = String(rawName || '').replace(/\.zip$/i, '');
+    // 至少两段数字才算版本号：-1.0 / -1.0.0 / -2.1.3
+    const stripped = base.replace(/-[0-9]+\.[0-9]+(\.[0-9]+)*$/, '');
+    return (MOD_ID_RE.test(stripped) && MOD_ID_RE.test(base)) ? stripped : base;
+}
+
 /** 插件目录里允许落盘的本机可执行类型（拦掉，避免用户误双击） */
 const MOD_BLOCKED_EXT = new Set([
     '.exe', '.dll', '.com', '.scr', '.msi', '.bat', '.cmd',
@@ -58,15 +90,33 @@ const MOD_MAX_BYTES = 64 * 1024 * 1024;
 export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveExt, log = () => {} }) {
     const INDEX_FILE = path.join(modsDir, 'index.json');
 
-    /** 读插件目录里的 manifest.json（优先）或从 zip 名推断 */
+    /**
+     * 读插件目录里的 manifest.json（优先）或从目录名推断。
+     *
+     * ★ id 的权威来源是 **manifest.id**，不是目录名（2026-09 改）。
+     *
+     *   旧实现反过来（`{ id: fallbackId, ...m, id: fallbackId }` 用目录名覆盖
+     *   manifest 里写的 id），理由是"目录名是解压时定下的，避免 manifest 写错对不上"。
+     *   但那条理由成立的前提是"目录名一定对"—— 而 pack-assets 的产物名带版本号，
+     *   安装时曾把 `elaina-avatar-1.0.0` 当目录名，于是**目录名才是错的那个**：
+     *   插件内部写死的资源 URL 与依赖它的 `after` 全都对不上。
+     *
+     *   现在改成：manifest.id 合法就用它（它是插件作者声明的身份，也是
+     *   资源路径与依赖引用的基准），只有缺失/非法时才回落到目录名。
+     *   `MOD_ID_RE` 校验必须保留 —— manifest 是外部输入，不能直接信。
+     */
     async function readManifest(dir, fallbackId) {
         const mf = path.join(dir, 'manifest.json');
         try {
             const raw = await readFile(mf, 'utf8');
             const m = JSON.parse(raw);
             if (m && typeof m === 'object') {
-                // id 以目录名为准（目录名是解压时定下的，避免 manifest 里写错导致对不上）
-                return { id: fallbackId, ...m, id: fallbackId };
+                const declared = typeof m.id === 'string' ? m.id.trim() : '';
+                const id = (declared && MOD_ID_RE.test(declared)) ? declared : fallbackId;
+                if (declared && !MOD_ID_RE.test(declared)) {
+                    log(`插件 ${fallbackId} 的 manifest.id 不合法（${declared}），回落到目录名`);
+                }
+                return { ...m, id };
             }
         } catch (e) {
             if (e && e.code !== 'ENOENT') log('插件 manifest.json 解析失败：' + dir + ' —— ' + e.message);
@@ -181,7 +231,27 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         for (const e of entries) {
             if (e.name === 'index.json') continue;
             if (e.isDirectory()) {
-                if (MOD_ID_RE.test(e.name)) installed.push({ id: e.name, dir: path.join(modsDir, e.name) });
+                if (!MOD_ID_RE.test(e.name)) continue;
+                // ★ 兼容旧安装：目录名带版本号（elaina-avatar-1.0.0）的是修复前的产物。
+                //   读它的 manifest 拿真 id；拿不到就按归一化规则剥 —— 总之把
+                //   资源 URL 与 after 依赖都对回正确名字，已装坏的用户不用重装。
+                //   不改磁盘目录名（改名会丢用户设置里的启用状态），只在清单里归一。
+                let id = e.name;
+                // 只对**多段版本号**尾（-1.0.0）做归一化，避免误伤 my-mod-2 这类真实名字
+                if (/-[0-9]+\.[0-9]+(\.[0-9]+)*$/.test(e.name)) {
+                    try {
+                        const mf = JSON.parse(await readFile(path.join(modsDir, e.name, 'manifest.json'), 'utf8'));
+                        if (mf && typeof mf.id === 'string' && MOD_ID_RE.test(mf.id)) id = mf.id;
+                    } catch { /* 无 manifest 或解析失败 */ }
+                    if (id === e.name) id = normalizeModId(e.name);
+                    // 归一后的 id 若与另一个真实目录撞车（两个来源同时存在），
+                    // 保留原目录（它能独立工作），归一那份跳过并记日志。
+                    if (id !== e.name && entries.some((x) => x.name === id && x.isDirectory())) {
+                        log(`目录 ${e.name} 与 ${id} 同时存在，跳过前者（可能是重复安装）`);
+                        continue;
+                    }
+                }
+                installed.push({ id, dir: path.join(modsDir, e.name) });
             } else if (e.isFile() && /\.zip$/i.test(e.name)) {
                 zips.push(e.name);
             }
@@ -200,15 +270,29 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         // 这也让"删目录"变成真正有效的卸载方式。
         const installResults = [];
         for (const z of zips) {
-            const id = z.replace(/\.zip$/i, '');
+            // ★ id 要先过 normalizeModId 剥掉版本号 ——
+            //   pack-assets 的产物名是 `elaina-avatar-1.0.0.zip`，
+            //   直接拿文件名当 id 会装进 elaina-avatar-1.0.0/，
+            //   资源 URL 与 after 依赖同时失效（见 normalizeModId 的说明）。
+            const id = normalizeModId(z);
             if (!MOD_ID_RE.test(id)) {
                 installResults.push({ zip: z, ok: false, error: '插件名不合法（只允许字母数字、- _ .）' });
+                continue;
+            }
+            // 若归一化后的目录已存在（用户重复放了不同版本的包），明确报出来
+            // 而不是静默覆盖 —— 覆盖会把旧版本的用户设置一并带走。
+            const targetDir = path.join(modsDir, id);
+            const alreadyInstalled = installed.some((i) => i.id === id);
+            if (alreadyInstalled) {
+                installResults.push({ zip: z, ok: false, error: `插件 ${id} 已安装（如需更新请先删除旧版）` });
+                await rm(path.join(modsDir, z), { force: true }).catch(() => {});
+                log(`跳过 ${z}：${id} 已安装，安装包已清理`);
                 continue;
             }
             try {
                 const r = await extractPluginZip(path.join(modsDir, z), id);
                 installResults.push({ zip: z, ok: true, id: r.id, files: r.written });
-                if (!installed.some((i) => i.id === id)) installed.push({ id, dir: path.join(modsDir, id) });
+                if (!alreadyInstalled) installed.push({ id, dir: targetDir });
                 // 装好即清理安装包（见上面的说明）
                 await rm(path.join(modsDir, z), { force: true }).catch(() => {});
                 log('已安装插件：' + id + '（' + r.written + ' 个文件，安装包已清理）');
@@ -221,12 +305,21 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         }
 
         // 收集已安装插件的清单
+        //
+        // ★ 这里同时给出两个名字，各有各的用途（2026-09 修）：
+        //   id  —— 归一化后的**身份**：依赖匹配（after）与资源 URL 的基准。
+        //          它等于 manifest.id（缺失时才回落到目录名）。
+        //   dir —— 磁盘上的**实际目录名**：前端按它拼脚本/样式的 URL。
+        // 二者不一致的情况真实存在（历史版本把 `elaina-avatar-1.0.0` 当目录名装过），
+        // 只给一个名字必然有一处 404 —— 要么脚本加载不到，要么图片加载不到。
         const list = [];
         for (const it of installed) {
             const m = await readManifest(it.dir, it.id);
+            const dirName = path.basename(it.dir);
             list.push({
-                id: it.id,
-                name: m.name || it.id,
+                id: m.id,
+                dir: dirName,
+                name: m.name || m.id,
                 version: m.version || '',
                 description: m.description || '',
                 entry: m.entry || 'index.js',

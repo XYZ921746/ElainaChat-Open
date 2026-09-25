@@ -35,6 +35,25 @@
     /** 插件根目录（相对站点根） */
     const MOD_ROOT = '/mods/';
 
+    /**
+     * 插件在磁盘上的**实际目录名**。
+     *
+     * ★ 为什么不能直接用 manifest.id 拼 URL（2026-09 修的真 bug）：
+     *   插件 id 是**身份**（依赖匹配、资源引用都以它为准），而目录名是
+     *   "它落在磁盘的哪个文件夹"。两者正常时相同，但**可能不同** ——
+     *   历史版本把打包产物名（`elaina-avatar-1.0.0.zip`）当目录名安装过，
+     *   于是目录叫 `elaina-avatar-1.0.0` 而 id 是 `elaina-avatar`。
+     *   此时按 id 拼 URL 会让脚本与图片**全部 404**（表现为
+     *   "插件开关打开了，但桌宠/Galgame 没有立绘、依赖也报缺失"）。
+     *
+     * 服务端在清单里为每个插件同时给出 id 与 dir，这里优先用 dir；
+     * 旧版服务端没有 dir 字段时回落到 id（那时两者本来就一致）。
+     */
+    function modDir(manifest) {
+        const d = manifest && typeof manifest.dir === 'string' ? manifest.dir.trim() : '';
+        return d || manifest.id;
+    }
+
     /** 插件状态：id -> { manifest, state, error, api } */
     const registry = new Map();
 
@@ -79,8 +98,16 @@
     function forgetMod(id) {
         try {
             localStorage.removeItem(MOD_ENABLED_KEY_PREFIX + id);
+            const entry = registry.get(id);
             registry.delete(id);
-            loadedScripts.forEach((v, k) => { if (k.includes('/' + id + '/')) loadedScripts.delete(k); });
+            // 清掉"已注入脚本"的记录时要同时认 id 与**实际目录名** ——
+            // 两者可能不同（见 modDir 说明），只按 id 匹配会漏删，
+            // 于是重装同一个插件时脚本不会被重新注入（表现为"装了没反应"）。
+            const needles = ['/' + id + '/'];
+            if (entry && entry.manifest && entry.manifest.dir) needles.push('/' + entry.manifest.dir + '/');
+            loadedScripts.forEach((v, k) => {
+                if (needles.some((n) => k.includes(n))) loadedScripts.delete(k);
+            });
         } catch (e) { /* 忽略 */ }
     }
 
@@ -105,6 +132,27 @@
         return {
             id: manifest.id,
             version: manifest.version || '0.0.0',
+
+            // ---- 资源定位（修「资源包装了等于没装」的另一半）----
+            /**
+             * 取本插件资源的 URL 基址（结尾带 /）。
+             *
+             * 为什么必须用它而不是插件自己拼 '/mods/<名字>/…'：
+             *   插件**声明的 id** 与它**实际被安装成**的目录名可能不一致
+             *   （历史版本曾把带版本号的 zip 名当目录名，装出
+             *    elaina-avatar-1.0.0/ 这种目录，写死的 URL 全部 404）。
+             *   这里用的 manifest.dir 是**磁盘上的真实目录名**，
+             *   由它给的基址才是资源真正能取到的位置。
+             *
+             * 典型用法：host.assetUrl('img/p_calm.png')
+             *   → '/mods/elaina-avatar/img/p_calm.png'
+             */
+            assetUrl(rel) {
+                const r = String(rel || '').replace(/^\/+/, '');
+                return MOD_ROOT + modDir(manifest) + '/' + r;
+            },
+            /** 本插件资源目录的 URL（结尾带 /），供需要自行拼路径的场合 */
+            assetBase() { return MOD_ROOT + modDir(manifest) + '/'; },
 
             // ---- 日志（带插件前缀，便于定位是哪个 mod 在说话）----
             log: (...a) => log('log', ...a),
@@ -349,8 +397,9 @@
 
         try {
             // ① 样式（可选）
+            //    路径用 modDir()：脚本/样式在**磁盘目录**下，不是 id 下（见 modDir 说明）
             for (const css of (Array.isArray(manifest.styles) ? manifest.styles : [])) {
-                const href = css.startsWith('/') ? css : MOD_ROOT + manifest.id + '/' + css;
+                const href = css.startsWith('/') ? css : MOD_ROOT + modDir(manifest) + '/' + css;
                 const el = document.createElement('link');
                 el.rel = 'stylesheet';
                 el.href = href;
@@ -360,7 +409,7 @@
 
             // ② 入口脚本
             const entrySrc = manifest.entry || 'index.js';
-            const src = entrySrc.startsWith('/') ? entrySrc : MOD_ROOT + manifest.id + '/' + entrySrc;
+            const src = entrySrc.startsWith('/') ? entrySrc : MOD_ROOT + modDir(manifest) + '/' + entrySrc;
             await injectScript(src);
 
             // ③ 初始化：插件把 init 挂到 window.ElainaMods.register(id, fn)
@@ -465,7 +514,9 @@
             //   · 有些 mod 没有 register()，加载完 api 就是 null —— 用 api 判会误判成"没加载过"
             //   · 重复启用时不该重复注入脚本（<script> 会被再插一遍，mod 的初始化会跑两次）
             const entrySrc = entry.manifest.entry || 'index.js';
-            const src = entrySrc.startsWith('/') ? entrySrc : MOD_ROOT + id + '/' + entrySrc;
+            // 与 loadOne 保持一致：走 modDir()，否则"已注入过没有"的判断会看错路径，
+            // 导致重复注入脚本（mod 的初始化跑两次）
+            const src = entrySrc.startsWith('/') ? entrySrc : MOD_ROOT + modDir(entry.manifest) + '/' + entrySrc;
             const neverLoaded = !loadedScripts.has(src);
             if (neverLoaded) {
                 try {

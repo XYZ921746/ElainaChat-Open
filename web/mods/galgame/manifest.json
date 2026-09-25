@@ -1,4 +1,5 @@
 {
+    "id": "galgame",
     "name": "Galgame 界面",
     "version": "1.0.0",
     "description": "全屏沉浸式剧情界面：场景背景 + 立绘 + 打字机对话框，与主界面共用同一份对话数据。",

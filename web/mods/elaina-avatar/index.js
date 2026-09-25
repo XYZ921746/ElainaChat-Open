@@ -28,7 +28,14 @@
     'use strict';
 
     const MOD_ID = 'elaina-avatar';
-    const BASE = '/mods/' + MOD_ID + '/img/';
+
+    /* 资源基址：★不写死目录名。
+       声明的 id 与实际安装目录可能不一致（历史版本曾把带版本号的 zip 名
+       当目录名，装出 elaina-avatar-1.0.0/ —— 写死 '/mods/elaina-avatar/img/'
+       的 URL 全部 404，表现为"桌宠/Galgame 显示不出人物"）。
+       优先用宿主注入的 assetBase（清单归一化后的真实位置）；
+       宿主太老没有该 API 时回落到约定路径（正常安装下二者一致）。 */
+    let BASE = '/mods/' + MOD_ID + '/img/';
 
     /* 情绪键固定为 9 个 —— 与立绘文件名一一对应。
        顺序无关紧要，但**键名不能随意改**：它就是图片文件名。 */
@@ -101,9 +108,17 @@
        让加载器把它标记为 ready（供其他插件检查依赖是否就绪）。 */
     if (window.ElainaMods && typeof window.ElainaMods.register === 'function') {
         window.ElainaMods.register(MOD_ID, function (host) {
-            host.log('立绘与情绪接口就绪（' + EMOTIONS.length + ' 种表情）');
+            // ★ 用宿主给的真实安装位置覆盖约定路径。
+            //   这是"接口在、图却 404"的正面修法：id 与目录名不一致时
+            //   （历史上装成过 elaina-avatar-1.0.0/），约定路径是错的，
+            //   而 host.assetBase() 来自清单归一化后的 id，永远指向真实位置。
+            if (host && typeof host.assetBase === 'function') {
+                BASE = host.assetBase() + 'img/';
+                window.ElainaAvatar.base = BASE;
+            }
+            host.log('立绘与情绪接口就绪（' + EMOTIONS.length + ' 种表情，资源基址 ' + BASE + '）');
             return {
-                EMOTIONS, LABELS, fromText, src, isReady,
+                EMOTIONS, LABELS, fromText, src, isReady, base: () => BASE,
             };
         });
     }
