@@ -107,7 +107,30 @@ try {
         body: JSON.stringify({ level: 'INFO' }),
     });
 
-    // ── 7. 启动输出是英文事实行 ──
+    // ── 8. 自噪音回路：查看器轮询不应把日志刷屏（2026-09 用户实测）──────
+    //   之前 /api/logs/tail 每次轮询都被 HTTP 访问日志记一行 ——
+    //   查看器一开，启动窗口每 2 秒滚一条"GET /api/logs/tail"，
+    //   日志系统在观察自己。成功轮询必须静默（失败仍要报）。
+    {
+        const before = out.length;
+        for (let i = 0; i < 3; i++) {
+            await fetch(BASE + '/api/logs/tail?limit=10');
+            await fetch(BASE + '/api/client-log', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ items: [{ level: 'info', text: '[Mod:test] viewer poll', page: '/' }] }),
+            }).catch(() => {});
+        }
+        await wait(500);
+        const added = out.slice(before);
+        ok(!added.includes('/api/logs/tail'), '★ 查看器轮询（成功）不打访问日志 —— 不再自噪音', added.slice(0, 200));
+        // 失败时仍要能看见：带不存在参数不会失败，改用一个真正的 404 轮询等价物验证 QUIET 只对成功生效
+        const r404 = await fetch(BASE + '/api/logs/tail-x');
+        ok(r404.status === 404, '（前置）未知接口仍 404');
+        await wait(300);
+        ok(out.includes('/api/logs/tail-x') && out.includes('404'), '★ 未知接口的 4xx 仍会记录（静默不吞错误）');
+    }
+
+    // ── 9. 英文事实行仍然成立 ──
     //（等待插件扫描完成 —— 它在 listen 回调里异步跑）
     for (let i = 0; i < 20 && !out.includes('installed: elaina-avatar'); i++) {
         await wait(200);

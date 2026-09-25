@@ -1723,6 +1723,15 @@ function isSameOrigin(request) {
 // 目的：启动窗口里直接能看到「谁、什么时候、访问了什么、结果如何」，
 // 排查手机连不上 / 接口报错时不用再去开浏览器控制台。
 const QUIET_FILE_RE = /\.(?:js|mjs|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|map)$/i;
+//
+// ★ 高频轮询接口在**成功时**不打日志（2026-09）。
+//
+//   /api/logs/tail 是日志查看器自己每 2 秒拉一次的数据源 ——
+//   若每次轮询也记一行，日志系统就在"观察自己"：查看器一打开，
+//   启动窗口每 2 秒滚一条 GET /api/logs/tail，把其它事件全挤走
+//   （用户实测贴出来的日志一半是这种自噪音）。
+//   失败（4xx/5xx）时**仍然要打** —— 那才是值得知道的异常。
+const QUIET_POLL_RE = /^\/api\/(?:logs\/tail|client-log)(?:$|\?)/;
 
 function ipOf(request) {
     const raw = (request && request.socket && request.socket.remoteAddress) || '';
@@ -1744,7 +1753,8 @@ function attachRequestLog(request, response) {
     response.on('finish', () => {
         const code = response.__logStatus || response.statusCode || 0;
         const rawPath = String(request.url || '/');
-        if (code < 400 && QUIET_FILE_RE.test(rawPath.split('?')[0])) return;
+        const pathOnly = rawPath.split('?')[0];
+        if (code < 400 && (QUIET_FILE_RE.test(pathOnly) || QUIET_POLL_RE.test(pathOnly + (rawPath.includes('?') ? '?' : '')))) return;
         const ms = Date.now() - started;
         const line = ipOf(request).padEnd(15) + ' '
             + String(request.method || '?').padEnd(5) + ' '

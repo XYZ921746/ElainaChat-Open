@@ -120,12 +120,26 @@
         } catch (e) { /* 服务端不在（APK 场景）时整个 section 已被隐藏 */ }
     }
 
+    function isVisible() {
+        const section = el('logViewerSection');
+        if (!section) return false;
+        // section 自己没被隐藏，且它的祖先（设置面板 overlay）也没被隐藏。
+        // ★ 只查 section 自己是不够的：closeSettingsPanel 隐藏的是**整个面板**，
+        //   section 的 class 不变 —— 那样关掉设置后轮询仍会继续
+        //   （服务端日志被 2 秒一条的自噪音刷屏，实测踩到）。
+        if (section.classList.contains('hidden')) return false;
+        let node = section.parentElement;
+        while (node) {
+            if (node.classList && node.classList.contains('hidden')) return false;
+            node = node.parentElement;
+        }
+        return true;
+    }
+
     function start() {
         if (timer) return;
         timer = setInterval(() => {
-            const section = el('logViewerSection');
-            // 不可见或面板收起时不再轮询（省电；也避免后台积累无意义请求）
-            if (!section || section.classList.contains('hidden') || !el('logViewerAuto')?.checked) return;
+            if (!isVisible() || !el('logViewerAuto')?.checked) return;
             refresh(false);
         }, 2000);
     }
