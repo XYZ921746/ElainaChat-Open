@@ -238,7 +238,8 @@ ok(new Set(locs).size > 3, '来源行号能区分不同调用点（不是全指�
         const redact = (t) => { let o = String(t); for (const [re, to] of rules) o = o.replace(re, to); return o; };
         const S = 'EPzNwvKXNWdt';
         const forms = [
-            ['密码独占一行（当前格式）', '要输这个密码\n      ' + S + '\n      建议改掉'],
+            ['英文事实行（当前格式）', 'LAN access password (initial, change it in Settings): ' + S],
+            ['密码独占一行', '要输这个密码\n      ' + S + '\n      建议改掉'],
             ['带修饰语的标签', '局域网访问密码（初始随机）：' + S],
             ['最老格式', '访问密码: ' + S],
             ['key=value', '{"password":"' + S + '"}'],
@@ -248,16 +249,18 @@ ok(new Set(locs).size > 3, '来源行号能区分不同调用点（不是全指�
             ok(!redact(text).includes(S), `★ 脱敏有效：${label}`);
         }
         // 反向：正常内容不能被误伤
-        const normal = '✔ 可用：伊蕾娜立绘与情绪（elaina-avatar）';
+        const normal = 'installed: elaina-avatar (dir=elaina-avatar)';
         ok(redact(normal) === normal, '★ 正常内容不被误伤（脱敏不过度）');
     }
 
-    const pw = consoleOut.match(/访问密码[^：:\n]{0,20}[:：]\s*(\S+)/)
+    const pw = consoleOut.match(/access password[^:\n]*:\s*(\S+)/i)
+        || consoleOut.match(/访问密码[^：:\n]{0,20}[:：]\s*(\S+)/)
         || consoleOut.match(/要输这个密码\s*\n\s*(\S+)/);
     ok(!!pw, '控制台打印了访问密码（用户要靠它登录）');
     ok(pw && !main.includes(pw[1]), '★ 日志文件里没有明文访问密码（脱敏对文案变化仍有效）');
     // 反向断言：日志里必须能看到"已脱敏"的痕迹，否则可能是整条都没记
-    ok(main.includes('******'), '日志里能看到脱敏后的占位符');
+    ok(main.includes('******') || main.includes('user-configured'),
+        '日志里能看到脱敏后的占位符（或"已由用户设置"的事实行）');
 }
 
 // ---- 控制台不重复输出 ----
@@ -299,8 +302,9 @@ await wait(200);
 ok(readdirSync(LOG_DIR).filter((n) => n.endsWith('.log')).length === 2,
     'LOG_TO_FILE=0 时不产生新日志文件（自动化场景要能关掉落盘）');
 // 不落盘时也要如实说明 —— 用户看到"没有日志文件"时得知道是配置关掉了，
-// 而不是以为日志功能坏了。说明在末尾的「技术信息」块里。
-ok(/不落盘/.test(out2()), 'LOG_TO_FILE=0 时明确说明了"不落盘"');
+// 而不是以为日志功能坏了。说明在启动头的 log file 行里（英文事实行）。
+ok(/disabled \(LOG_TO_FILE=0\)/.test(out2()) || /不落盘/.test(out2()),
+    'LOG_TO_FILE=0 时明确说明了"不落盘"');
 
 // ================= 场景三：LOG_CHAT=0 =================
 const { child: child3 } = await startServer({ LOG_CHAT: '0' }, await freePort());

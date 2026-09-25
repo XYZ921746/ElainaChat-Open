@@ -157,6 +157,10 @@ function fillSettingsForm() {
     void refreshLogSettings();
     void refreshDataSettings();
     void refreshOverlayStatus();
+    // 日志查看器：日志设置块可用 = 有本地服务 → 显示并开始首次全量拉取。
+    // 它自己管理轮询（不可见时自动暂停），这里只负责"让它出现"。
+    try { if (window.LogViewer && !document.getElementById('logSettingsSection')?.classList.contains('hidden')) window.LogViewer.show(); }
+    catch (e) { /* 查看器出问题不能影响设置页其它部分 */ }
 }
 
 

@@ -208,25 +208,32 @@ console.log('\n=== 7. 源码层：故障点用了结构化报告 ===');
     const serve = readFileSync(path.join(ROOT, 'web', 'serve.mjs'), 'utf8');
     ok(/import \{[^}]*banner[^}]*\} from '\.\.\/server\/diagnostics\.mjs'/.test(serve),
         'serve.mjs 引入了诊断模块');
-    ok(/printListenError[\s\S]{0,900}problem\(\{/.test(serve),
-        '★ 端口占用用 problem() 报告（含 what/why/how）');
+    ok(/printListenError[\s\S]{0,900}already in use/.test(serve),
+        '★ 端口占用是英文事实行 + cause/fix 结构');
     // 端口占用的"怎么办"必须给出可照做的命令
     ok(/netstat -ano \| findstr/.test(serve), '★ 给了"找出占用者"的命令');
     ok(/taskkill \/PID/.test(serve), '★ 给了"结束进程"的命令');
     ok(/set PORT=/.test(serve), '★ 给了"换端口"的命令');
+    // 给人的那一句中文仍在（fix 命令后面）
+    ok(/端口被占用，多半是上一个实例还开着/.test(serve), '★ 保留一句中文说明（给人看）');
     ok(/banner\(\{/.test(serve), '启动时打自描述横幅');
-    ok(/usage\(usageItems\)/.test(serve), '★ 有「怎么用」块（地址/密码集中在前）');
-    ok(/techInfo\(\[/.test(serve), '★ 技术信息收在最后一块');
-    ok(/summary\(bootProblems\)/.test(serve), '启动收尾打了汇总（仅在有问题时出现）');
-    // 顺序：怎么用 → 插件 → 技术信息
-    {
-        const iUsage = serve.indexOf('console.log(usage(usageItems))');
-        const iPlug = serve.indexOf("section('插件（已安装）')");
-        const iTech = serve.indexOf('console.log(techInfo([');
-        ok(iUsage > 0 && iPlug > iUsage && iTech > iPlug,
-            '★ 输出顺序是「怎么用 → 插件 → 技术信息」（按用户要做什么排）',
-            `usage@${iUsage} plug@${iPlug} tech@${iTech}`);
-    }
+
+    // ── 2026-09 二次调整：日志正文 = 英文事实行，说明文字移出日志流 ──
+    //   用户明确要求："我要的是日志的详细，不是加不相干的信息" +
+    //   "日志全英文（中文日志没有英文日志好用）"。
+    //   启动事件现在是一行一个英文事实，引导文字只在最后保留一句中文指路。
+    ok(/listening on \$\{urls\.join\(', '\)\}/.test(serve), '★ 启动事件：listening 行（英文，含全部地址）');
+    ok(/\[mod\] installed: \$\{p\.id\}/.test(serve), '★ 启动事件：每个插件一行英文事实（id/dir/依赖）');
+    ok(/LAN access password/.test(serve), '★ 访问密码行是英文事实行');
+    ok(/就绪。日志可在应用内/.test(serve), '★ 只保留一句中文指路（软件内查看器入口）');
+    // 反向：说明文字不再刷屏
+    ok(!/usage\(usageItems\)/.test(serve), '★ 「怎么用」说明块已移出日志流');
+    ok(!/techInfo\(\[/.test(serve), '★ 冗长的技术信息块已移除');
+    ok(!/section\('插件（已安装）'\)/.test(serve), '★ 插件体检分段说明已移出（改为 [mod] 事实行）');
+
+    // 英文事实行仍然进内存缓冲（软件内查看器的数据源）
+    ok(/logBuffer\.push\(/.test(serve), '★ emitLog 把每条日志写入内存缓冲');
+    ok(/api\/logs\/tail/.test(serve), '★ /api/logs/tail 接口存在（查看器数据源）');
 
     // ★ 多行结构必须保留（否则诊断块被压成一行，等于白做）
     ok(/function formatForFile/.test(serve), '★ 有 formatForFile（区分单行/多行）');
@@ -274,19 +281,18 @@ console.log('\n=== 8. 端到端：真实服务 + 真实落盘日志 ===');
             const content = readFileSync(path.join(LOG_DIR, logs[0]), 'utf8');
             // ① 编码正确
             ok(!content.includes('\uFFFD'), '★ 日志文件是合法 UTF-8（没有替换字符）');
-            // ② 自报家门
-            ok(/ElainaChat Mod v/.test(content), '★ 落盘的日志里有软件名与版本');
-            ok(/本地运行的 AI 角色聊天应用/.test(content), '★ 有一句话定位');
-            ok(/怎么用/.test(content), '★ 有「怎么用」块（地址在里面）');
-            ok(/技术信息/.test(content), '★ 有技术信息块');
+            // ② 英文事实行（2026-09 起）
+            ok(/ElainaChat Mod v/.test(content), '★ 有软件名与版本');
+            ok(/local AI chat server/.test(content), '★ 横幅是一行英文定位（含 pid/node/平台）');
+            ok(/listening on http:\/\//.test(content), '★ listening 行（英文事实）');
+            ok(/installed: .*\(dir=/.test(content), '★ 插件清单是英文事实行');
             // ③ 多行结构保留（关键：没被压成一行）
-            ok(/【怎么用】\n/.test(content), '★ 多行结构保留（没被压成 ⏎ 一行）');
             ok(!/⏎/.test(content), '★ 没有出现压平标记 ⏎');
-            // ④ 可扫读
-            ok(content.includes(MARK.ok), '有 ✔ 状态标记');
-            // ⑤ 不再有冗长的"现在在做什么"段落
-            ok(!/现在在做什么/.test(content), '★ 没有冗长段落（横幅保持精简）');
-            // ⑥ 行首前缀仍完整（grep 可用）
+            // ④ 冗长说明不再刷屏
+            ok(!/怎么用/.test(content), '★ 说明文字不再进日志流');
+            ok(!/技术信息/.test(content), '★ 冗长技术信息块已移除');
+            ok(!/现在在做什么/.test(content), '★ 没有冗长段落');
+            // ⑤ 行首前缀仍完整（grep 可用）
             const withPrefix = content.split('\n').filter((l) => /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] \[/.test(l));
             ok(withPrefix.length >= 3, '★ 多条记录带完整前缀（grep 仍可用）', String(withPrefix.length));
         }

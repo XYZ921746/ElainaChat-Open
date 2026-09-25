@@ -31,9 +31,11 @@ import { createLoginGuard, validatePasswordStrength, PWD_MIN_LEN } from '../serv
 // zip64 回退），与 zip.mjs 的 readZip 逐段重复 —— 两份实现意味着安全修复要改两处，
 // 漏一处就是个洞。现已合并：这里只保留一个薄包装，语义（{files, blocked}）不变。
 import { readZip, BLOCKED_EXT, effectiveExt } from '../server/zip.mjs';
-// 诊断输出：让完全不了解本软件的人（或 AI）也能从日志看懂
-// 「这是什么 / 在做什么 / 哪里有问题 / 该怎么办」。格式集中一处才好演进。
-import { banner, usage, section, checklist, techInfo, problem, summary, describePlugins, MARK } from '../server/diagnostics.mjs';
+// 启动头格式（横幅）。日志**正文**不走这里 —— 正文保持一行一事件、英文为主。
+// 诊断细节的呈现已移到软件内日志查看器（/api/logs/tail + 设置页），不再刷控制台。
+import { banner } from '../server/diagnostics.mjs';
+// 内存日志缓冲：软件内日志查看器的数据源（控制台全量、界面筛着看）。
+import { createLogBuffer } from '../server/log-buffer.mjs';
 
 const scryptAsync = promisify(scrypt);
 
@@ -371,6 +373,11 @@ const SECRET_RULES = [
     //   这是 check-log-format.mjs 的"日志文件里没有明文访问密码"抓到的
     //   （那条断言的价值就在这：文案一改，脱敏就可能失效）。
     [/访问密码[^：:\n]{0,20}[:：]\s*\S+/g, '访问密码: ******（仅打印在控制台，不写入日志）'],
+    // ★ 英文事实行形态（2026-09 第三次踩：日志正文改为英文后）。
+    //   `[auth] LAN access password (initial, change it in Settings): xxx`
+    //   中文规则匹配不上 → 密码明文落盘。规则必须跟着文案走，
+    //   check-log-format.mjs 用"历史格式全部喂一遍"的方式盯着这件事。
+    [/LAN access password[^:\n]*:\s*\S+/gi, 'LAN access password: ******'],
     // ★ 密码**单独占一行**的形态（2026-09 第二次踩）。
     //   重做「怎么用」块时，为了让密码不被看漏，它被放到了独立一行：
     //       ⚠ 手机 / 平板连进来时要输这个密码
@@ -459,12 +466,19 @@ function emitLog(level, args) {
     // AstrBot 只在 WARNING 及以上附版本号 —— 正常信息里塞版本号纯属噪音
     const verTag = (LEVEL_NO[level] || 20) >= 30 ? ` [v${APP_VERSION}]` : '';
 
-    // 文件：一条记录一行（换行压成 ⏎），保证 grep / tail 的可用性。
-    // 完整的多行内容在追踪日志里，那里不压。
+    // 文件：单行保持一行一条（grep 可用）；多行保留结构（诊断块可读）。
     // 低于当前落盘级别的记录只进控制台 —— 终端始终是全量，级别只用来收窄文件。
     if (shouldLogToFile(level)) {
         appendToFile(mainSink, formatForFile(body, now, tag, short, verTag, loc));
     }
+
+    // 内存缓冲：**每条都收**（不受落盘级别约束，过滤在读的时候做）——
+    // 这样查看器切到 DEBUG 能看到全量（等同终端），切到 ERROR 只看报错。
+    // 脱敏后再存：缓冲会经 /api/logs/tail 提供出去，与文件同一口径。
+    logBuffer.push({
+        ts: now, level, tag, loc,
+        message: redactSecrets(body).replace(/^\n+/, ''),
+    });
 
     // 控制台：正文保持原样（多行就多行），人看的
     const head = CONSOLE_COLOR
@@ -511,6 +525,13 @@ function formatForFile(body, now, tag, short, verTag, loc) {
     return head + lines[0].replace(/\s+$/, '') + '\n' + rest.join('\n') + '\n';
 }
 
+// ── 内存日志缓冲（软件内日志查看器的数据源）────────────────────────────
+//
+// 每条日志在 emitLog 里存一份解析好的结构化记录；/api/logs/tail 按级别/模块/
+// 关键词过滤后返回给前端。**写入不受落盘级别约束** —— 过滤发生在读的时候，
+// 这样查看器切到 DEBUG 能看到全量（等同终端），切到 ERROR 只看报错。
+const logBuffer = createLogBuffer();
+
 /**
  * 写追踪日志：LLM 的完整请求消息、完整回复、完整上游报错。
  * 多行**原样保留**（这是给人读的）；主日志里对应的那条会压成一行并截断。
@@ -554,30 +575,32 @@ pruneOldLogs();   // 放在包装之后：清理动作本身也进日志
 // 记录本次启动的标识，日志文件里能看出这份日志属于哪一次、跑了多久
 const BOOT_AT = Date.now();
 
-// ★ 启动横幅：只回答"这是什么"。
+// ── 启动输出：**简短、英文、信息密度优先**（2026-09 按用户要求重做）──────
 //
-// 旧输出第一行是 `[boot] serve.mjs 启动 pid=… node=…` —— 日志一旦被贴到别处
-// （issue / 群里 / 给 AI 看），接收方完全不知道这是什么软件。
-// 现在开头写明软件名与一句话定位；进程号/Node 版本这类排查信息收进
-// 末尾的「技术信息」块，不挡视线。
+// 用户的原话："我要的是日志的详细，不是在日志里加不相干的信息" +
+// "日志采用全英文……中文日志没有英文日志好用"。
+//
+// 之前两版的教训：
+//   · 第一版往日志里塞「这是什么 / 怎么用」两大段说明 —— 那是文档不是日志，
+//     每次启动都滚一遍，把真正的事件淹没，从日志提取信息反而变难。
+//   · 中文长句无法 grep（"无法加载" vs "加载失败"同义不同词），检索困难。
+//
+// 现在的取舍：
+//   · 日志正文 = **一行一个事件，英文**，给 grep / AI / 日志查看器用
+//   · 面向人的引导（地址、密码、注意事项）只在**首次生成密码**那一条里保留中文，
+//     其余全部移出日志流 —— 需要时软件内有日志查看器与设置页，不必靠刷屏
 console.log(banner({
     name: 'ElainaChat Mod',
     version: APP_VERSION,
-    tagline: '本地运行的 AI 角色聊天应用 —— 聊天记录与 API Key 都存在这台电脑上，AI 请求直连服务商，不经过第三方',
+    tagline: `local AI chat server · pid=${process.pid} · node=${process.version}`
+        + ` · ${process.platform}/${process.arch}`,
 }));
-
-// 日志自身的说明：只留**需要注意**的那一条。
-// 为什么不再逐项列"日志文件已就绪/落盘级别/轮转策略"：那些是每次启动都一样的
-// 常量信息，对使用者毫无价值，只会把真正的重点挤下去。路径收进末尾技术信息块。
+console.log(`[boot] log file: ${LOG_TO_FILE ? path.relative(APP_ROOT, mainSink.file) : 'disabled (LOG_TO_FILE=0)'}`
+    + ` · file level: ${fileLevel} · trace: ${traceEnabled ? 'on' : 'off'}`);
 if (LOG_TO_FILE && traceEnabled) {
-    // 追踪日志含完整对话内容，而用户排查时常常把日志整份发出去 —— 必须提醒
-    console.log(checklist([
-        {
-            state: 'warn', label: '对话追踪日志已开启，它含完整聊天内容',
-            hint: '对外分享日志前先看一眼 ' + path.relative(APP_ROOT, traceSink.file) + '。'
-                + '\n      不需要的话可在「设置 → 高级 → 日志」关掉。',
-        },
-    ], '提醒'));
+    // 追踪日志含完整对话内容 —— 对外分享日志前必须知道这一点（保留中文，给人看的提醒）
+    console.log('[boot] 注意：追踪日志含完整聊天内容，对外分享前先查看 '
+        + path.relative(APP_ROOT, traceSink.file));
 }
 
 // 收尾也留一行：日志文件的最后一个时间戳就是会话结束时刻，配合文件名就能知道"这次跑了多久"。
@@ -2474,6 +2497,26 @@ const requestHandler = async (request, response) => {
             return jsonResponse(response, 200, { ok: true });
         }
 
+        // 日志查看器的数据源：从内存缓冲按条件取。
+        //
+        // 查询参数（都是可选）：level（最低级别）、tags（逗号分隔的模块名）、
+        // search（关键词）、limit（条数上限）、since（时间戳，增量拉取）。
+        //
+        // 为什么放内存缓冲而不是读文件：文件是"落盘级别"过滤后的产物，
+        // 且读大文件再解析既慢又占内存；缓冲里是**全量**（不受落盘级别约束），
+        // 查看器切级别/模块都是即时的。
+        if (pathname === '/api/logs/tail' && request.method === 'GET') {
+            const u = new URL(request.url || '/', 'http://x');
+            const result = logBuffer.query({
+                minLevel: normalizeLevelName(u.searchParams.get('level')) || undefined,
+                tags: u.searchParams.get('tags') ? u.searchParams.get('tags').split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+                search: u.searchParams.get('search') || undefined,
+                limit: Number(u.searchParams.get('limit')) || undefined,
+                since: Number(u.searchParams.get('since')) || undefined,
+            });
+            return jsonResponse(response, 200, { ok: true, ...result, tags: logBuffer.tags() });
+        }
+
         // 日志设置：读取当前状态 / 运行时调整级别与对话追踪。
         // 放在鉴权之后 —— 它会改服务端行为，不能让未登录的局域网设备操作。
         if (pathname === '/api/logs/settings' && request.method === 'GET') {
@@ -2934,36 +2977,19 @@ const requestHandler = async (request, response) => {
     }
 };
 
-// 端口被占用等启动错误：给出可读提示，而不是抛一串裸栈。
-// 用 CRITICAL —— 服务根本没起来，这是最高级别的失败，不该和普通报错混在一个档次里。
-// （不写空行分隔：日志系统会丢弃纯空白记录，写了也是白写。）
+// 启动监听失败：**英文、一行事件 + 结构化细节**（技术日志规范）。
+// 用 CRITICAL —— 服务根本没起来，最高级别的失败。
+// 修复命令保留给需要的人；"怎么回事"的一句话用中文附在末尾（给人看）。
 function printListenError(err, which, usedPort) {
     if (err && err.code === 'EADDRINUSE') {
-        // 三段式：发生了什么 / 为什么 / 怎么办。
-        // 旧文案只说了"端口被占用"和一句 set PORT=…，但**没说怎么找出占用者** ——
-        // 用户（尤其是不熟悉命令行的）到这一步就卡住了。现在把命令直接给全。
         const alt = Number(usedPort) + 2;
-        logCritical(problem({
-            what: `${which} 端口 ${usedPort} 已被占用，服务没能启动`,
-            where: 'web/serve.mjs 的监听步骤',
-            why: '这个端口已经被另一个程序占着。最常见的是**上一次启动的 ElainaChat 还开着**'
-                + '（窗口最小化了，或者关得不干净）。',
-            how: [
-                `找出占用者并结束它（Windows 命令）：`
-                + `\n         netstat -ano | findstr :${usedPort}` + `\n         taskkill /PID <上面最后一列的数字> /F`,
-                `换个端口启动（不用管占用者）：`
-                + `\n         set PORT=${alt} && set HTTPS_PORT=${alt + 1} && node web/serve.mjs`
-                + `\n         然后浏览器改用 http://127.0.0.1:${alt} 打开。`,
-                '直接重启电脑 —— 能解决，但没必要。',
-            ],
-        }));
+        logCritical(`[boot] CRITICAL: ${which} port ${usedPort} already in use - server not started`
+            + `\n  cause: another process is bound to this port (most likely a previous instance that is still running)`
+            + `\n  fix 1: find & kill it:  netstat -ano | findstr :${usedPort}  then  taskkill /PID <pid> /F`
+            + `\n  fix 2: use other ports:  set PORT=${alt} && set HTTPS_PORT=${alt + 1} && node web/serve.mjs`
+            + `\n  （一句话：端口被占用，多半是上一个实例还开着 —— 关掉它或按上面换端口重启）`);
     } else {
-        logCritical(problem({
-            what: `${which} 服务启动失败`,
-            where: 'web/serve.mjs 的监听步骤',
-            why: String((err && err.message) || err),
-            how: '把本窗口的完整日志复制出来（它包含失败原因），然后重启程序再试一次。',
-        }));
+        logCritical(`[boot] CRITICAL: ${which} listen failed: ${String((err && err.message) || err)}`);
     }
     process.exitCode = 1;
 }
@@ -3035,113 +3061,47 @@ const mainServer = createNetServer(muxSocket);
 mainServer.on('error', (err) => printListenError(err, 'HTTP/HTTPS', port));
 
 mainServer.listen(port, host, async () => {
-    // ══════════════════════════════════════════════════════════════════
-    //  输出顺序：**按"用户要做什么"排，不按"程序有哪些模块"排**。
+    // ── 启动事件：**一行一个事实，英文**（2026-09 按用户要求重做）─────────
     //
-    //  ① 怎么用（地址 + 密码）—— 用户唯一真正需要照着做的东西，放最前
-    //  ② 插件体检 —— 最常见的"功能不生效"来源，紧跟着
-    //  ③ 问题汇总 —— 有才出现，集中列一遍
-    //  ④ 技术信息 —— 排查才用得上，压到最后
-    //
-    //  为什么这么改：上一版按模块分段（日志/访问控制/插件各一段），
-    //  结果用户要滚过一大段才看到地址，而"日志级别 INFO"这种信息
-    //  占的篇幅比地址还多。日志该回答的是"我该做什么"，不是"程序有哪些部件"。
-    // ══════════════════════════════════════════════════════════════════
-
-    const bootProblems = [];
-
-    // ---- ① 怎么用 ----
-    const usageItems = [
-        {
-            state: 'ok', label: '在这台电脑上打开',
-            value: 'http://127.0.0.1:' + port,
-            hint: '用浏览器（Chrome / Edge）打开这个地址就能用了。',
-        },
-    ];
+    // "怎么用"的引导文字已全部移出日志流 —— 地址和密码在应用里都能看到
+    // （设置页 / 登录页），日志里刷一遍只会让机器与人更难提取有用信息。
+    // 日志行回答"什么在什么端口、装了什么插件、密码是不是初始的"这些**事实**。
+    const urls = ['http://127.0.0.1:' + port];
     if (host === '0.0.0.0' || host === '::') {
-        const ips = localIPv4List();
-        if (ips.length) {
-            usageItems.push({
-                state: 'ok', label: '手机 / 平板打开（需和这台电脑连同一个 WiFi）',
-                value: ips.map((ip) => 'http://' + ip + ':' + port).join('    或    '),
-                hint: '首次打开会要求输访问密码（见下）。',
-            });
-        }
-    } else {
-        usageItems.push({
-            state: 'note', label: '手机 / 平板暂时连不上',
-            hint: '当前只允许本机访问（HOST=' + host + '）。想让手机也能用，'
-                + '去掉启动时的 HOST 设置再重启。',
-        });
+        for (const ip of localIPv4List()) urls.push('http://' + ip + ':' + port);
     }
+    console.log(`[boot] listening on ${urls.join(', ')} (HTTP+HTTPS on the same port)`);
 
-    // 访问密码：和"怎么用"放同一块 —— 它就是要照着敲的东西之一。
-    // 只有还是初始随机密码时才打出来（否则用户没地方看密码）；
-    // 自己改过之后不再显示，改密码的入口在应用内的设置里。
+    // 访问密码：只有仍是初始随机密码时才打明文（用户没别的地方看它）。
+    // 用户自己设置过之后，这里只剩一行事实，不再重复提示。
     if (authInfo.isDefault) {
-        usageItems.push({
-            state: 'warn', label: '手机 / 平板连进来时要输这个密码',
-            value: authInfo.password,
-            hint: '建议改成自己记得住的：「设置 → 高级 → 访问密码」。'
-                + '\n      注意：登录后的设备能读写这台电脑的文件、执行命令，'
-                + '所以这个密码相当于这台电脑的钥匙，别随便告诉别人。',
-        });
+        console.log(`[auth] LAN access password (initial, change it in Settings → Advanced): ${authInfo.password}`);
     } else {
-        usageItems.push({
-            state: 'ok', label: '访问密码：已由你自行设置',
-            hint: '控制台不再显示明文。忘记了可在本机打开 http://127.0.0.1:' + port
-                + ' → 设置 → 高级 → 访问密码 重设。',
-        });
+        console.log('[auth] LAN access password: user-configured');
     }
-    console.log(usage(usageItems));
 
-    // ---- ② 插件体检 ----
-    // 为什么单独列：插件是最容易"静默失效"的一块（没启用 / 缺前置 / 目录改过
-    // 都会让它不工作，而界面上看不出原因）。启动时先给一份清单，
-    // 用户遇到"功能不生效"时回来翻这一屏就够了。
-    //
-    // 注意措辞：这里只反映**磁盘上装了什么**，不反映浏览器里加载成没成 ——
-    // 后者只有前端知道，所以如实说明这是"已安装"，不谎称"已生效"。
-    //
-    // ★ 整块**一次** console.log：每次调用都会生成一条独立日志记录、
-    //   带上自己的时间戳前缀。分多次调用的话，分组标题会和它的内容被
-    //   时间戳隔开，看起来像两件不相干的事（实测踩到）。
+    // 插件清单：一行一条事实（id/目录/依赖），详情（名称、描述）归软件内查看器
     try {
         const r = await modManager.scanAndSync();
-        const { text } = describePlugins(r.installed.map((p) => ({
-            id: p.id, name: p.name, state: 'ready', dir: p.dir,
-        })));
-        console.log(section('插件（已安装）') + '\n' + text
-            + '\n      实际是否生效由浏览器决定 —— 打开页面后看同一前缀 [Mod] 的日志。');
+        if (r.installed.length) {
+            for (const p of r.installed) {
+                console.log(`[mod] installed: ${p.id} (dir=${p.dir}${p.after.length ? ', after=' + p.after.join('+') : ''})`);
+            }
+        } else {
+            console.log('[mod] no plugins installed (text chat works without them)');
+        }
+        if (r.results.length) {
+            for (const res of r.results) {
+                if (res.ok) console.log(`[mod] installed from zip: ${res.id} (${res.files} files)`);
+                else console.error(`[mod] install failed: ${res.zip} - ${res.error}`);
+            }
+        }
     } catch (err) {
-        const text = problem({
-            what: '插件目录扫描失败（不影响文字聊天）',
-            where: 'web/mods/',
-            why: String((err && err.message) || err),
-            how: '检查 web/mods/ 目录是否存在、是否有读取权限。'
-                + '不需要插件的话可以忽略这条。',
-        });
-        console.error(text);
-        bootProblems.push(text);
+        console.error(`[mod] scan failed: ${String((err && err.message) || err)}`);
     }
 
-    // ---- ③ 问题汇总（只有真有问题才出现）----
-    //   正常时**不打**"一切正常"—— 上面已经把该说的说完了，
-    //   再打一遍就是重复（上一版这里和"服务已启动"说了两遍同一件事）。
-    const sum = summary(bootProblems);
-    if (sum) console.log(sum);
-
-    // ---- ④ 技术信息（排查用，普通用户可跳过）----
-    console.log(techInfo([
-        ['进程号', String(process.pid)],
-        ['运行环境', `Node ${process.version} · ${process.platform} ${process.arch}`],
-        ['版本', 'v' + APP_VERSION],
-        ['HTTPS', '同一端口同时支持（手机麦克风需要它，浏览器会提示证书不受信任，点继续即可）'],
-        ...(LOG_TO_FILE
-            ? [['主日志', path.relative(APP_ROOT, mainSink.file)],
-               ['落盘级别', fileLevel + '（终端始终显示全部级别，可在「设置 → 高级 → 日志」调整）']]
-            : [['日志', '本次不落盘（LOG_TO_FILE=0），只打在控制台']]),
-    ]));
+    // 指路（保留中文 —— 这是给人看的一句，也是启动输出里唯一一句）：
+    console.log('[boot] 就绪。日志可在应用内「设置 → 高级 → 日志查看器」按级别/模块筛选查看。');
 });
 
 // 兼容入口：老的 https://IP:4174 链接继续可用（两个端口都支持双协议）。
