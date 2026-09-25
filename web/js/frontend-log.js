@@ -59,6 +59,31 @@
             console.debug = function () { origDebug.apply(console, arguments); push('debug', toText(arguments)); };
         }
 
+        // ★ console.log 也转发，但**只转 mod 相关的那几条**（2026-09 补）。
+        //
+        // 为什么必须补：插件的加载是"看不见的过程" ——
+        //   · 成功时插件走 host.log()，而它落到 console.log → 启动窗口里一条都没有；
+        //   · 失败时才有 [Mod:…] 的 error → 于是"没有 mod 日志"既可能是成功、
+        //     也可能是 mods.js 压根没跑，**两者在启动窗口里长得一模一样**。
+        //   实测就踩了这个坑：用户报"日志里没有 mod 开头的日志"，无法据此判断
+        //   到底是没加载还是加载成功。
+        //
+        // 为什么不转发**所有** console.log：宿主自己有大量正常日志
+        // （每轮对话、每次请求），全转发会把启动窗口刷满、把真正的错误埋掉 ——
+        // 这正是当初只挂 error/warn/debug 的原因。这里只认 mod 前缀，
+        // 代价小、收益明确：插件装没装、启没启、加载成没成，一眼可查。
+        var origLog = console.log;
+        console.log = function () {
+            origLog.apply(console, arguments);
+            try {
+                var first = arguments.length ? String(arguments[0]) : '';
+                // host.log 打的是 '[Mod:<name>] …'；宿主自己的 Mod 生命周期日志也用这个前缀
+                if (first.indexOf('[Mod:') === 0 || first.indexOf('[Mod]') === 0) {
+                    push('info', toText(arguments));
+                }
+            } catch (e) { /* 绝不影响应用本身 */ }
+        };
+
         window.addEventListener('error', function (e) {
             push('error', '未捕获异常: ' + (e.message || '') + '  @'
                 + String(e.filename || '').split('/').pop() + ':' + (e.lineno || 0));

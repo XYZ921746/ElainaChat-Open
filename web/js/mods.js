@@ -614,8 +614,21 @@
 
     /** 加载全部插件 */
     async function loadAll() {
+        // ★ 先打一条总览日志（console.log，会被前端日志转发带到启动窗口）。
+        //
+        // 为什么必须有：插件的加载是"看不见的过程"，而"没有 mod 日志"这个现象
+        // 既可能是**成功**（旧实现里成功日志走 console.log、不被转发），
+        // 也可能是 **mods.js 压根没跑 / 清单读不到** —— 两者在启动窗口里
+        // 长得一模一样，无法据此排查（实测就卡在这里）。
+        // 现在无论成败，先留一条"我开始加载了、清单里有几个"的痕迹。
         const manifests = await discover();
-        if (!manifests.length) return [];
+        console.log('[Mod] 开始加载：清单里发现 ' + manifests.length + ' 个插件'
+            + (manifests.length ? '（' + manifests.map((m) => m.id).join('、') + '）' : ''));
+        if (!manifests.length) {
+            // 清单为空 = 没装任何插件，或 index.json 取不到。后者要能看出来。
+            console.warn('[Mod] 插件清单为空 —— 没安装任何插件，或 /mods/index.json 读取失败');
+            return [];
+        }
 
         // ★ 先查缺失依赖 —— 缺前置的插件会被**拒绝加载**（不是警告后照跑）。
         //   判定同时认清单 id 与目录名：用户改了目录名时，after 里写的
@@ -643,6 +656,22 @@
             // 缺失依赖也记到条目上，供设置界面显示（loadOne 已在 error 里写了原因）
             if (lack.length) entry.missingDeps = lack;
             results.push(entry);
+        }
+
+        // ★ 加载完成汇总：每个插件的最终状态一行一条。
+        //
+        // 这是"插件到底怎么了"最直接的一处证据 —— 用户报"插件用不了"时，
+        // 看一眼启动窗口就知道是没启用、缺前置、还是加载报错，
+        // 不用再让人去开浏览器控制台（手机上根本开不了）。
+        console.log('[Mod] 加载完成：' + results.map((e) =>
+            e.manifest.id + '=' + e.state
+            + (e.manifest.dir && e.manifest.dir !== e.manifest.id ? '(' + e.manifest.dir + ')' : '')
+        ).join('  '));
+        const notReady = results.filter((e) => e.state !== 'ready');
+        if (notReady.length) {
+            console.log('[Mod] 未就绪的插件：' + notReady.map((e) =>
+                e.manifest.id + '=' + e.state + (e.error ? '（' + e.error + '）' : '')
+            ).join('  |  '));
         }
         return results;
     }
