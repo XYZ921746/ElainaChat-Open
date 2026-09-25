@@ -21,6 +21,38 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MODS = path.join(ROOT, 'web', 'mods');
 
+/**
+ * 按 **manifest.id** 找插件的真实目录名。
+ *
+ * ★ 为什么不直接写死 'elaina-avatar'（2026-09 修）：
+ *   用户可以把插件目录改名（实测有人改成了 `1111`），而 id 仍是
+ *   manifest 里声明的那个。检查脚本若写死目录名，就会在"用户改了名"
+ *   这个**完全合法**的情况下自己失败 —— 那是检查的问题，不是产品的问题。
+ *   本文件的第一版就写死了，于是在改名后报出一堆假的 ENOENT。
+ *
+ * @returns {string|null} 真实目录名（不是路径）
+ */
+function modDirById(id) {
+    let names = [];
+    try { names = readdirSync(MODS); } catch { return null; }
+    for (const n of names) {
+        const mf = path.join(MODS, n, 'manifest.json');
+        if (!existsSync(mf)) continue;
+        try {
+            const m = JSON.parse(readFileSync(mf, 'utf8'));
+            if (m && m.id === id) return n;
+        } catch { /* 忽略坏 manifest */ }
+    }
+    // 没有 manifest.id 时退回同名目录（老插件）
+    return existsSync(path.join(MODS, id, 'index.js')) ? id : null;
+}
+
+/** 按 manifest.id 取插件目录的绝对路径 */
+function modPath(id, ...rest) {
+    const dir = modDirById(id);
+    return dir ? path.join(MODS, dir, ...rest) : null;
+}
+
 let pass = 0, fail = 0;
 const failures = [];
 const ok = (c, label, extra) => {
@@ -159,13 +191,15 @@ console.log('=== 1. 关键实现存在且语义正确 ===');
 // ============================================================ 1.5 两个 mod 本体
 console.log('\n=== 1.5 Galgame 与桌宠（本体与共用层） ===');
 {
-    const galPath = path.join(ROOT, 'web', 'mods', 'galgame', 'index.js');
-    const petPath = path.join(ROOT, 'web', 'mods', 'pet', 'index.js');
-    ok(existsSync(galPath), 'galgame/index.js 存在');
-    ok(existsSync(petPath), 'pet/index.js 存在');
-    ok(existsSync(path.join(ROOT, 'web', 'mods', 'elaina-avatar', 'index.js')), 'elaina-avatar/index.js 存在');
+    const galPath = modPath('galgame', 'index.js');
+    const petPath = modPath('pet', 'index.js');
+    ok(Boolean(galPath && existsSync(galPath)), 'galgame/index.js 存在');
+    ok(Boolean(petPath && existsSync(petPath)), 'pet/index.js 存在');
+    const avatarIndex = modPath('elaina-avatar', 'index.js');
+    ok(Boolean(avatarIndex && existsSync(avatarIndex)),
+        'elaina-avatar/index.js 存在（按 manifest.id 找到真实目录：' + modDirById('elaina-avatar') + '）');
 
-    if (existsSync(galPath) && existsSync(petPath)) {
+    if (galPath && petPath && existsSync(galPath) && existsSync(petPath)) {
         const gal = readFileSync(galPath, 'utf8');
         const pet = readFileSync(petPath, 'utf8');
 
@@ -199,11 +233,11 @@ console.log('\n=== 1.5 Galgame 与桌宠（本体与共用层） ===');
         ok(/ElainaMods\.setEnabled\(MOD_ID, false\)/.test(pet), '★ pet 收起时同步关 mod 开关');
 
         // 资源
-        ok(existsSync(path.join(ROOT, 'web', 'mods', 'galgame', 'style.css')), 'galgame 有样式');
-        ok(existsSync(path.join(ROOT, 'web', 'mods', 'pet', 'style.css')), 'pet 有样式');
+        ok(Boolean(modPath('galgame', 'style.css')) && existsSync(modPath('galgame', 'style.css')), 'galgame 有样式');
+        ok(Boolean(modPath('pet', 'style.css')) && existsSync(modPath('pet', 'style.css')), 'pet 有样式');
 
         // ★ 立绘只有一套（消除重复的实证）
-        const imgDir = path.join(ROOT, 'web', 'mods', 'elaina-avatar', 'img');
+        const imgDir = modPath('elaina-avatar', 'img');
         let pngs = [];
         try { pngs = readdirSync(imgDir).filter((f) => f.endsWith('.png')); } catch { /* 忽略 */ }
         ok(pngs.length === 9, '公共立绘恰好 9 张（一套），实得 ' + pngs.length);
@@ -289,9 +323,18 @@ try {
         ok(!existsSync(path.join(MODS, 'demo-mod')), '★ mod 目录已被删除');
         ok(!existsSync(path.join(MODS, 'demo-mod.zip')), '★ 安装包也被删除（否则会被重新装回来）');
 
-        // 静态资源
-        ok((await fetch(`http://127.0.0.1:${PORT}/mods/elaina-avatar/img/p_calm.png`)).status === 200,
-            'mod 立绘可经静态服务访问');
+        // 静态资源：★ 用清单里的**真实目录名**（dir）拼 URL，不写死 'elaina-avatar'
+        //   —— 用户改了目录名时，写死的 URL 必然 404，那是检查的问题。
+        const avEntry = (body.plugins || []).find((p) => p.id === 'elaina-avatar');
+        ok(Boolean(avEntry), '清单里有 elaina-avatar');
+        if (avEntry) {
+            const enc = String(avEntry.dir || avEntry.id).split('/').map(encodeURIComponent).join('/');
+            ok(typeof avEntry.dir === 'string' && avEntry.dir.length > 0,
+                '★ 清单带 dir 字段（前端据此拼资源 URL）', avEntry.dir);
+            const imgUrl = `http://127.0.0.1:${PORT}/mods/${enc}/img/p_calm.png`;
+            ok((await fetch(imgUrl)).status === 200,
+                'mod 立绘可经静态服务访问（按真实目录 ' + avEntry.dir + '）', imgUrl);
+        }
         ok((await fetch(`http://127.0.0.1:${PORT}/mods/index.json`)).status === 200, 'mod 清单可被前端读取');
         ok((await fetch(`http://127.0.0.1:${PORT}/js/mods.js`)).status === 200, 'mod 加载器脚本可被加载');
     }

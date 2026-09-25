@@ -828,17 +828,23 @@ async function refreshModsList() {
         if (m.state === 'error') {
             badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-600 ml-1" title="'
                 + escapeHtml(m.error || '') + '">加载失败</span>';
+        } else if (m.state === 'blocked') {
+            // 缺前置插件 → **拒绝加载**（不是"半残地跑起来"）。
+            // 状态与原因都要摆出来：这是"为什么这个插件不工作"的答案。
+            badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-600 ml-1" title="'
+                + escapeHtml(m.error || '') + '">缺少前置插件</span>';
         } else if (m.state === 'ready') {
             badge = '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-600 ml-1">已加载</span>';
         }
-        // 缺失依赖：必须显眼提示。
-        // 典型场景：只装了 galgame 没装 elaina-avatar（两者现在分开发布），
-        // 表现是"Galgame 能打开但没有立绘"——不提示的话完全无从排查。
+        // 缺失的前置插件：显示成一行可读的原因（而不仅是一个角标）。
+        // 典型场景：只装了 galgame 没装 elaina-avatar（两者分开发布），
+        // 旧行为是"能打开但没有立绘"，现在直接拒绝加载并说明缺什么。
         const missing = Array.isArray(m.missingDeps) ? m.missingDeps : [];
+        let blockReason = '';
         if (missing.length) {
-            badge += '<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 ml-1" title="'
-                + escapeHtml('缺少依赖：' + missing.join('、') + '。请先安装这些插件，否则功能不完整。')
-                + '">缺依赖：' + escapeHtml(missing.join('、')) + '</span>';
+            blockReason = '<span class="block text-[11px] text-red-500 leading-relaxed mt-0.5">'
+                + '缺少前置插件：' + escapeHtml(missing.join('、'))
+                + ' —— 请先在下面安装并启用它，本插件才会被加载。</span>';
         }
         // hidden 的 mod（如公共依赖）不显示开关 —— 它不提供界面，关掉只会让别的 mod 坏掉
         const toggle = m.hidden
@@ -866,6 +872,7 @@ async function refreshModsList() {
             + '<span class="min-w-0">'
               + '<span class="text-xs font-semibold text-indigo-800">' + name + '</span>' + ver + badge
               + (desc ? '<span class="block text-[11px] text-indigo-400 leading-relaxed mt-0.5">' + desc + '</span>' : '')
+              + blockReason
             + '</span></label>'
             + delBtn
             + '</div>';

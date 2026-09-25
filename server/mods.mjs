@@ -33,8 +33,40 @@
 import { readdir, stat, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 
-/** 插件目录名合法性：只允许字母数字、连字符、下划线、点（且不能是 . / ..） */
+/**
+ * 插件 **id** 的合法性：只允许字母数字、连字符、下划线、点（且不能是 . / ..）。
+ *
+ * ★ id 与目录名的约束**不同**，别混用（2026-09 踩过）：
+ *   · id 是**身份**：要进 localStorage 键名、要拼资源 URL、要做依赖匹配，
+ *     所以收得紧（纯 ASCII、无空格）—— 中文 id 会让 `/mods/<id>/…` 这种
+ *     URL 与 localStorage 键都变得难处理。
+ *   · 目录名是**磁盘位置**：用户完全可能把它改成中文（"桌宠"）或带空格
+ *     （"my pet"）。这类目录**必须照样能识别** —— 它只要是个安全的目录名即可。
+ *   旧实现两者共用这一个正则，于是把插件目录改成中文后**直接扫不到**
+ *   （连 manifest 都不读），表现为"改个名字插件就消失了"。
+ */
 const MOD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/**
+ * 插件**目录名**的合法性（比 id 宽松）。
+ *
+ * 允许中文、空格、括号等常见字符 —— 用户会这样命名。只挡掉真正危险的东西：
+ *   · 路径分隔符 `/` `\` 与 `..`（目录穿越）
+ *   · 以 `.` 开头（隐藏目录，且 `.`/`..` 本身）
+ *   · Windows 非法字符 `<>:"|?*` 与控制字符（建不出这种目录，或建出来无法访问）
+ *   · 首尾空白与尾随点（Windows 会静默吃掉，导致名字与预期不符）
+ * 长度上限 128，避免异常长的名字。
+ */
+const MOD_DIR_RE = /^[^\\/:*?"<>|\u0000-\u001f]{1,128}$/;
+function isSafeModDirName(name) {
+    const n = String(name || '');
+    if (!n || n === '.' || n === '..') return false;
+    if (n.startsWith('.')) return false;              // 隐藏目录 / . ..
+    if (n !== n.trim()) return false;                 // 首尾空白
+    if (/[. ]$/.test(n)) return false;                // 尾随点/空格（Windows 会吃掉）
+    if (n.includes('..')) return false;               // 防穿越（配合上面的分隔符检查）
+    return MOD_DIR_RE.test(n);
+}
 
 /**
  * 把 zip 文件名归一化成插件 id：剥掉尾部的版本号。
@@ -103,6 +135,9 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
      *
      *   现在改成：manifest.id 合法就用它（它是插件作者声明的身份，也是
      *   资源路径与依赖引用的基准），只有缺失/非法时才回落到目录名。
+     *
+     * ★ 回落时还会对目录名做 normalizeModId（剥版本号尾），这样
+     *   "没写 id 的插件 + 带版本号的目录名"也能得到干净的 id。
      *   `MOD_ID_RE` 校验必须保留 —— manifest 是外部输入，不能直接信。
      */
     async function readManifest(dir, fallbackId) {
@@ -112,17 +147,21 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
             const m = JSON.parse(raw);
             if (m && typeof m === 'object') {
                 const declared = typeof m.id === 'string' ? m.id.trim() : '';
-                const id = (declared && MOD_ID_RE.test(declared)) ? declared : fallbackId;
-                if (declared && !MOD_ID_RE.test(declared)) {
+                if (declared && MOD_ID_RE.test(declared)) return { ...m, id: declared };
+                if (declared) {
                     log(`插件 ${fallbackId} 的 manifest.id 不合法（${declared}），回落到目录名`);
                 }
-                return { ...m, id };
+                // 没写 id / 写得不合法 → 用目录名，并剥掉可能的版本号尾
+                return { ...m, id: normalizeModId(fallbackId) };
             }
         } catch (e) {
             if (e && e.code !== 'ENOENT') log('插件 manifest.json 解析失败：' + dir + ' —— ' + e.message);
         }
         // 没有 manifest 时给一份最小可用清单：让"只有 index.js 的 mod"也能跑
-        return { id: fallbackId, name: fallbackId, version: '', description: '', entry: 'index.js' };
+        return {
+            id: normalizeModId(fallbackId),
+            name: fallbackId, version: '', description: '', entry: 'index.js',
+        };
     }
 
     /**
@@ -231,27 +270,14 @@ export function createModManager({ modsDir, unzip, isUnsafeEntryName, effectiveE
         for (const e of entries) {
             if (e.name === 'index.json') continue;
             if (e.isDirectory()) {
-                if (!MOD_ID_RE.test(e.name)) continue;
-                // ★ 兼容旧安装：目录名带版本号（elaina-avatar-1.0.0）的是修复前的产物。
-                //   读它的 manifest 拿真 id；拿不到就按归一化规则剥 —— 总之把
-                //   资源 URL 与 after 依赖都对回正确名字，已装坏的用户不用重装。
-                //   不改磁盘目录名（改名会丢用户设置里的启用状态），只在清单里归一。
-                let id = e.name;
-                // 只对**多段版本号**尾（-1.0.0）做归一化，避免误伤 my-mod-2 这类真实名字
-                if (/-[0-9]+\.[0-9]+(\.[0-9]+)*$/.test(e.name)) {
-                    try {
-                        const mf = JSON.parse(await readFile(path.join(modsDir, e.name, 'manifest.json'), 'utf8'));
-                        if (mf && typeof mf.id === 'string' && MOD_ID_RE.test(mf.id)) id = mf.id;
-                    } catch { /* 无 manifest 或解析失败 */ }
-                    if (id === e.name) id = normalizeModId(e.name);
-                    // 归一后的 id 若与另一个真实目录撞车（两个来源同时存在），
-                    // 保留原目录（它能独立工作），归一那份跳过并记日志。
-                    if (id !== e.name && entries.some((x) => x.name === id && x.isDirectory())) {
-                        log(`目录 ${e.name} 与 ${id} 同时存在，跳过前者（可能是重复安装）`);
-                        continue;
-                    }
+                // ★ 目录名用 isSafeModDirName（宽松，允许中文/空格），
+                //   而不是 MOD_ID_RE（严格 ASCII）—— 用户把插件目录改成
+                //   「桌宠」是完全合理的，旧实现会**直接跳过**它。
+                if (!isSafeModDirName(e.name)) {
+                    log(`跳过目录 ${e.name}：名字含不安全字符或非法形式`);
+                    continue;
                 }
-                installed.push({ id, dir: path.join(modsDir, e.name) });
+                installed.push({ id: e.name, dir: path.join(modsDir, e.name) });
             } else if (e.isFile() && /\.zip$/i.test(e.name)) {
                 zips.push(e.name);
             }

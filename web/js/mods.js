@@ -36,7 +36,7 @@
     const MOD_ROOT = '/mods/';
 
     /**
-     * 插件在磁盘上的**实际目录名**。
+     * 插件在磁盘上的**实际目录名**（已做 URL 编码，可直接拼进 URL）。
      *
      * ★ 为什么不能直接用 manifest.id 拼 URL（2026-09 修的真 bug）：
      *   插件 id 是**身份**（依赖匹配、资源引用都以它为准），而目录名是
@@ -46,12 +46,25 @@
      *   此时按 id 拼 URL 会让脚本与图片**全部 404**（表现为
      *   "插件开关打开了，但桌宠/Galgame 没有立绘、依赖也报缺失"）。
      *
+     * ★ 为什么必须 encodeURIComponent（2026-09 第二次踩）：
+     *   用户完全可以把插件目录改成中文（"桌宠"）或带空格（"my pet"）。
+     *   不编码的话，同一个目录在不同地方会拼出不同字符串：
+     *     · `el.src = '/mods/桌宠/index.js'` —— 浏览器读属性时得到**已编码**的
+     *       `/mods/%E6%A1%8C%E5%AE%A0/index.js`
+     *     · 而 `loadedScripts` 里存的是**未编码**的原串
+     *   两者对不上 → `neverLoaded` 永远为真 → **每次启用都重复注入脚本**，
+     *   插件的初始化会跑两次（界面出现两份、事件监听挂两遍）。
+     *   `assetUrl()` 同理：编码后 `new Image().src` 与 fetch 才都能取到。
+     *
      * 服务端在清单里为每个插件同时给出 id 与 dir，这里优先用 dir；
      * 旧版服务端没有 dir 字段时回落到 id（那时两者本来就一致）。
      */
     function modDir(manifest) {
         const d = manifest && typeof manifest.dir === 'string' ? manifest.dir.trim() : '';
-        return d || manifest.id;
+        const raw = d || (manifest && manifest.id) || '';
+        // 逐段编码：不能整串 encodeURIComponent（会把路径分隔符也编掉）。
+        // 这里 dir 是单层目录名，但仍按 '/' 分段处理，兼容带子路径的写法。
+        return String(raw).split('/').map(encodeURIComponent).join('/');
     }
 
     /** 插件状态：id -> { manifest, state, error, api } */
@@ -122,15 +135,21 @@
      * （`state` / `elements` / 各种内部函数），宿主以后就没法重构了 ——
      * 任何改名都会悄悄弄坏某个 mod。这里显式列出允许使用的入口，
      * 宿主改内部实现时只要保证这张表不变，插件就不会坏。
+     *
+     * @param {object} manifest 清单条目
+     * @param {string} [regName] 插件脚本里 register() 用的名字（缺省 = manifest.id）
      */
-    function createHostApi(manifest) {
+    function createHostApi(manifest, regName) {
+        // 日志前缀用**注册名**（插件自己认得的名字），便于对上它的源码
+        const name = regName || manifest.id;
         const log = (level, ...args) => {
-            const tag = '[Mod:' + manifest.id + ']';
+            const tag = '[Mod:' + name + ']';
             const fn = console[level] || console.log;
             try { fn(tag, ...args); } catch (e) { /* 忽略 */ }
         };
         return {
-            id: manifest.id,
+            id: name,
+            manifestId: manifest.id,
             version: manifest.version || '0.0.0',
 
             // ---- 资源定位（修「资源包装了等于没装」的另一半）----
@@ -153,6 +172,54 @@
             },
             /** 本插件资源目录的 URL（结尾带 /），供需要自行拼路径的场合 */
             assetBase() { return MOD_ROOT + modDir(manifest) + '/'; },
+
+            // ---- 查找其他插件（★ 由插件系统统一解析，插件不自己拼路径）----
+            /**
+             * 按**注册名 / 清单 id / 目录名**中的任意一个查找插件。
+             *
+             * 为什么要有这个：插件之间互相依赖（galgame 要用 elaina-avatar 的
+             * 立绘接口）时，插件自己拼 `/mods/elaina-avatar/…` 是脆的 ——
+             * 用户改了目录名、或清单 id 与注册名不一致，路径就错了。
+             * 交给系统查表才是稳的：系统维护着"注册名 ↔ 目录"的映射。
+             *
+             * 用法：
+             *   const av = host.require('elaina-avatar');
+             *   if (!av.ok) { host.error(av.reason); return; }
+             *   const url = av.url('img/p_calm.png');   // 资源路径由系统算
+             */
+            require(key) {
+                try {
+                    const found = window.ElainaMods.find(key);
+                    if (!found) {
+                        return {
+                            ok: false,
+                            reason: '找不到插件「' + key + '」。请先在「设置 → 插件」里安装并启用它。',
+                        };
+                    }
+                    if (found.state !== 'ready') {
+                        return {
+                            ok: false,
+                            found,
+                            reason: '插件「' + key + '」当前状态是 ' + found.state
+                                + '，还不能使用' + (found.entry && found.entry.error ? '：' + found.entry.error : '。'),
+                        };
+                    }
+                    const dir = found.dir;
+                    const enc = dir.split('/').map(encodeURIComponent).join('/');
+                    return {
+                        ok: true,
+                        id: found.id,
+                        dir,
+                        regName: found.regName,
+                        api: found.entry ? found.entry.api : null,
+                        /** 取该插件的资源 URL（路径由系统按真实目录算） */
+                        url: (rel) => MOD_ROOT + enc + '/' + String(rel || '').replace(/^\/+/, ''),
+                        base: () => MOD_ROOT + enc + '/',
+                    };
+                } catch (e) {
+                    return { ok: false, reason: '查找插件「' + key + '」时出错：' + (e && e.message || e) };
+                }
+            },
 
             // ---- 日志（带插件前缀，便于定位是哪个 mod 在说话）----
             log: (...a) => log('log', ...a),
@@ -380,11 +447,34 @@
      *
      * 失败隔离的核心：**整个函数体都包在 try/catch 里**。
      * 插件是用户可自行增删的东西，质量不可控 —— 一个坏 mod 绝不能
-     * 让整个应用白屏（那会让用户连"去设置里关掉它"都做不到）。
+     * 让整个白屏（那会让用户连"去设置里关掉它"都做不到）。
+     *
+     * @param {object} manifest 清单条目
+     * @param {string[]} [missingDeps] 缺失的前置插件 id（非空时**拒绝加载**）
      */
-    async function loadOne(manifest) {
+    async function loadOne(manifest, missingDeps = []) {
         const entry = { manifest, state: 'pending', error: null, api: null };
         registry.set(manifest.id, entry);
+
+        // ★ 前置插件缺失 → **拒绝加载**，并给出可读原因。
+        //
+        // 旧行为只是 console.error 一句警告、然后照样加载。那很糟：
+        // 插件会在"依赖不在"的前提下跑起来 —— 例如 galgame 拿不到
+        // window.ElainaAvatar，于是它自己回落成"没有立绘"，用户看到的是
+        // "界面能打开但没有人物"，而设置里那个"缺依赖"角标很容易被忽略。
+        // 更麻烦的是**加载顺序失去保证**：依赖可能排在它后面才加载。
+        //
+        // 现在明确拒绝：状态标为 blocked，error 里写清缺什么、去哪装，
+        // 设置界面直接显示这条原因（见 refreshModsList 的 blocked 处理）。
+        // 这样"为什么这个插件不工作"是有答案的，而不是一个静默的半残状态。
+        if (missingDeps.length) {
+            entry.state = 'blocked';
+            entry.error = '缺少前置插件：' + missingDeps.join('、')
+                + '。请先在「设置 → 插件」里安装并启用它，否则本插件不会被加载'
+                + '（缺了前置就启动，功能只会是残缺的，所以这里直接拒绝）。';
+            console.error('[Mod:' + manifest.id + '] ' + entry.error);
+            return entry;
+        }
 
         if (!modsGloballyEnabled()) {
             entry.state = 'disabled';
@@ -397,7 +487,7 @@
 
         try {
             // ① 样式（可选）
-            //    路径用 modDir()：脚本/样式在**磁盘目录**下，不是 id 下（见 modDir 说明）
+            //    路径由 modDir() 统一给出（已 URL 编码），插件自己不拼路径
             for (const css of (Array.isArray(manifest.styles) ? manifest.styles : [])) {
                 const href = css.startsWith('/') ? css : MOD_ROOT + modDir(manifest) + '/' + css;
                 const el = document.createElement('link');
@@ -408,14 +498,43 @@
             }
 
             // ② 入口脚本
+            //
+            // ★ 注入前记下"当前在加载哪个目录"：插件脚本执行时会调
+            //   register(name, …)，系统据此知道**这个注册名来自哪个目录**。
+            //   这是"路径由插件系统查"的关键一环 —— 见 regByDir 的说明。
             const entrySrc = manifest.entry || 'index.js';
             const src = entrySrc.startsWith('/') ? entrySrc : MOD_ROOT + modDir(manifest) + '/' + entrySrc;
-            await injectScript(src);
+            loadingDir = manifest.dir || manifest.id;
+            try {
+                await injectScript(src);
+            } finally {
+                loadingDir = null;
+            }
 
-            // ③ 初始化：插件把 init 挂到 window.ElainaMods.register(id, fn)
-            const factory = pendingRegistrations.get(manifest.id);
+            // ③ 初始化：找这个插件注册的 factory。
+            //
+            // ★ 先按 manifest.id 找（常规情况），找不到就按**本目录注册了什么**找。
+            //   为什么需要第二步：用户改了目录名、而 manifest 又没写 id 时，
+            //   manifest.id 会等于目录名（如 pet-renamed），而脚本里注册的
+            //   仍是 'pet' —— 只按 manifest.id 查会**永远查不到**，
+            //   插件表现为"已加载但从不初始化"（界面毫无反应）。
+            //   按目录反查就能把这条链接上，目录怎么改都不影响。
+            let factory = pendingRegistrations.get(manifest.id);
+            let regName = manifest.id;
+            if (typeof factory !== 'function') {
+                const byDir = regByDir.get(manifest.dir || manifest.id);
+                if (byDir && typeof pendingRegistrations.get(byDir) === 'function') {
+                    factory = pendingRegistrations.get(byDir);
+                    regName = byDir;
+                    console.warn('[Mod:' + manifest.id + '] 清单 id 与注册名不一致（'
+                        + manifest.id + ' ≠ ' + byDir + '），已按注册名加载'
+                        + '（建议在 manifest.json 里显式写 "id": "' + byDir + '"）');
+                }
+            }
+
             if (typeof factory === 'function') {
-                entry.api = await factory(createHostApi(manifest));
+                entry.regName = regName;
+                entry.api = await factory(createHostApi(manifest, regName));
             } else if (manifest.autoInit !== false) {
                 // 没有 register 的插件：脚本加载成功即算可用（有些 mod 自带启动逻辑）
                 entry.api = null;
@@ -433,7 +552,33 @@
     const pendingRegistrations = new Map();
 
     /**
-     * 找出每个插件**缺失的依赖**。
+     * 注册名 ↔ 目录 的双向映射（★ 插件系统自己维护，插件不参与算路径）。
+     *
+     * ── 为什么需要它（2026-09 踩到的真 bug）──────────────────────────────
+     *
+     * 插件的**身份**其实有两个来源：
+     *   · 服务端清单给的 `manifest.id`（来自 manifest.json，或回落到目录名）
+     *   · 插件脚本里 `register('pet', …)` 声明的**注册名**
+     *
+     * 正常情况两者相同。但用户**改了插件目录名**之后就可能不同：
+     * 目录叫 `pet-renamed`、manifest 又没写 id → 清单 id 是 `pet-renamed`，
+     * 而脚本注册的是 `pet`。旧实现直接 `pendingRegistrations.get(manifest.id)`
+     * → **查不到 factory → 插件永远不初始化**（清单里显示"已加载"，
+     * 界面却毫无反应，是最难排查的那种）。
+     *
+     * 修法就是"让插件系统来做查找"：脚本是按目录注入的，所以系统**知道**
+     * 某个 register() 调用来自哪个目录。于是记录 dir → 注册名，
+     * loadOne 先按 manifest.id 找，找不到就按"我这个目录注册了什么"找。
+     * 这样**目录怎么改都不影响插件被正确初始化**。
+     */
+    const regByDir = new Map();     // dir（磁盘目录名）→ 注册名
+    const dirByReg = new Map();     // 注册名 → dir
+
+    /** 当前正在注入的插件目录（register() 据此知道自己来自哪个目录） */
+    let loadingDir = null;
+
+    /**
+     * 找出每个插件**缺失的前置插件**。
      *
      * 为什么要单独做这件事：`sortByDependency` 里对找不到的依赖是
      * `if (d) visit(...)` —— **静默跳过**。这在单仓库时代问题不大（一起发布），
@@ -441,12 +586,23 @@
      * 就会变成常态。那时的表现是"Galgame 打开了但没有立绘"，
      * 且控制台一声不响 —— 属于最难排查的那类问题。
      *
-     * 所以这里显式算出缺失项，交给调用方报错/提示。
+     * ★ 判定要同时认**清单 id** 与**目录名**（2026-09 修）：
+     *   用户改了插件目录名、而 manifest 没写 id 时，清单 id 会等于目录名
+     *   （如 `pet-renamed`），而依赖方 after 里写的仍是注册名 `pet`。
+     *   只按清单 id 比会**误报"缺依赖"**，把好好的插件拦下来。
+     *   两个键都收进集合，才不会误伤。
      *
-     * @returns {Map<string, string[]>} 插件 id → 缺失的依赖 id 列表
+     * @returns {Map<string, string[]>} 插件 id → 缺失的前置插件 id 列表
      */
     function findMissingDeps(manifests) {
-        const ids = new Set(manifests.map((m) => m.id));
+        // 可用身份集合：清单 id、目录名，以及（已加载过的话）注册名
+        const ids = new Set();
+        for (const m of manifests) {
+            if (m.id) ids.add(m.id);
+            if (m.dir) ids.add(m.dir);
+            const rn = m.dir ? regByDir.get(m.dir) : null;
+            if (rn) ids.add(rn);
+        }
         const missing = new Map();
         for (const m of manifests) {
             const deps = Array.isArray(m.after) ? m.after : [];
@@ -461,12 +617,13 @@
         const manifests = await discover();
         if (!manifests.length) return [];
 
-        // ★ 先查缺失依赖：明确报错，不要静默跳过
+        // ★ 先查缺失依赖 —— 缺前置的插件会被**拒绝加载**（不是警告后照跑）。
+        //   判定同时认清单 id 与目录名：用户改了目录名时，after 里写的
+        //   仍是原注册名，两个键都试一遍才不会误报"缺依赖"。
         const missing = findMissingDeps(manifests);
         for (const [id, lack] of missing) {
-            const msg = '[Mod:' + id + '] 缺少依赖：' + lack.join('、')
-                + '（该插件声明了 after，但依赖未安装 —— 功能可能不完整，请先安装依赖）';
-            console.error(msg);
+            console.error('[Mod:' + id + '] 缺少前置插件：' + lack.join('、')
+                + '（已拒绝加载 —— 缺了前置就启动，功能只会是残缺的）');
         }
 
         let ordered;
@@ -481,9 +638,10 @@
         const results = [];
         // 顺序加载（不是并发）：插件之间可能有依赖，且顺序加载让失败定位更容易
         for (const m of ordered) {
-            const entry = await loadOne(m);
-            // 把缺失依赖记到条目上，供设置界面显示
-            if (missing.has(m.id)) entry.missingDeps = missing.get(m.id);
+            const lack = missing.get(m.id) || [];
+            const entry = await loadOne(m, lack);
+            // 缺失依赖也记到条目上，供设置界面显示（loadOne 已在 error 里写了原因）
+            if (lack.length) entry.missingDeps = lack;
             results.push(entry);
         }
         return results;
@@ -557,23 +715,77 @@
     // ========================================================================
 
     window.ElainaMods = {
-        /** 插件脚本用它注册初始化函数：ElainaMods.register('galgame', (host) => ({...})) */
+        /**
+         * 插件脚本用它注册初始化函数：ElainaMods.register('galgame', (host) => ({...}))
+         *
+         * ★ 注册名就是插件的**权威身份**（依赖匹配、资源查找都以它为准）。
+         *   这里同时记下"它来自哪个目录"（loadingDir）—— 这样即使目录名、
+         *   manifest.id、注册名三者不一致，插件系统也能靠这张表把它们对上。
+         *   见 regByDir 的说明。
+         */
         register(id, factory) {
-            pendingRegistrations.set(String(id), factory);
+            const name = String(id);
+            pendingRegistrations.set(name, factory);
+            if (loadingDir) {
+                regByDir.set(loadingDir, name);
+                dirByReg.set(name, loadingDir);
+            }
+        },
+        /**
+         * 按注册名/清单 id/目录名中的**任意一个**查插件。
+         *
+         * 这是"路径与身份由插件系统统一管理"的入口：插件之间互相查找
+         * （例如 galgame 找 elaina-avatar）不该靠拼字符串，而该问系统。
+         * 三个键都试一遍，用户改了目录名也照样查得到。
+         *
+         * @returns {{id, dir, regName, state, entry}|null}
+         */
+        find(key) {
+            const k = String(key || '');
+            if (!k) return null;
+            // ① 直接命中清单 id
+            let entry = registry.get(k);
+            // ② 命中注册名 → 反查它的目录 → 再取条目
+            if (!entry) {
+                const dir = dirByReg.get(k);
+                if (dir) entry = [...registry.values()].find((e) => (e.manifest.dir || e.manifest.id) === dir);
+            }
+            // ③ 命中目录名
+            if (!entry) entry = [...registry.values()].find((e) => (e.manifest.dir || e.manifest.id) === k);
+            if (!entry) return null;
+            return {
+                id: entry.manifest.id,
+                dir: entry.manifest.dir || entry.manifest.id,
+                regName: entry.regName || entry.manifest.id,
+                state: entry.state,
+                entry,
+            };
+        },
+        /** 取某个插件资源的 URL（按注册名/清单 id/目录名均可查，自动编码） */
+        assetUrl(key, rel) {
+            const found = window.ElainaMods.find(key);
+            const dir = found ? found.dir : String(key || '');
+            const r = String(rel || '').replace(/^\/+/, '');
+            const enc = dir.split('/').map(encodeURIComponent).join('/');
+            return MOD_ROOT + enc + '/' + r;
         },
         loadAll,
         /** 列出已发现的插件及其状态（供设置界面渲染） */
         list() {
             return [...registry.values()].map((e) => ({
                 id: e.manifest.id,
+                // dir / regName 都暴露出去：设置界面与宿主都要用真实目录，
+                // 而不是拿 id 去猜（三者可能不一致，见 modDir 说明）
+                dir: e.manifest.dir || e.manifest.id,
+                regName: e.regName || e.manifest.id,
                 name: e.manifest.name || e.manifest.id,
                 version: e.manifest.version || '',
                 description: e.manifest.description || '',
                 state: e.state,
                 error: e.error,
                 enabled: isModEnabled(e.manifest.id, e.manifest),
-                // 缺失的依赖（manifest.after 里声明了但没装）——
-                // 设置界面据此提示，避免"装了 galgame 但立绘不显示"这种无声故障
+                // 缺失的前置插件（manifest.after 里声明了但没装/没启用）——
+                // 这类插件会被**拒绝加载**，设置界面据此显示原因
                 missingDeps: e.missingDeps || [],
             }));
         },

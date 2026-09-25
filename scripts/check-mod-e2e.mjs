@@ -137,11 +137,19 @@ try {
                 ok(r.status === 200, `★ ${url} → 200`, 'status=' + r.status);
             }
 
-            // 立绘图片可达
-            const img = await fetch(BASE + '/mods/elaina-avatar/img/p_calm.png');
-            ok(img.status === 200, '★ 立绘 /mods/elaina-avatar/img/p_calm.png → 200', 'status=' + img.status);
-            ok((img.headers.get('content-type') || '').startsWith('image/'),
-                '返回图片类型', img.headers.get('content-type'));
+            // 立绘图片可达 —— ★ 按清单里的**真实目录名**拼 URL，不写死 'elaina-avatar'
+            //   （用户改了目录名时，写死的 URL 必然 404；那是检查的问题）
+            const avEntry = plugins.find((p) => p.id === 'elaina-avatar');
+            if (avEntry) {
+                const enc = String(avEntry.dir || avEntry.id).split('/').map(encodeURIComponent).join('/');
+                const img = await fetch(BASE + `/mods/${enc}/img/p_calm.png`);
+                ok(img.status === 200,
+                    `★ 立绘 /mods/${enc}/img/p_calm.png → 200（按真实目录）`, 'status=' + img.status);
+                ok((img.headers.get('content-type') || '').startsWith('image/'),
+                    '返回图片类型', img.headers.get('content-type'));
+            } else {
+                ok(false, '清单里有 elaina-avatar（才能验立绘）');
+            }
         }
     } finally {
         child.kill();
