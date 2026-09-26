@@ -293,7 +293,7 @@ console.log('\n=== 8. 端到端：真实服务 + 真实落盘日志 ===');
             ok(!/技术信息/.test(content), '★ 冗长技术信息块已移除');
             ok(!/现在在做什么/.test(content), '★ 没有冗长段落');
             // ⑤ 行首前缀仍完整（grep 可用）
-            const withPrefix = content.split('\n').filter((l) => /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] \[/.test(l));
+            const withPrefix = content.split('\n').filter((l) => /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[/.test(l));
             ok(withPrefix.length >= 3, '★ 多条记录带完整前缀（grep 仍可用）', String(withPrefix.length));
         }
     } finally {

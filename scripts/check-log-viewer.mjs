@@ -81,7 +81,7 @@ try {
 
     ok(st.visible, '查看器在高级 tab 里显示');
     ok(st.lineCount > 3, '★ 渲染出了日志行', String(st.lineCount));
-    ok(/^\d{2}:\d{2}:\d{2}\.\d{3} \[\w+\] \[\w+\]/.test(st.firstLine),
+    ok(/^\d{2}:\d{2}:\d{2} \[\w+\] \[\w+\]/.test(st.firstLine),
         '★ 行格式：时刻 + [级别] + [模块] + 消息', st.firstLine);
     ok(st.hasLevelColors, '★ 级别有配色区分');
     ok(st.tagOptions.includes('Mod') || st.tagOptions.includes('Core'), '★ 模块下拉有真实模块名', JSON.stringify(st.tagOptions));

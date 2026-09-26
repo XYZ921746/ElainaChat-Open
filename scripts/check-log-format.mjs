@@ -179,7 +179,7 @@ const mainLines = main.split('\n').filter((l) => l !== '');
 //     · 每条记录的**首行**必须带完整前缀（时间/标签/级别/来源）→ grep 仍可用
 //     · 续行不带前缀，但必须**有缩进**（视觉上属于上一条记录）
 //   所以断言拆成两条：首行必须合规；不带前缀的行必须缩进。
-const LINE_RE = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] \[[A-Za-z0-9]+\] \[(DBUG|INFO|WARN|ERRO|CRIT)\]( \[v[^\]]+\])? \[[a-z0-9_.-]+:\d+\]: \s*\S/;
+const LINE_RE = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[[A-Za-z0-9]+\] \[(DBUG|INFO|WARN|ERRO|CRIT)\]( \[v[^\]]+\])? \[[a-z0-9_.-]+:\d+\]: \s*\S/;
 const headLines = mainLines.filter((l) => LINE_RE.test(l));
 const contLines = mainLines.filter((l) => !LINE_RE.test(l));
 ok(headLines.length > 0, '主日志有合规的记录首行');

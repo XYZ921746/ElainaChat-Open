@@ -48,7 +48,7 @@
     function fmtTime(ts) {
         const d = new Date(ts);
         const p = (n, w = 2) => String(n).padStart(w, '0');
-        return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+        return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     }
 
     /** 一条记录 → 一行 HTML。级别/模块上色，正文保持原样。 */

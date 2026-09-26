@@ -130,16 +130,14 @@ function logStampFor(date) {
     return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
         + `_${pad2(date.getHours())}-${pad2(date.getMinutes())}-${pad2(date.getSeconds())}`;
 }
-/** 时刻 → 日志行里的 `YYYY-MM-DD HH:mm:ss.SSS` */
+/** 时刻 → 日志行里的 `YYYY-MM-DD HH:mm:ss` */
 function logTimeFull(date = new Date()) {
     return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} `
-        + `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
-        + `.${String(date.getMilliseconds()).padStart(3, '0')}`;
+        + `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
 }
-/** 时刻 → 控制台用的 `HH:mm:ss.SSS` */
+/** 时刻 → 控制台用的 `HH:mm:ss` */
 function logTimeShort(date = new Date()) {
-    return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
-        + `.${String(date.getMilliseconds()).padStart(3, '0')}`;
+    return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
 }
 
 // ---- 级别（四位，对齐 AstrBot 的 short_levelname）----
